@@ -1,0 +1,309 @@
+packs: strings
+
+=== str-len
+(str-len "abc")
+--- want
+3
+
+=== str-len counts runes
+(str-len "héllo")
+--- want
+5
+
+=== str-len empty
+(str-len "")
+--- want
+0
+
+=== str-concat
+(str-concat "a" "b" "c")
+--- want
+"abc"
+
+=== str-concat needs strings
+(str-concat "a" 1)
+--- error
+
+=== str-join
+(str-join "-" (list "a" "b"))
+--- want
+"a-b"
+
+=== str-join empty list
+(str-join "-" (list))
+--- want
+""
+
+=== str-split
+(str-split "," "a,b")
+--- want
+(list "a" "b")
+
+=== str-split no separator present
+(str-split "," "abc")
+--- want
+(list "abc")
+
+=== str-find present
+(str-find "foo" "foobar")
+--- want
+#t
+
+=== str-find absent
+(str-find "baz" "foobar")
+--- want
+#f
+
+=== str-sub
+(str-sub "héllo" 1 3)
+--- want
+"él"
+
+=== str-sub to end
+(str-sub "hello" 3)
+--- want
+"lo"
+
+=== str-replace
+(str-replace "l" "L" "hello")
+--- want
+"heLLo"
+
+=== str-trim
+(str-trim "  hi  ")
+--- want
+"hi"
+
+=== str-upper
+(str-upper "abc")
+--- want
+"ABC"
+
+=== str-lower
+(str-lower "ABC")
+--- want
+"abc"
+
+=== str-fmt string
+(str-fmt "%s!" "hi")
+--- want
+"hi!"
+
+=== str-fmt float
+(str-fmt "%.2f" 3.14159)
+--- want
+"3.14"
+
+=== str-fmt %d
+(str-fmt "%d" 1)
+--- want
+"1"
+
+=== str-fmt %d with width
+(str-fmt "[%3d]" 7)
+--- want
+"[  7]"
+
+=== str-fmt %d zero padded
+(str-fmt "%03d" 7)
+--- want
+"007"
+
+=== str-fmt %d rejects a fraction
+(str-fmt "%d" 1.5)
+--- error
+
+=== str-fmt %d rejects a string
+(str-fmt "%d" "1")
+--- error
+
+=== str-fmt %s renders any value as text
+(str-fmt "%s %s %s" 42 #t "x")
+--- want
+"42 #t x"
+
+=== str-fmt %v renders a Filo literal
+(str-fmt "%v" (list 1 "a"))
+--- want
+"(list 1 \"a\")"
+
+=== str-fmt left-aligned width
+(str-fmt "[%-4s]" "ab")
+--- want
+"[ab  ]"
+
+=== str-fmt percent sign
+(str-fmt "100%%")
+--- want
+"100%"
+
+=== str-fmt unknown verb is an error
+(str-fmt "%x" 1)
+--- error
+
+=== str-fmt incomplete verb is an error
+(str-fmt "50%")
+--- error
+
+=== str-fmt missing argument is an error
+(str-fmt "%s %s" "a")
+--- error
+
+=== str-fmt extra argument is an error
+(str-fmt "%s" "a" "b")
+--- error
+
+=== str-fmt format must be a string
+(str-fmt 1)
+--- error
+
+=== str-upper maps Latin-1 letters
+(str-upper "ação é ÿ")
+--- want
+"AÇÃO É Ÿ"
+
+=== str-lower maps Latin-1 letters
+(str-lower "AÇÃO É Ÿ")
+--- want
+"ação é ÿ"
+
+=== str-upper leaves other scripts alone
+(str-upper "日本 ß")
+--- want
+"日本 ß"
+
+=== str-split with an empty separator explodes into runes
+(str-split "" "héy")
+--- want
+(list "h" "é" "y")
+
+=== str-split of an empty string by an empty separator is empty
+(str-split "" "")
+--- want
+(list)
+
+=== str-split of an empty string
+(str-split "," "")
+--- want
+(list "")
+
+=== str-split keeps empty fields
+(str-split "," ",a,,b,")
+--- want
+(list "" "a" "" "b" "")
+
+=== str-replace with an empty old inserts everywhere
+(str-replace "" "-" "ab")
+--- want
+"-a-b-"
+
+=== str-replace removes
+(str-replace "l" "" "hello")
+--- want
+"heo"
+
+=== str-sub clamps
+(str-sub "hello" -3 100)
+--- want
+"hello"
+
+=== str-sub with a negative end means the end
+(str-sub "hello" 1 -1)
+--- want
+"ello"
+
+=== str-sub start past end is empty
+(str-sub "hello" 4 2)
+--- want
+""
+
+=== str-sub rejects a fractional start
+(str-sub "hello" 1.5)
+--- error
+
+=== str-trim removes a no-break space
+(str-trim "  hi  ")
+--- want
+"hi"
+
+=== str-find empty substring
+(str-find "" "abc")
+--- want
+#t
+
+=== str-join needs string elements
+(str-join "-" (list "a" 1))
+--- error
+
+=== str-len of a multibyte string
+(str-len "日本語")
+--- want
+3
+
+=== str-fmt %+d
+(str-fmt "%+d %+d" 5 -5)
+--- want
+"+5 -5"
+
+=== str-fmt %d precision pads digits
+(str-fmt "%.3d" 7)
+--- want
+"007"
+
+=== str-fmt %d precision wins over zero flag
+(str-fmt "%05.3d" 7)
+--- want
+"  007"
+
+=== str-fmt %-5d
+(str-fmt "[%-5d]" 42)
+--- want
+"[42   ]"
+
+=== str-fmt %d negative zero padded
+(str-fmt "%05d" -42)
+--- want
+"-0042"
+
+=== str-fmt %f default precision
+(str-fmt "%f" 1.5)
+--- want
+"1.500000"
+
+=== str-fmt %8.2f
+(str-fmt "[%8.2f]" 3.14159)
+--- want
+"[    3.14]"
+
+=== str-fmt %+.1f
+(str-fmt "%+.1f" 2)
+--- want
+"+2.0"
+
+=== str-fmt %s precision truncates runes
+(str-fmt "%.2s" "héllo")
+--- want
+"hé"
+
+=== str-fmt width counts runes
+(str-fmt "[%4s]" "é")
+--- want
+"[   é]"
+
+=== str-fmt %v quotes a string
+(str-fmt "%v" "a")
+--- want
+"\"a\""
+
+=== str-fmt %s of a list
+(str-fmt "%s" (list 1 2))
+--- want
+"(list 1 2)"
+
+=== str-fmt %d of a fraction in text
+(str-fmt "%d" 2.5)
+--- error
+
+=== str-fmt bad verb shape is an error
+(str-fmt "%1-d" 1)
+--- error

@@ -1,0 +1,111 @@
+packs: math
+
+=== sqrt
+needs host-math
+(sqrt 16)
+--- want
+4
+
+=== sqrt negative
+needs host-math
+(sqrt -1)
+--- error
+
+=== abs negative
+(abs -5)
+--- want
+5
+
+=== abs positive
+(abs 5)
+--- want
+5
+
+=== floor
+(floor 2.7)
+--- want
+2
+
+=== floor negative
+(floor -2.7)
+--- want
+-3
+
+=== ceil
+(ceil 2.1)
+--- want
+3
+
+=== round half up
+(round 2.5)
+--- want
+3
+
+=== round half away from zero
+(round -2.5)
+--- want
+-3
+
+=== to-int truncates
+(to-int 2.7)
+--- want
+2
+
+=== to-int truncates toward zero
+(to-int -2.7)
+--- want
+-2
+
+=== math-min
+(math-min 3 1 2)
+--- want
+1
+
+=== math-max
+(math-max 3 1 2)
+--- want
+3
+
+=== math-min needs an argument
+(math-min)
+--- error
+
+=== pi
+(> (pi) 3.14159)
+--- want
+#t
+
+=== e
+(> (e) 2.718)
+--- want
+#t
+
+=== exp and log round-trip
+needs host-math
+(round (log (exp 3)))
+--- want
+3
+
+=== log10
+needs host-math
+(log10 1000)
+--- want
+3
+
+=== sin zero
+needs host-math
+(sin 0)
+--- want
+0
+
+=== cos zero
+needs host-math
+(cos 0)
+--- want
+1
+
+=== tan zero
+needs host-math
+(tan 0)
+--- want
+0

@@ -1,0 +1,72 @@
+name: test
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  # The behavior gate: the corpus under ASan/UBSan, on both hosts, plus the
+  # API and number-text tests. What the local `make qa` runs first.
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - run: make corpus
+      - run: make corpus-nolibc
+      - run: make api
+      - run: make nolibc
+
+  # Format and the two static analyzers, warnings as errors.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LLVM: /usr/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y clang-format clang-tidy cppcheck
+      - run: make fmt-check
+      - run: make tidy
+      - run: make check
+
+  # No libc at all: the core and the packs as wasm32 objects. This is the
+  # target that catches a stray libc call before an embedded host does.
+  freestanding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LLVM: /usr/bin
+    steps:
+      - uses: actions/checkout@v4
+      - run: make freestanding
+
+  # Any byte string is a script and none may fault. Short by design: this is
+  # a regression smoke test, not the fuzzing campaign.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LLVM: /usr/bin
+      FUZZ_SECONDS: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: make fuzz
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            build/fuzz_crash_*
+            build/fuzz.log
+          if-no-files-found: ignore
