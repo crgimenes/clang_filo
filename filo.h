@@ -139,6 +139,11 @@ struct filo_ctx {
     uint32_t steps;
     uint32_t recursion;
     uint32_t depth;
+    /* How many times a value has been published beyond the scope that made
+       it — a closure capturing its frame, or a write to a global or an
+       enclosing frame. A scope compares this before and after its work to
+       know whether it may hand its memory back; see "regions" in filo.c. */
+    uint64_t escapes;
     void *frame; /* current local scope (internal type) */
     char error[FILO_ERROR_MAX];
     uint8_t signal;      /* internal: exit/return unwinding */

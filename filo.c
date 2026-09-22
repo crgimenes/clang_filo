@@ -181,6 +181,177 @@ static int make_seq(filo_ctx *ctx, uint8_t kind, const filo_value *items, uint32
     return FILO_OK;
 }
 
+/* A range from zero holds no memory: items NULL with a length means the
+   integers 0..len-1. It is a representation of this engine and nothing
+   else — a value crossing the public boundary is materialised first, so no
+   host builtin has to know about it. */
+static filo_value seq_at(const filo_seq *s, uint32_t i) {
+    if (s->items == NULL) {
+        return filo_num((double)i);
+    }
+    return s->items[i];
+}
+
+/* The vector itself, materialising the range for whoever needs a pointer
+   rather than an element. NULL when there is no room. */
+static filo_value *seq_items(filo_ctx *ctx, const filo_seq *s) {
+    if (s->items != NULL || s->len == 0) {
+        return (filo_value *)(void *)(uintptr_t)(const void *)s->items;
+    }
+    filo_value *v = ralloc(ctx, sizeof(filo_value) * s->len);
+    if (v == NULL) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < s->len; i++) {
+        v[i] = filo_num((double)i);
+    }
+    return v;
+}
+
+/* ------------------------------------------------------------------ regions
+
+   The run arena only ever bumps a pointer, so a scope can hand its memory
+   back by moving that pointer down — but only when nothing that outlives
+   the scope points into the part being given back. Two things publish a
+   value beyond the scope that made it: a closure, which captures its frame
+   by reference, and a write to a global or to an enclosing frame. Both
+   bump ctx->escapes, and a scope whose work changed it keeps its memory.
+
+   The result itself has to come down with the pointer. A scalar carries
+   nothing. A string is a flat block, so it slides. A list or a tuple is
+   copied compactly and then relocated, which is why the copy is made
+   contiguous. A closure keeps its region: the frame it captured may form a
+   cycle, and untangling that is the job of the copier that persists
+   globals, not of this one.
+
+   Everything here is an optimisation with no effect a script can observe:
+   the value, the error, the globals and the step count are the same with
+   it and without it. */
+
+enum {
+    /* A copy walks the value with the C stack. The evaluator bounds its own
+       recursion; this bounds ours, and a structure deeper than this simply
+       keeps its region instead of being recovered. */
+    REGION_COPY_DEPTH_MAX = 64,
+};
+
+static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, uint32_t depth) {
+    *dst = *src;
+    if (src->kind == FILO_NUMBER || src->kind == FILO_BOOL) {
+        return true;
+    }
+    if (depth > REGION_COPY_DEPTH_MAX) {
+        return false;
+    }
+    if (src->kind == FILO_STRING) {
+        if (src->u.str.len == 0) {
+            return true;
+        }
+        uint8_t *bytes = ralloc(ctx, src->u.str.len);
+        if (bytes == NULL) {
+            return false;
+        }
+        memcpy(bytes, src->u.str.ptr, src->u.str.len);
+        dst->u.str.ptr = bytes;
+        return true;
+    }
+    if (src->kind != FILO_LIST && src->kind != FILO_TUPLE) {
+        return false; /* a closure: see the note above */
+    }
+    uint32_t n = src->u.seq.len;
+    if (n == 0 || src->u.seq.items == NULL) {
+        return true; /* empty, or a range that was never materialised */
+    }
+    filo_value *items = ralloc(ctx, sizeof(filo_value) * n);
+    if (items == NULL) {
+        return false;
+    }
+    dst->u.seq.items = items;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!region_copy(ctx, &src->u.seq.items[i], &items[i], depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Once the copy slides down, every pointer that aimed inside it moves by
+   the same delta. A pointer that aimed outside — a string literal in the
+   persistent arena — stays where it is, which is what the range test is
+   for. */
+static void region_relocate(filo_value *v, const uint8_t *lo, const uint8_t *hi, ptrdiff_t delta) {
+    if (v->kind == FILO_STRING) {
+        const uint8_t *p = v->u.str.ptr;
+        if (p >= lo && p < hi) {
+            v->u.str.ptr = p + delta;
+        }
+        return;
+    }
+    if (v->kind != FILO_LIST && v->kind != FILO_TUPLE) {
+        return;
+    }
+    filo_value *items = v->u.seq.items;
+    if (items == NULL || v->u.seq.len == 0) {
+        return;
+    }
+    const uint8_t *p = (const uint8_t *)items;
+    if (p >= lo && p < hi) {
+        items = (filo_value *)(void *)(p + delta);
+        v->u.seq.items = items;
+    }
+    for (uint32_t i = 0; i < v->u.seq.len; i++) {
+        region_relocate(&items[i], lo, hi, delta);
+    }
+}
+
+/* The blocks always travel downward — from where the copy was made to the
+   mark below it — and they may overlap, so the copy runs forward. memmove
+   would do it, and it is the one libc function this file would have had to
+   add to its six. */
+static void region_move_down(uint8_t *dst, const uint8_t *src, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = src[i];
+    }
+}
+
+/* Gives the arena back to mark, bringing out with it. */
+static void region_release(filo_ctx *ctx, size_t mark, filo_value *out) {
+    uint8_t *base = ctx->run.base;
+    const uint8_t *hi = base + ctx->run.cap;
+    if (out->kind == FILO_NUMBER || out->kind == FILO_BOOL) {
+        ctx->run.used = mark;
+        return;
+    }
+    if (out->kind == FILO_LIST || out->kind == FILO_TUPLE) {
+        size_t top = ctx->run.used;
+        filo_value copy = {0};
+        if (!region_copy(ctx, out, &copy, 0)) {
+            ctx->run.used = top; /* could not: the region stays as it was */
+            return;
+        }
+        size_t size = ctx->run.used - top;
+        const uint8_t *from = base + top;
+        region_move_down(base + mark, from, size);
+        region_relocate(&copy, from, from + size, (ptrdiff_t)mark - (ptrdiff_t)top);
+        ctx->run.used = mark + size;
+        *out = copy;
+        return;
+    }
+    if (out->kind != FILO_STRING) {
+        return; /* a closure keeps its region */
+    }
+    const uint8_t *p = out->u.str.ptr;
+    if (p == NULL || p < base || p >= hi || p < base + mark) {
+        /* a literal, or older than the mark: valid wherever it is */
+        ctx->run.used = mark;
+        return;
+    }
+    uint32_t len = out->u.str.len;
+    region_move_down(base + mark, p, len);
+    out->u.str.ptr = base + mark;
+    ctx->run.used = mark + ((len + 7U) & ~(size_t)7U);
+}
+
 int filo_list(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *out) {
     return make_seq(ctx, FILO_LIST, items, n, out);
 }
@@ -212,7 +383,9 @@ bool filo_equal(const filo_value *a, const filo_value *b) {
             return false;
         }
         for (uint32_t i = 0; i < a->u.seq.len; i++) {
-            if (!filo_equal(&a->u.seq.items[i], &b->u.seq.items[i])) {
+            filo_value av = seq_at(&a->u.seq, i);
+            filo_value bv = seq_at(&b->u.seq, i);
+            if (!filo_equal(&av, &bv)) {
                 return false;
             }
         }
@@ -1362,6 +1535,8 @@ static int as_bool(filo_ctx *ctx, const filo_value *v, bool *out) {
 
 static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
                         const filo_instr *const *args, uint32_t n, filo_value *out) {
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
     filo_value *vals = NULL;
     if (eval_args(ctx, args, n, &vals) != FILO_OK) {
         if (ctx->signal == SIG_NONE) {
@@ -1382,6 +1557,9 @@ static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
             (void)prefix_error(ctx, prefix);
         }
         return FILO_ERR;
+    }
+    if (ctx->escapes == escapes) {
+        region_release(ctx, mark, out);
     }
     return FILO_OK;
 }
@@ -1442,6 +1620,8 @@ int filo_call(filo_ctx *ctx, const filo_value *fnv, const filo_value *args, uint
     if (enter_call(ctx) != FILO_OK) {
         return FILO_ERR;
     }
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
     filo_value *slots = NULL;
     if (n > 0) {
         slots = ralloc(ctx, sizeof(filo_value) * n);
@@ -1451,7 +1631,11 @@ int filo_call(filo_ctx *ctx, const filo_value *fnv, const filo_value *args, uint
         }
         memcpy(slots, args, sizeof(filo_value) * n);
     }
-    return run_func(ctx, fn, slots, n, out);
+    int rc = run_func(ctx, fn, slots, n, out);
+    if (rc == FILO_OK && ctx->escapes == escapes) {
+        region_release(ctx, mark, out);
+    }
+    return rc;
 }
 
 static int eval_call(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
@@ -1483,6 +1667,8 @@ static int eval_call(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     if (enter_call(ctx) != FILO_OK) {
         return wrap(ctx, "function call", FILO_ERR);
     }
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
     filo_value *slots = NULL;
     if (n > 0) {
         slots = ralloc(ctx, sizeof(filo_value) * n);
@@ -1501,7 +1687,11 @@ static int eval_call(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
             return wrap(ctx, "function call", FILO_ERR);
         }
     }
-    return wrap(ctx, "function call", run_func(ctx, fn, slots, n, out));
+    int rc = wrap(ctx, "function call", run_func(ctx, fn, slots, n, out));
+    if (rc == FILO_OK && ctx->escapes == escapes) {
+        region_release(ctx, mark, out);
+    }
+    return rc;
 }
 
 static int eval_if(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
@@ -1582,6 +1772,8 @@ static int eval_let(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     if (in->nargs <= n) {
         return filo_fail(ctx, "let expects bindings and body");
     }
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
     frame *f = ralloc(ctx, sizeof(frame));
     if (f == NULL) {
         return FILO_ERR;
@@ -1606,6 +1798,9 @@ static int eval_let(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     }
     int rc = eval_body(ctx, in->args + n, in->nargs - n, out);
     ctx->frame = old;
+    if (rc == FILO_OK && ctx->escapes == escapes) {
+        region_release(ctx, mark, out);
+    }
     return rc;
 }
 
@@ -1632,7 +1827,9 @@ static int eval_letv(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         if (f->slots == NULL) {
             return FILO_ERR;
         }
-        memcpy(f->slots, t.u.seq.items, sizeof(filo_value) * f->n);
+        for (uint32_t i = 0; i < f->n; i++) {
+            f->slots[i] = seq_at(&t.u.seq, i);
+        }
     }
     f->parent = ctx->frame;
     frame *old = ctx->frame;
@@ -1658,6 +1855,9 @@ static int eval_set(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         frame *f = ctx->frame;
         for (uint32_t i = 0; i < target->a; i++) {
             f = f->parent;
+        }
+        if (target->a > 0) {
+            ctx->escapes++; /* an enclosing scope now holds it */
         }
         f->slots[target->b] = v;
         *out = v;
@@ -1810,6 +2010,7 @@ static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         rc = wrap(ctx, "set", eval_set(ctx, in, out));
         break;
     case OP_FN:
+        ctx->escapes++; /* it captures the frame in effect, by reference */
         rc = wrap(ctx, "fn", eval_fn(ctx, in, out));
         break;
     case OP_DEF:
@@ -1927,7 +2128,8 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
     }
     case FILO_LIST:
     case FILO_TUPLE: {
-        if (src->u.seq.len == 0 || in_persistent(ctx, src->u.seq.items)) {
+        if (src->u.seq.len == 0 || src->u.seq.items == NULL ||
+            in_persistent(ctx, src->u.seq.items)) {
             return FILO_OK;
         }
         filo_value *items = palloc(ctx, sizeof(filo_value) * src->u.seq.len);
@@ -1966,6 +2168,7 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
 /* During a run a global holds run-arena data and is marked dirty; the run
    end copies dirty globals out (or restores them when the run failed). */
 static void set_global_id(filo_ctx *ctx, uint32_t id, filo_value v) {
+    ctx->escapes++; /* the value outlives whatever scope is running */
     if (!ctx->dirty[id]) {
         ctx->dirty[id] = true;
         ctx->saved[id] = ctx->globals[id];
@@ -2137,7 +2340,8 @@ static int render(filo_ctx *ctx, const filo_value *v, sink *s, bool quote) {
         sink_puts(s, v->kind == FILO_LIST ? "(list" : "(tuple");
         for (uint32_t i = 0; i < v->u.seq.len; i++) {
             sink_puts(s, " ");
-            if (render(ctx, &v->u.seq.items[i], s, true) != FILO_OK) {
+            filo_value item = seq_at(&v->u.seq, i);
+            if (render(ctx, &item, s, true) != FILO_OK) {
                 return FILO_ERR;
             }
         }
@@ -2286,6 +2490,14 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
         return FILO_ERR;
     }
     if (result != NULL) {
+        if ((v.kind == FILO_LIST || v.kind == FILO_TUPLE) && v.u.seq.items == NULL &&
+            v.u.seq.len > 0) {
+            filo_value *items = seq_items(ctx, &v.u.seq); /* it crosses the boundary */
+            if (items == NULL) {
+                return FILO_ERR;
+            }
+            v.u.seq.items = items;
+        }
         *result = v;
     }
     return FILO_OK;
@@ -2679,7 +2891,7 @@ static int b_head(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value 
     if (l.len == 0) {
         return filo_fail(ctx, "head of empty list");
     }
-    *out = l.items[0];
+    *out = seq_at(&l, 0);
     return FILO_OK;
 }
 
@@ -2694,7 +2906,11 @@ static int b_tail(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value 
     if (l.len == 0) {
         return filo_fail(ctx, "tail of empty list");
     }
-    return filo_list(ctx, l.items + 1, l.len - 1, out);
+    const filo_value *items = seq_items(ctx, &l);
+    if (items == NULL) {
+        return FILO_ERR;
+    }
+    return filo_list(ctx, items + 1, l.len - 1, out);
 }
 
 /* Integral and exactly representable (|x| <= 2^53); NaN and infinities fail,
@@ -2721,7 +2937,7 @@ static int b_nth(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     if (idx < 0 || idx >= (double)l.len) {
         return filo_fail(ctx, "index out of range");
     }
-    *out = l.items[(uint32_t)idx];
+    *out = seq_at(&l, (uint32_t)idx);
     return FILO_OK;
 }
 
@@ -2737,7 +2953,9 @@ static int b_list_append(filo_ctx *ctx, const filo_value *args, uint32_t n, filo
         return FILO_ERR;
     }
     if (l.len > 0) {
-        memcpy(out->u.seq.items, l.items, sizeof(filo_value) * l.len);
+        for (uint32_t i = 0; i < l.len; i++) {
+            out->u.seq.items[i] = seq_at(&l, i);
+        }
     }
     out->u.seq.items[l.len] = args[1];
     return FILO_OK;
@@ -2764,8 +2982,11 @@ static int b_list_concat(filo_ctx *ctx, const filo_value *args, uint32_t n, filo
     uint32_t at = 0;
     for (uint32_t i = 0; i < n; i++) {
         if (args[i].u.seq.len > 0) {
-            memcpy(out->u.seq.items + at, args[i].u.seq.items,
-                   sizeof(filo_value) * args[i].u.seq.len);
+            const filo_value *from = seq_items(ctx, &args[i].u.seq);
+            if (from == NULL) {
+                return FILO_ERR;
+            }
+            memcpy(out->u.seq.items + at, from, sizeof(filo_value) * args[i].u.seq.len);
             at += args[i].u.seq.len;
         }
     }
@@ -2787,7 +3008,8 @@ static int b_map(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
         return FILO_ERR;
     }
     for (uint32_t i = 0; i < l.len; i++) {
-        if (filo_call(ctx, &args[0], &l.items[i], 1, &out->u.seq.items[i]) != FILO_OK) {
+        filo_value item = seq_at(&l, i);
+        if (filo_call(ctx, &args[0], &item, 1, &out->u.seq.items[i]) != FILO_OK) {
             return FILO_ERR;
         }
     }
@@ -2807,7 +3029,7 @@ static int b_fold(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value 
     }
     filo_value acc = args[1];
     for (uint32_t i = 0; i < l.len; i++) {
-        filo_value pair[2] = {acc, l.items[i]};
+        filo_value pair[2] = {acc, seq_at(&l, i)};
         if (filo_call(ctx, &args[0], pair, 2, &acc) != FILO_OK) {
             return FILO_ERR;
         }
@@ -2833,7 +3055,8 @@ static int b_filter(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_valu
     uint32_t kept = 0;
     for (uint32_t i = 0; i < l.len; i++) {
         filo_value v = {0};
-        if (filo_call(ctx, &args[0], &l.items[i], 1, &v) != FILO_OK) {
+        filo_value item = seq_at(&l, i);
+        if (filo_call(ctx, &args[0], &item, 1, &v) != FILO_OK) {
             return FILO_ERR;
         }
         bool keep = false;
@@ -2841,7 +3064,7 @@ static int b_filter(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_valu
             return prefix_error(ctx, "filter predicate must return a bool: ");
         }
         if (keep) {
-            out->u.seq.items[kept] = l.items[i];
+            out->u.seq.items[kept] = seq_at(&l, i);
             kept++;
         }
     }
@@ -2861,7 +3084,7 @@ static int b_reverse(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_val
         return FILO_ERR;
     }
     for (uint32_t i = 0; i < l.len; i++) {
-        out->u.seq.items[l.len - 1 - i] = l.items[i];
+        out->u.seq.items[l.len - 1 - i] = seq_at(&l, i);
     }
     return FILO_OK;
 }
@@ -2892,6 +3115,13 @@ static int b_range(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value
         return filo_fail(ctx, "range too large");
     }
     uint32_t count = (uint32_t)(hi - lo);
+    if (lo == 0) {
+        memset(out, 0, sizeof(*out));
+        out->kind = FILO_LIST;
+        out->u.seq.items = NULL; /* the integers 0..count-1, holding no memory */
+        out->u.seq.len = count;
+        return FILO_OK;
+    }
     if (make_seq(ctx, FILO_LIST, NULL, count, out) != FILO_OK) {
         return FILO_ERR;
     }
@@ -2974,7 +3204,18 @@ int filo_arg_str(filo_ctx *ctx, const filo_value *v, filo_str *out) {
 }
 
 int filo_arg_list(filo_ctx *ctx, const filo_value *v, filo_seq *out) {
-    return as_list(ctx, v, out);
+    int rc = as_list(ctx, v, out);
+    if (rc != FILO_OK) {
+        return rc;
+    }
+    if (out->items == NULL && out->len > 0) {
+        filo_value *items = seq_items(ctx, out); /* the host gets a real vector */
+        if (items == NULL) {
+            return FILO_ERR;
+        }
+        out->items = items;
+    }
+    return FILO_OK;
 }
 
 void *filo_alloc(filo_ctx *ctx, size_t n) {
