@@ -142,10 +142,7 @@ void filo_libc_install(void) {
 }
 
 const filo_host filo_libc_host = {
-    NULL,
-    filo_libc_num_to_str,
-    filo_libc_str_to_num,
-    NULL,
+    NULL, filo_libc_num_to_str, filo_libc_str_to_num, NULL, NULL,
 };
 
 const filo_math_fns filo_libc_math = {sqrt, sin, cos, tan, log, log10, exp};

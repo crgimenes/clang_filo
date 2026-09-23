@@ -84,6 +84,22 @@ static void test_seal_refuses_new_globals(void) {
     CHECK(v.u.num == 3);
 }
 
+/* The table holds FILO_SYMBOLS_MAX names, a build setting; one more is an
+   error, not a write past the end. */
+static void test_symbol_table_is_bounded(void) {
+    start();
+    char name[16];
+    uint32_t made = CTX.nsymbols;
+    for (uint32_t i = made; i < FILO_SYMBOLS_MAX; i++) {
+        (void)snprintf(name, sizeof(name), "g%u", i);
+        CHECK(filo_set_global(&CTX, name, filo_num(i)) == FILO_OK);
+    }
+    CHECK(filo_set_global(&CTX, "one_too_many", filo_num(0)) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "too many globals") != NULL);
+    filo_value v = {0};
+    CHECK(run("(def another 1)", &v) == FILO_ERR);
+}
+
 static void test_seal_is_off_until_asked(void) {
     start();
     filo_value v = {0};
@@ -319,6 +335,7 @@ int main(void) {
     test_globals_cross_both_ways();
     test_seal_refuses_new_globals();
     test_seal_is_off_until_asked();
+    test_symbol_table_is_bounded();
     test_host_calls_a_script_function();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();

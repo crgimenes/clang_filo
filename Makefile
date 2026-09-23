@@ -13,7 +13,7 @@ ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
 TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix
 
-.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc device fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -61,15 +61,42 @@ oracle: corpus
 	./build/corpus_runner_san --nolibc --vm $(ORACLE)
 
 # The device build: the core without its front end (FILO_VM_ONLY: no parser,
-# no IR, no compiler), the libc-free number host, no libm. It runs the corpus
-# and the oracle as units the full build compiled, and must give what the
-# full build gave on every one.
+# no IR, no compiler), the libc-free number host, no libm, and the symbol
+# table a small board sizes down to. It runs the corpus and the oracle as
+# units the full build compiled, and must give what the full build gave on
+# every one.
 device: all device_test.c
 	@rm -rf build/units && mkdir -p build/units
 	@./build/corpus_runner --nolibc --vm --write-units build/units $(CORPUS) $(ORACLE) > /dev/null
-	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) -DFILO_VM_ONLY \
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) -DFILO_VM_ONLY -DFILO_SYMBOLS_MAX=128 \
 		-o build/device_test $(CORE) $(PACKS) $(NOLIBC) device_test.c
 	./build/device_test build/units
+
+# The filo command, the listing and the trace. The listing reads units with
+# a reader of its own (fbc_dump.c, from docs/bytecode.md alone), so it is
+# held to the loader on every unit the corpus and the oracle compile to, and
+# to the runtime on how numbers are written. What the examples show is kept
+# in testdata/cli: a change to the compiler is a change to what a lesson
+# shows, and it shows up here (make cli-regen rewrites them).
+CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace
+CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c
+
+build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
+	@mkdir -p build
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
+		-o build/filo $(CLI_SRC) filo_cli.c -lm
+
+cli: device build/filo dump_test.c
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
+		-o build/dump_test $(CLI_SRC) dump_test.c -lm
+	./build/dump_test build/units
+	@for c in $(CLI_CASES); do \
+		./build/filo $$(sh testdata/cli/args.sh $$c) > build/cli.out 2>&1; \
+		diff -u testdata/cli/$$c build/cli.out || exit 1; \
+	done; echo "cli: $(words $(CLI_CASES)) outputs as kept"
+
+cli-regen: build/filo
+	@for c in $(CLI_CASES); do ./build/filo $$(sh testdata/cli/args.sh $$c) > testdata/cli/$$c 2>&1; done
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:
@@ -86,7 +113,7 @@ tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
-		nolibc_test.c -- -std=c11
+		nolibc_test.c fbc_dump.c filo_cli.c dump_test.c -- -std=c11
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) device_test.c -- -std=c11 -DFILO_VM_ONLY
@@ -94,7 +121,7 @@ tidy:
 check:
 	cppcheck --enable=warning,style,performance,portability --inline-suppr \
 		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c \
-		api_test.c nolibc_test.c device_test.c
+		api_test.c nolibc_test.c device_test.c fbc_dump.c filo_cli.c dump_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
 # strlen/strchr: the same freestanding wasm32 target the msh terminal uses.
@@ -135,12 +162,12 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 # A unit is input from anywhere, so the loader and the machine are fuzzed
 # with units: the corpus compiled to bytecode as seeds, mutated from there.
 # The target is the device build, which is where units from anywhere run.
-fuzz-bc: all fuzz_bc.c
+fuzz-bc: all fuzz_bc.c fbc_dump.c fbc_dump.h
 	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
 	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
 	@rm -f build/fuzz_bc_seeds/*.expect
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
-		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fuzz_bc.c -lm
+		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fbc_dump.c fuzz_bc.c -lm
 	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \
 		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds \
 		> build/fuzz_bc.log 2>&1 || { tail -30 build/fuzz_bc.log; exit 1; }
@@ -151,7 +178,7 @@ bench: $(CORE) $(PACKS) $(HOST) bench.c $(HDRS)
 	$(CC) $(CFLAGS) -o build/bench $(CORE) $(PACKS) $(HOST) bench.c -lm
 	./build/bench 2000
 
-qa: all fmt-check corpus corpus-nolibc oracle api nolibc device tidy check freestanding fuzz fuzz-bc
+qa: all fmt-check corpus corpus-nolibc oracle api nolibc device cli tidy check freestanding fuzz fuzz-bc
 
 clean:
 	rm -rf build

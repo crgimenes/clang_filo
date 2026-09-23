@@ -164,7 +164,28 @@ builtins, the loader and the VM. Measured with the ESP32-S3's gcc at `-Os`:
 
 `make device` holds it to the full build: the full build writes every corpus
 and oracle case as a unit, with what the run gave, and the device build,
-with the libc-free number host and no libm, must give the same for each.
+with the libc-free number host, no libm and a symbol table of 128
+(`FILO_SYMBOLS_MAX`), must give the same for each.
+
+## Seeing it run
+
+`filo` (built by `make cli`) takes a program from source to the machine in
+view:
+
+    filo run examples/dobro.filo            # 42, from the IR
+    filo build -o dobro.fbc examples/dobro.filo
+    filo dump dobro.fbc                     # the unit, every operand named
+    filo run --trace dobro.fbc              # each instruction, with the stack
+
+The listing reads units with `fbc_dump.c`, written from this document alone
+and sharing no code with the loader: a second reading of the format, held to
+the loader on every unit the corpus and the oracle compile to. The trace is
+the `trace` hook of `filo_host`, which sees each instruction before it runs:
+its offset in the code section, the operand stack and how many calls deep
+the run is; the host decodes the instruction from the unit's bytes. It costs
+a check per instruction, as `should_stop` does (about 3% on a recursive
+`fib`), and the IR has no trace. What the examples show is kept in
+`testdata/cli`.
 
 ## Loading is a trust boundary
 

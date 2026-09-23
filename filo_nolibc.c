@@ -926,8 +926,5 @@ size_t filo_nolibc_num_to_str(void *user, double x, char *dst, size_t cap) {
 const filo_strings_fns filo_nolibc_strings = {nolibc_fmt_fixed};
 
 const filo_host filo_nolibc_host = {
-    NULL,
-    filo_nolibc_num_to_str,
-    filo_nolibc_str_to_num,
-    NULL,
+    NULL, filo_nolibc_num_to_str, filo_nolibc_str_to_num, NULL, NULL,
 };

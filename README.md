@@ -21,7 +21,12 @@ and the bytecode.
 Built with `-DFILO_VM_ONLY`, the runtime keeps only what runs a unit: no
 parser, no IR, no compiler. On an ESP32-S3 that is 17 KB of code instead of
 30 KB. `make device` runs the corpus and the oracle, compiled by the full
-build, on that build.
+build, on that build. `FILO_SYMBOLS_MAX` (512 by default, about 40 bytes a
+name in every context) is a build setting too; the device check runs with
+128.
+
+`filo run`, `filo build`, `filo dump` and `filo run --trace` show the road
+from source to the machine: `examples/` starts at "olá mundo".
 
 ## Memory
 
@@ -113,6 +118,7 @@ sustain. Case mapping covers ASCII and the Latin-1 letters.
 | `make api` | host API behavior the corpus cannot express |
 | `make nolibc` | the libc-free number text against the libc one |
 | `make device` | the corpus and the oracle as units, on the `FILO_VM_ONLY` build |
+| `make cli` | the `filo` command, its listing and trace against the runtime and `testdata/cli` |
 | `make fmt-check` / `make fmt` | clang-format |
 | `make tidy` / `make check` | clang-tidy and cppcheck, warnings as errors |
 | `make freestanding` | wasm32 objects, `-ffreestanding -nostdlib` |

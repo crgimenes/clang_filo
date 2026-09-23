@@ -30,7 +30,6 @@ enum {
 enum {
     FILO_ERROR_MAX = 256,
     FILO_BUILTINS_MAX = 96,
-    FILO_SYMBOLS_MAX = 512,
     FILO_STEP_LIMIT_DEFAULT = 100000,
     FILO_RECURSION_LIMIT_DEFAULT = 128,
     FILO_RANGE_MAX = 1048576,   /* 2^20 elements; same ceiling as the Go runtime */
@@ -38,6 +37,14 @@ enum {
                                    configuration, not part of the language */
     FILO_EVAL_DEPTH_MAX = 512,  /* nesting of eval() calls: bounds the C stack */
 };
+
+/* Globals a context can name. Each costs about 40 bytes on a 32-bit target
+   in every context (the value, its saved copy, the name, three flags), so a
+   board with little RAM sizes it to what its programs use. It shapes
+   filo_ctx: the whole build must agree on it, as on FILO_VM_ONLY. */
+#ifndef FILO_SYMBOLS_MAX
+#define FILO_SYMBOLS_MAX 512
+#endif
 
 typedef enum {
     FILO_NUMBER = 0,
@@ -79,11 +86,24 @@ struct filo_value {
    failure it sets the message with filo_fail() and returns FILO_ERR. */
 typedef int (*filo_builtin)(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out);
 
+/* One instruction of the bytecode machine, about to run: where it is in its
+   unit's code section, the operand stack as it stands (bottom first), and
+   how many calls deep the run is. The instruction itself is in the unit's
+   bytes, which the host has; docs/bytecode.md says how to read it. */
+typedef struct {
+    uint32_t pc;
+    const filo_value *stack;
+    uint32_t depth;
+    uint32_t calls;
+} filo_trace;
+
 /* Host hooks. Number formatting and parsing are hooks because doing them
    exactly (shortest round-trip text, Go's ParseFloat rules) needs either libc
    or a deliberate algorithm; filo_libc.c provides both on a libc host.
    should_stop, when set, is polled at every step and ends the run with an
-   error when it returns true — the host's timeout or cancellation. */
+   error when it returns true — the host's timeout or cancellation. trace,
+   when set, sees every bytecode instruction before it runs: the machine
+   shown at work, for someone learning how it runs. The IR has no trace. */
 typedef struct {
     void *user;
     /* writes the shortest round-trip text of x; returns the length or 0 */
@@ -91,6 +111,7 @@ typedef struct {
     /* parses the whole of s; returns false when it is not a number */
     bool (*str_to_num)(void *user, const uint8_t *s, size_t len, double *out);
     bool (*should_stop)(void *user);
+    void (*trace)(void *user, const filo_trace *t);
 } filo_host;
 
 typedef struct {

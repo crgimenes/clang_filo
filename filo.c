@@ -3813,6 +3813,10 @@ static int vm_loop(filo_ctx *ctx, bc_act *base, filo_value *out) {
         if (a->pc >= end) {
             return filo_fail(ctx, "bytecode: ran past the end of a function");
         }
+        if (ctx->host.trace != NULL) {
+            filo_trace t = {a->pc, a->stack, a->sp, ctx->recursion};
+            ctx->host.trace(ctx->host.user, &t);
+        }
         uint32_t b = u->code[a->pc];
         a->pc++;
         uint32_t op = b >> 3U;

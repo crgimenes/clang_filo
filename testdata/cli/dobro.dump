@@ -1,0 +1,27 @@
+unit: 152 bytes, format 1, checksum cde4b0cf ok
+widest stack 2, widest frame 1
+
+imports (1): what the loading context must provide
+     0  *
+globals (1)
+     0  dobro
+constants (2)
+     0  21
+     1  2
+exports (1)
+  dobro -> fn 0
+
+fn 0 (entry "dobro"): params 0, slots 0, stack 2, 7 bytes
+  0000  61              CLOSURE  1         fn 1
+  0001  10              STORE_G  0         dobro
+  0002  39              POP      1
+  0003  08              PUSH_G   0         dobro
+  0004  00              PUSH_K   0         21
+  0005  49              CALL     1
+  0006  58              RET      0         return
+
+fn 1: params 1, slots 1, stack 2, 5 bytes
+  0007  18              PUSH_L   0         slot 0
+  0008  01              PUSH_K   1         2
+  0009  52 00           CALLB    2 0       *
+  0011  58              RET      0         return
