@@ -182,6 +182,136 @@ static void test_limits_are_enforced(void) {
     CHECK(filo_error(&CTX)[0] != '\0');
 }
 
+/* ---- bytecode ---- */
+
+static uint8_t unit_buf[1U << 16U];
+
+/* Builds a unit from sources compiled in CTX: entries named after the
+   sources' order, "e0", "e1", … */
+static size_t build(const char *const *srcs, uint32_t n) {
+    static filo_prog progs[4];
+    static const char *names[4] = {"e0", "e1", "e2", "e3"};
+    filo_bc_entry entries[4];
+    for (uint32_t i = 0; i < n; i++) {
+        CHECK(filo_compile(&CTX, (const uint8_t *)srcs[i], strlen(srcs[i]), &progs[i]) == FILO_OK);
+        entries[i].name = names[i];
+        entries[i].prog = &progs[i];
+    }
+    size_t len = 0;
+    CHECK(filo_bc_build(&CTX, entries, n, unit_buf, sizeof(unit_buf), &len) == FILO_OK);
+    return len;
+}
+
+static void test_bc_short_buffer_says_the_size(void) {
+    start();
+    filo_prog prog;
+    const char *src = "(+ 1 2)";
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    filo_bc_entry e = {"main", &prog};
+    size_t len = 0;
+    CHECK(filo_bc_build(&CTX, &e, 1, unit_buf, 8, &len) == FILO_ERR);
+    CHECK(len > 8);
+    size_t need = len;
+    CHECK(filo_bc_build(&CTX, &e, 1, unit_buf, need, &len) == FILO_OK);
+    CHECK(len == need);
+}
+
+static void test_bc_refuses_a_damaged_unit(void) {
+    start();
+    const char *src[] = {"(+ 1 2)"};
+    size_t len = build(src, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    unit_buf[len - 1] ^= 1U; /* one bit anywhere */
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "checksum") != NULL);
+    unit_buf[len - 1] ^= 1U;
+    unit_buf[0] = 'X';
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "not a Filo unit") != NULL);
+    unit_buf[0] = 0x7F;
+    CHECK(filo_bc_load(&CTX, unit_buf, len - 1, &u) == FILO_ERR);
+}
+
+static int twice(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
+    double x = 0;
+    if (n != 1 || filo_arg_num(ctx, &args[0], &x) != FILO_OK) {
+        return filo_fail(ctx, "twice expects a number");
+    }
+    *out = filo_num(x * 2);
+    return FILO_OK;
+}
+
+/* The imports are the capability list: a context without one of them does
+   not load the unit at all, rather than failing at the call. */
+static void test_bc_missing_builtin_fails_the_load(void) {
+    start();
+    CHECK(filo_register_builtin(&CTX, "twice", twice) == FILO_OK);
+    const char *src[] = {"(twice 21)"};
+    size_t len = build(src, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    filo_value v;
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 42);
+    CHECK(filo_bc_run(&CTX, u, "nope", NULL, &v) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "no entry point") != NULL);
+    start(); /* a context that never registered twice */
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strcmp(filo_error(&CTX), "missing builtin: twice") == 0);
+}
+
+/* Entry points of one unit share its globals, as a screen's hooks share
+   what its init defined. */
+static void test_bc_entries_share_globals(void) {
+    start();
+    const char *src[] = {"(def n 5)", "(set n (+ n 1))"};
+    size_t len = build(src, 2);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    filo_value v;
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK);
+    CHECK(filo_get_global(&CTX, "n", &v) && v.u.num == 7);
+}
+
+/* The IR and the bytecode call each other both ways, and the host calls a
+   bytecode function like any other: a closure is a closure. */
+static void test_bc_and_ir_call_each_other(void) {
+    start();
+    filo_value v;
+    CHECK(run("(def inc (fn (x) (+ x 1)))", &v) == FILO_OK);
+    const char *src[] = {"(do (def dbl (fn (x) (* x 2))) (inc 41))"};
+    size_t len = build(src, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 42); /* bytecode called the IR's inc */
+    CHECK(run("(fold (fn (acc x) (+ acc x)) 0 (map dbl (list 1 2 3)))", &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 12); /* map called the bytecode's dbl */
+    filo_value fn;
+    CHECK(filo_get_global(&CTX, "dbl", &fn));
+    filo_value arg = filo_num(5);
+    CHECK(filo_call(&CTX, &fn, &arg, 1, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 10);
+}
+
+/* A sealed context names its globals once; a unit that needs another one
+   is refused when it loads. */
+static void test_bc_sealed_context_refuses_unknown_globals(void) {
+    start();
+    CHECK(filo_set_global(&CTX, "known", filo_num(1)) == FILO_OK);
+    const char *src[] = {"(+ known other)"};
+    size_t len = build(src, 1);
+    start();
+    CHECK(filo_set_global(&CTX, "known", filo_num(1)) == FILO_OK);
+    filo_seal_globals(&CTX);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "other") != NULL);
+}
+
 int main(void) {
     filo_libc_install();
     test_globals_cross_both_ways();
@@ -191,6 +321,12 @@ int main(void) {
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();
     test_limits_are_enforced();
+    test_bc_short_buffer_says_the_size();
+    test_bc_refuses_a_damaged_unit();
+    test_bc_missing_builtin_fails_the_load();
+    test_bc_entries_share_globals();
+    test_bc_and_ir_call_each_other();
+    test_bc_sealed_context_refuses_unknown_globals();
     if (failures > 0) {
         printf("%d failure(s)\n", failures);
         return 1;

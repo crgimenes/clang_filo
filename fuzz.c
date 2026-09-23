@@ -26,6 +26,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     filo_limits limits = {20000U, 64U};
     filo_value v;
+    /* the same program through the bytecode: the compiler sees every shape
+       the fuzzer invents */
+    static uint8_t unit[1U << 16U];
+    filo_bc_entry entry = {"main", &prog};
+    size_t len = 0;
+    const filo_unit *u = NULL;
+    if (filo_bc_build(&ctx, &entry, 1, unit, sizeof(unit), &len) == FILO_OK &&
+        filo_bc_load(&ctx, unit, len, &u) == FILO_OK) {
+        (void)filo_bc_run(&ctx, u, "main", &limits, &v);
+    }
     if (filo_run(&ctx, &prog, &limits, &v) == FILO_OK) {
         char buf[256];
         size_t n = 0;

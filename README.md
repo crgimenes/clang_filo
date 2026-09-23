@@ -9,6 +9,15 @@ Two files are the whole core — `filo.h` and `filo.c` — with no libc beyond
 `memcpy`/`memset`/`memcmp`/`strlen`/`strcmp`/`strchr` and no allocation after
 init. It builds for a freestanding wasm32 target and for microcontrollers.
 
+A program can also be compiled to bytecode ([docs/bytecode.md](docs/bytecode.md)):
+a unit of a few kilobytes that a stack machine runs in place, from flash or
+from wherever its bytes live, with no parser and no IR in memory. The ten
+screens of the author's board take 766 KB of IR and 25 KB as units. Its
+imports are its capability list — a context without one of them refuses the
+unit — and a unit is treated as untrusted input: checksummed, bounds-checked
+and fuzzed. Every corpus case and the Prolog oracle run through both the IR
+and the bytecode.
+
 ## Memory
 
 The host hands over two blocks and the runtime never asks for more:
@@ -92,14 +101,17 @@ sustain. Case mapping covers ASCII and the Latin-1 letters.
 
 | target | what it does |
 | --- | --- |
-| `make corpus` | the corpus under ASan/UBSan |
+| `make corpus` | the corpus under ASan/UBSan, through the IR and the bytecode |
 | `make corpus-nolibc` | the same corpus with the libc-free host |
+| `make oracle` | the Prolog spec's answers, exported from the Go repository |
+| `make oracle-regen` | rewrites them; needs the Go checkout beside this one |
 | `make api` | host API behavior the corpus cannot express |
 | `make nolibc` | the libc-free number text against the libc one |
 | `make fmt-check` / `make fmt` | clang-format |
 | `make tidy` / `make check` | clang-tidy and cppcheck, warnings as errors |
 | `make freestanding` | wasm32 objects, `-ffreestanding -nostdlib` |
-| `make fuzz` | libFuzzer, `FUZZ_SECONDS=15` by default |
+| `make fuzz` | libFuzzer on source, `FUZZ_SECONDS=15` by default |
+| `make fuzz-bc` | libFuzzer on units, seeded with the corpus compiled |
 | `make bench` | `fib 15`, the Go `BenchmarkRecursiveCall` script |
 | `make qa` | all of the above; the gate before anything is called done |
 

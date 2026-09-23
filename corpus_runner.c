@@ -51,6 +51,44 @@ static bool want_strings = false;
 /* The same corpus against the libc-free host: a runtime that answers
    differently depending on who formats its numbers is two runtimes. */
 static bool use_nolibc = false;
+/* --vm: every case goes through the bytecode too — compiled, written as a
+   unit, loaded back from the bytes and run by the VM. */
+static bool use_vm = false;
+static uint8_t unit_mem[1U << 20U];
+/* --write-units DIR: each case's unit is also written there, as a seed for
+   the bytecode fuzzer */
+static const char *units_dir = NULL;
+static unsigned units_written = 0;
+
+static void write_unit(const uint8_t *data, size_t len) {
+    char path[512];
+    (void)snprintf(path, sizeof(path), "%s/%05u.fbc", units_dir, units_written);
+    units_written++;
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        return;
+    }
+    (void)fwrite(data, 1, len, f);
+    (void)fclose(f);
+}
+
+static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits,
+                       filo_value *out) {
+    if (!use_vm) {
+        return filo_run(ctx, prog, limits, out);
+    }
+    filo_bc_entry entry = {"main", prog};
+    size_t len = 0;
+    const filo_unit *unit = NULL;
+    if (filo_bc_build(ctx, &entry, 1, unit_mem, sizeof(unit_mem), &len) != FILO_OK ||
+        filo_bc_load(ctx, unit_mem, len, &unit) != FILO_OK) {
+        return FILO_ERR;
+    }
+    if (units_dir != NULL) {
+        write_unit(unit_mem, len);
+    }
+    return filo_bc_run(ctx, unit, "main", limits, out);
+}
 
 static void init_ctx(filo_ctx *ctx, void *p, size_t pcap, void *r, size_t rcap) {
     filo_init(ctx, use_nolibc ? &filo_nolibc_host : &filo_libc_host, p, pcap, r, rcap);
@@ -156,7 +194,7 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
     filo_value got;
     bool failed = true;
     if (filo_compile(ctx, (const uint8_t *)c->script, strlen(c->script), &prog) == FILO_OK &&
-        filo_run(ctx, &prog, c->has_limits ? &c->limits : NULL, &got) == FILO_OK) {
+        run_program(ctx, &prog, c->has_limits ? &c->limits : NULL, &got) == FILO_OK) {
         failed = false;
     }
     if (c->want_err) {
@@ -416,14 +454,25 @@ static bool run_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("usage: corpus_runner [--nolibc] FILE...\n");
+        printf("usage: corpus_runner [--nolibc] [--vm] [--write-units DIR] FILE...\n");
         return 2;
     }
     int first = 1;
-    if (strcmp(argv[1], "--nolibc") == 0) {
-        use_nolibc = true;
-        first = 2;
-    } else {
+    while (first < argc && argv[first][0] == '-' && argv[first][1] == '-') {
+        if (strcmp(argv[first], "--nolibc") == 0) {
+            use_nolibc = true;
+        } else if (strcmp(argv[first], "--vm") == 0) {
+            use_vm = true;
+        } else if (strcmp(argv[first], "--write-units") == 0 && first + 1 < argc) {
+            first++;
+            units_dir = argv[first];
+        } else {
+            printf("unknown flag %s\n", argv[first]);
+            return 2;
+        }
+        first++;
+    }
+    if (!use_nolibc) {
         filo_libc_install(); /* pow with a fractional exponent needs libm */
     }
     for (int i = first; i < argc; i++) {

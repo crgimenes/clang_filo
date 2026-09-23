@@ -905,12 +905,15 @@ struct frame {
     frame *parent;
 };
 
+typedef struct bc_fn bc_fn;
+
 struct filo_func {
     const char *const *params;
     uint32_t nparams;
     const filo_instr *const *body;
     uint32_t nbody;
     frame *frame;
+    const bc_fn *bc; /* set when the body is bytecode instead of IR */
 };
 
 /* --------------------------------------------------------------- lowering */
@@ -1608,8 +1611,14 @@ static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
 /* Runs fn's body in a frame of slots whose parent is the captured frame; the
    recursion counter was incremented by the caller. A return signal becomes
    the value. */
+static int vm_run_func(filo_ctx *ctx, const filo_func *fn, const filo_value *slots, uint32_t n,
+                       filo_value *out);
+
 static int run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
                     filo_value *out) {
+    if (fn->bc != NULL) {
+        return vm_run_func(ctx, fn, slots, n, out);
+    }
     frame *f = ralloc(ctx, sizeof(frame));
     if (f == NULL) {
         ctx->recursion--;
@@ -1935,6 +1944,7 @@ static int eval_fn(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     fn->body = in->args;
     fn->nbody = in->nargs;
     fn->frame = ctx->frame;
+    fn->bc = NULL;
     memset(out, 0, sizeof(*out));
     out->kind = FILO_FUNC;
     out->u.fn = fn;
@@ -2286,6 +2296,1649 @@ bool filo_get_global(const filo_ctx *ctx, const char *name, filo_value *out) {
     return false;
 }
 
+/* -------------------------------------------------------------- bytecode
+
+   docs/bytecode.md is the contract. The compiler walks the IR and writes the
+   instruction stream of a stack machine; the loader checks a unit and
+   resolves its names against a context; the VM runs it in place. A call
+   from bytecode to bytecode is a new activation record in the run arena,
+   not a C call, so the machine could be paused between any two
+   instructions. A builtin that calls a script back (map, fold) still goes
+   through filo_call and the C stack. */
+
+enum {
+    BC_PUSH_K = 0,
+    BC_PUSH_G,
+    BC_STORE_G,
+    BC_PUSH_L,
+    BC_STORE_L,
+    BC_PUSH_UP,
+    BC_STORE_UP,
+    BC_POP,
+    BC_JMP,
+    BC_CALL,
+    BC_CALLB,
+    BC_RET,
+    BC_CLOSURE,
+    BC_TUPLE,
+    BC_UNPACK,
+    BC_TRAP,
+};
+
+enum {
+    BC_J_ALWAYS = 0,
+    BC_J_FALSE,
+    BC_J_AND,
+    BC_J_OR,
+    BC_J_CHECK,
+};
+
+enum {
+    BC_SEC_IMPORTS = 1,
+    BC_SEC_GLOBALS,
+    BC_SEC_CONSTANTS,
+    BC_SEC_FUNCTIONS,
+    BC_SEC_CODE,
+    BC_SEC_EXPORTS,
+};
+
+enum {
+    BC_K_NUMBER = 1,
+    BC_K_STRING,
+    BC_K_TRUE,
+    BC_K_FALSE,
+    BC_K_EMPTY,
+};
+
+enum {
+    BC_HEADER = 20,
+    BC_SECTION = 12,
+    BC_SECTIONS = 6,
+    BC_VERSION = 1,
+    BC_KIND_UNIT = 1,
+    /* what one unit may hold: the compiler stops there, the loader refuses
+       past it */
+    BC_CONSTS_MAX = 4096,
+    BC_FNS_MAX = 1024,
+    BC_EXPORTS_MAX = 64,
+    BC_SCOPES_MAX = 64,
+    BC_SCOPE_POOL = 4096,
+    BC_CODE_MAX = 1048576,
+    BC_STACK_MAX = 4096,
+    BC_NAME_MAX = 256,
+};
+
+struct bc_fn {
+    const filo_unit *unit;
+    uint32_t off; /* in the code section */
+    uint32_t len;
+    uint32_t nparams;
+    uint32_t nslots; /* parameters first, then one slot per let binding */
+    uint32_t maxstack;
+};
+
+struct filo_unit {
+    const uint8_t *code;
+    uint32_t code_len;
+    filo_value *consts;
+    uint32_t nconsts;
+    uint32_t *globals; /* unit index to symbol id in the loading context */
+    uint32_t nglobals;
+    const filo_builtin_entry **imports;
+    uint32_t nimports;
+    bc_fn *fns;
+    uint32_t nfns;
+    filo_str *export_names;
+    uint32_t *export_fns;
+    uint32_t nexports;
+};
+
+static uint32_t fnv1a(uint32_t h, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619U;
+    }
+    return h;
+}
+
+/* The checksum of a unit: all of it, with its own field read as zero. */
+static uint32_t bc_checksum(const uint8_t *data, size_t len) {
+    static const uint8_t zero[4] = {0, 0, 0, 0};
+    uint32_t h = fnv1a(2166136261U, data, 8);
+    h = fnv1a(h, zero, 4);
+    return fnv1a(h, data + 12, len - 12);
+}
+
+/* ---- the compiler ---- */
+
+typedef struct {
+    bool fn; /* a function's own frame, or a let inside it */
+    uint32_t base;
+} bc_scope;
+
+typedef struct {
+    const filo_instr *root; /* an entry point's program */
+    const filo_instr *const *body;
+    uint32_t nbody;
+    uint32_t nparams;
+    uint32_t scope_at; /* the scopes around it when it was created, in the pool */
+    uint32_t nscopes;
+    uint32_t off;
+    uint32_t len;
+    uint32_t nslots;
+    uint32_t maxstack;
+} bc_fnrec;
+
+typedef struct {
+    filo_ctx *ctx;
+    uint8_t *code;
+    size_t len;
+    size_t cap;
+    filo_value consts[BC_CONSTS_MAX];
+    uint32_t nconsts;
+    uint32_t globals[FILO_SYMBOLS_MAX];
+    uint32_t nglobals;
+    const filo_builtin_entry *imports[FILO_BUILTINS_MAX];
+    uint32_t nimports;
+    bc_fnrec fns[BC_FNS_MAX];
+    uint32_t nfns;
+    bc_scope pool[BC_SCOPE_POOL];
+    uint32_t npool;
+    bc_scope scopes[BC_SCOPES_MAX]; /* of the function being compiled */
+    uint32_t nscopes;
+    uint32_t nslots;
+    uint32_t depth; /* values on its stack at this point */
+    uint32_t maxdepth;
+    bool failed; /* the message is in ctx */
+} bcc;
+
+static void bc_fail(bcc *c, const char *msg) {
+    if (!c->failed) {
+        (void)filo_fail(c->ctx, msg);
+        c->failed = true;
+    }
+}
+
+static void bc_byte(bcc *c, uint32_t b) {
+    if (c->len >= c->cap) {
+        bc_fail(c, "bytecode: the code does not fit (a unit holds up to 1 MB, and the run arena "
+                   "bounds it)");
+        return;
+    }
+    c->code[c->len] = (uint8_t)b;
+    c->len++;
+}
+
+static void bc_uleb(bcc *c, uint32_t v) {
+    while (v >= 0x80U) {
+        bc_byte(c, (v & 0x7FU) | 0x80U);
+        v >>= 7U;
+    }
+    bc_byte(c, v);
+}
+
+/* The first byte, and the operand after it when three bits cannot hold it. */
+static void bc_op(bcc *c, uint32_t op, uint32_t x) {
+    if (x < 7U) {
+        bc_byte(c, (op << 3U) | x);
+        return;
+    }
+    bc_byte(c, (op << 3U) | 7U);
+    bc_uleb(c, x);
+}
+
+static void bc_stack(bcc *c, int32_t delta) {
+    if (delta < 0 && (uint32_t)(-delta) > c->depth) {
+        bc_fail(c, "bytecode: stack underflow while compiling");
+        return;
+    }
+    c->depth = (uint32_t)((int32_t)c->depth + delta);
+    if (c->depth > c->maxdepth) {
+        c->maxdepth = c->depth;
+    }
+}
+
+/* A jump forward to a place not known yet: returns where its offset goes. */
+static size_t bc_jump(bcc *c, uint32_t cond) {
+    bc_byte(c, ((uint32_t)BC_JMP << 3U) | cond);
+    size_t at = c->len;
+    bc_byte(c, 0);
+    bc_byte(c, 0);
+    return at;
+}
+
+static void bc_land(bcc *c, size_t at) {
+    if (c->failed) {
+        return;
+    }
+    size_t dist = c->len - (at + 2U);
+    if (dist > 32767U) {
+        bc_fail(c, "bytecode: a jump longer than 32767 bytes");
+        return;
+    }
+    c->code[at] = (uint8_t)dist;
+    c->code[at + 1] = (uint8_t)(dist >> 8U);
+}
+
+static bool same_const(const filo_value *a, const filo_value *b) {
+    if (a->kind != b->kind) {
+        return false;
+    }
+    switch (a->kind) {
+    case FILO_NUMBER: {
+        uint64_t x = 0;
+        uint64_t y = 0;
+        memcpy(&x, &a->u.num, sizeof(x));
+        memcpy(&y, &b->u.num, sizeof(y));
+        return x == y;
+    }
+    case FILO_BOOL:
+        return a->u.b == b->u.b;
+    case FILO_STRING:
+        if (a->u.str.len != b->u.str.len) {
+            return false;
+        }
+        if (a->u.str.len == 0) {
+            return true;
+        }
+        return memcmp(a->u.str.ptr, b->u.str.ptr, a->u.str.len) == 0;
+    case FILO_LIST: /* only the empty list is ever a constant */
+        if (a->u.seq.len != 0) {
+            return false;
+        }
+        return b->u.seq.len == 0;
+    default:
+        return false;
+    }
+}
+
+static uint32_t bc_const(bcc *c, filo_value v) {
+    bool ok = false;
+    if (v.kind == FILO_NUMBER || v.kind == FILO_BOOL || v.kind == FILO_STRING) {
+        ok = true;
+    }
+    if (v.kind == FILO_LIST && v.u.seq.len == 0) {
+        ok = true;
+    }
+    if (!ok) {
+        bc_fail(c, "bytecode: a constant that is not a number, string, bool or ()");
+        return 0;
+    }
+    for (uint32_t i = 0; i < c->nconsts; i++) {
+        if (same_const(&c->consts[i], &v)) {
+            return i;
+        }
+    }
+    if (c->nconsts >= BC_CONSTS_MAX) {
+        bc_fail(c, "bytecode: more constants than one unit holds");
+        return 0;
+    }
+    c->consts[c->nconsts] = v;
+    c->nconsts++;
+    return c->nconsts - 1;
+}
+
+static uint32_t bc_global(bcc *c, uint32_t id) {
+    for (uint32_t i = 0; i < c->nglobals; i++) {
+        if (c->globals[i] == id) {
+            return i;
+        }
+    }
+    if (c->nglobals >= FILO_SYMBOLS_MAX) {
+        bc_fail(c, "bytecode: more globals than one unit holds");
+        return 0;
+    }
+    c->globals[c->nglobals] = id;
+    c->nglobals++;
+    return c->nglobals - 1;
+}
+
+static uint32_t bc_import(bcc *c, const char *name) {
+    const filo_builtin_entry *e =
+        builtin_by_name(c->ctx, (const uint8_t *)name, (uint32_t)strlen(name));
+    if (e == NULL) {
+        bc_fail(c, "bytecode: a builtin the context does not have");
+        return 0;
+    }
+    for (uint32_t i = 0; i < c->nimports; i++) {
+        if (c->imports[i] == e) {
+            return i;
+        }
+    }
+    if (c->nimports >= FILO_BUILTINS_MAX) {
+        bc_fail(c, "bytecode: more imports than one unit holds");
+        return 0;
+    }
+    c->imports[c->nimports] = e;
+    c->nimports++;
+    return c->nimports - 1;
+}
+
+/* Text for a TRAP, in the run arena with the rest of the compiler's
+   scratch. */
+static const char *bc_text(bcc *c, const char *a, const char *b, const char *d) {
+    size_t na = strlen(a);
+    size_t nb = strlen(b);
+    size_t nd = strlen(d);
+    char *s = ralloc(c->ctx, na + nb + nd + 1);
+    if (s == NULL) {
+        c->failed = true;
+        return "";
+    }
+    memcpy(s, a, na);
+    memcpy(s + na, b, nb);
+    memcpy(s + na + nb, d, nd);
+    s[na + nb + nd] = '\0';
+    return s;
+}
+
+/* An error where the IR would raise it; in the structure around it the
+   instruction stands for a value, though it never produces one. */
+static void bc_trap(bcc *c, const char *msg) {
+    uint32_t k = bc_const(c, filo_cstring(msg));
+    bc_op(c, BC_TRAP, k);
+    bc_stack(c, 1);
+}
+
+static uint32_t bc_queue(bcc *c, const filo_instr *root, const filo_instr *const *body,
+                         uint32_t nbody, uint32_t nparams) {
+    if (c->nfns >= BC_FNS_MAX || c->npool + c->nscopes > BC_SCOPE_POOL) {
+        bc_fail(c, "bytecode: more functions than one unit holds");
+        return 0;
+    }
+    bc_fnrec *f = &c->fns[c->nfns];
+    memset(f, 0, sizeof(*f));
+    f->root = root;
+    f->body = body;
+    f->nbody = nbody;
+    f->nparams = nparams;
+    f->scope_at = c->npool;
+    f->nscopes = c->nscopes;
+    if (c->nscopes > 0) {
+        memcpy(&c->pool[c->npool], c->scopes, sizeof(bc_scope) * c->nscopes);
+    }
+    c->npool += c->nscopes;
+    c->nfns++;
+    return c->nfns - 1;
+}
+
+static bool bc_push_scope(bcc *c, bool fn, uint32_t base) {
+    if (c->nscopes >= BC_SCOPES_MAX) {
+        bc_fail(c, "bytecode: scopes nested deeper than one function holds");
+        return false;
+    }
+    c->scopes[c->nscopes].fn = fn;
+    c->scopes[c->nscopes].base = base;
+    c->nscopes++;
+    return true;
+}
+
+/* A local of the IR — depth counts every let and function scope — as a
+   slot of the frame of the function that owns it. */
+static void bc_local(bcc *c, uint32_t depth, uint32_t slot, bool store) {
+    if (depth >= c->nscopes) {
+        bc_fail(c, "bytecode: a local outside every scope");
+        return;
+    }
+    uint32_t t = c->nscopes - 1 - depth;
+    uint32_t crossed = 0;
+    for (uint32_t i = c->nscopes - 1; i > t; i--) {
+        if (c->scopes[i].fn) {
+            crossed++;
+        }
+    }
+    uint32_t flat = c->scopes[t].base + slot;
+    if (crossed == 0) {
+        bc_op(c, store ? BC_STORE_L : BC_PUSH_L, flat);
+        return;
+    }
+    bc_op(c, store ? BC_STORE_UP : BC_PUSH_UP, crossed);
+    bc_uleb(c, flat);
+}
+
+static void bc_expr(bcc *c, const filo_instr *in);
+
+static void bc_seq(bcc *c, const filo_instr *const *body, uint32_t n) {
+    if (n == 0) {
+        bc_trap(c, "empty body");
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        bc_expr(c, body[i]);
+        if (i + 1 < n) {
+            bc_op(c, BC_POP, 1);
+            bc_stack(c, -1);
+        }
+    }
+}
+
+static void bc_empty(bcc *c) {
+    bc_op(c, BC_PUSH_K, bc_const(c, empty_list()));
+    bc_stack(c, 1);
+}
+
+static void bc_if(bcc *c, const filo_instr *in) {
+    if (in->nargs < 2 || in->nargs > 3) {
+        bc_trap(c, "if expects 2 or 3 arguments (condition then [else])");
+        return;
+    }
+    bc_expr(c, in->args[0]);
+    size_t to_else = bc_jump(c, BC_J_FALSE);
+    bc_stack(c, -1);
+    uint32_t base = c->depth;
+    bc_expr(c, in->args[1]);
+    size_t to_end = bc_jump(c, BC_J_ALWAYS);
+    c->depth = base;
+    bc_land(c, to_else);
+    if (in->nargs == 3) {
+        bc_expr(c, in->args[2]);
+    } else {
+        bc_empty(c);
+    }
+    bc_land(c, to_end);
+}
+
+static void bc_cond(bcc *c, const filo_instr *in) {
+    size_t *ends = NULL;
+    if (in->nclauses > 0) {
+        ends = ralloc(c->ctx, sizeof(size_t) * in->nclauses);
+        if (ends == NULL) {
+            c->failed = true;
+            return;
+        }
+    }
+    uint32_t nends = 0;
+    uint32_t base = c->depth;
+    bool closed = false; /* an else or a bad clause: nothing after it runs */
+    for (uint32_t i = 0; i < in->nclauses && !closed; i++) {
+        const clause *cl = &in->clauses[i];
+        if (cl->invalid) {
+            bc_trap(c, "cond clause must be a list of a test and a body");
+            closed = true;
+            continue;
+        }
+        if (cl->is_else) {
+            bc_seq(c, cl->body, cl->nbody);
+            closed = true;
+            continue;
+        }
+        bc_expr(c, cl->test);
+        size_t next = bc_jump(c, BC_J_FALSE);
+        bc_stack(c, -1);
+        bc_seq(c, cl->body, cl->nbody);
+        ends[nends] = bc_jump(c, BC_J_ALWAYS);
+        nends++;
+        c->depth = base;
+        bc_land(c, next);
+    }
+    if (!closed) {
+        bc_empty(c);
+    }
+    for (uint32_t i = 0; i < nends; i++) {
+        bc_land(c, ends[i]);
+    }
+}
+
+static void bc_logic(bcc *c, const filo_instr *in, bool is_and) {
+    if (in->nargs == 0) {
+        bc_op(c, BC_PUSH_K, bc_const(c, filo_bool(is_and)));
+        bc_stack(c, 1);
+        return;
+    }
+    size_t *outs = ralloc(c->ctx, sizeof(size_t) * in->nargs);
+    if (outs == NULL) {
+        c->failed = true;
+        return;
+    }
+    for (uint32_t i = 0; i < in->nargs; i++) {
+        bc_expr(c, in->args[i]);
+        if (i + 1 < in->nargs) {
+            outs[i] = bc_jump(c, is_and ? BC_J_AND : BC_J_OR);
+            bc_stack(c, -1); /* on through, the value was consumed */
+        }
+    }
+    /* the last operand must be a bool too, and it is the result */
+    size_t check = bc_jump(c, BC_J_CHECK);
+    bc_land(c, check);
+    for (uint32_t i = 0; i + 1 < in->nargs; i++) {
+        bc_land(c, outs[i]);
+    }
+}
+
+static void bc_let(bcc *c, const filo_instr *in) {
+    uint32_t n = in->a;
+    if (in->nargs <= n) {
+        bc_trap(c, "let expects bindings and body");
+        return;
+    }
+    uint32_t base = c->nslots;
+    c->nslots += n; /* never reused: a closure keeps its let's slot */
+    if (!bc_push_scope(c, false, base)) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        bc_expr(c, in->args[i]);
+        bc_op(c, BC_STORE_L, base + i);
+        bc_op(c, BC_POP, 1);
+        bc_stack(c, -1);
+    }
+    bc_seq(c, in->args + n, in->nargs - n);
+    c->nscopes--;
+}
+
+static void bc_letv(bcc *c, const filo_instr *in) {
+    uint32_t n = in->nnames;
+    bc_expr(c, in->args[0]); /* in the scope around the letv */
+    bc_op(c, BC_UNPACK, n);
+    bc_stack(c, (int32_t)n - 1);
+    uint32_t base = c->nslots;
+    c->nslots += n;
+    if (!bc_push_scope(c, false, base)) {
+        return;
+    }
+    for (uint32_t i = n; i > 0; i--) {
+        bc_op(c, BC_STORE_L, base + i - 1);
+        bc_op(c, BC_POP, 1);
+        bc_stack(c, -1);
+    }
+    bc_seq(c, in->args + 1, in->nargs - 1);
+    c->nscopes--;
+}
+
+static void bc_set(bcc *c, const filo_instr *in) {
+    if (in->nargs != 2) {
+        bc_trap(c, "set expects name and expression");
+        return;
+    }
+    bc_expr(c, in->args[1]);
+    const filo_instr *target = in->args[0];
+    if (target->op == OP_LOCAL) {
+        bc_local(c, target->a, target->b, true);
+        return;
+    }
+    if (target->op == OP_GLOBAL) {
+        bc_op(c, BC_STORE_G, bc_global(c, target->a));
+        return;
+    }
+    bc_op(c, BC_POP, 1);
+    bc_stack(c, -1);
+    bc_trap(c, "set name must be symbol");
+}
+
+static void bc_def(bcc *c, const filo_instr *in) {
+    if (in->msg != NULL) {
+        bc_trap(c, in->msg);
+        return;
+    }
+    bc_expr(c, in->args[0]);
+    int32_t id = symbol_id(c->ctx, (const uint8_t *)in->name, (uint32_t)strlen(in->name));
+    if (id < 0) {
+        /* the IR fails here when the def runs, and only then */
+        const char *why = bc_text(c, c->ctx->error, "", "");
+        c->ctx->error[0] = '\0';
+        bc_op(c, BC_POP, 1);
+        bc_stack(c, -1);
+        bc_trap(c, why);
+        return;
+    }
+    bc_op(c, BC_STORE_G, bc_global(c, (uint32_t)id));
+}
+
+static void bc_signal(bcc *c, const filo_instr *in, uint32_t exit) {
+    if (in->nargs > 1) {
+        bc_trap(c, bc_text(c, in->name, " expects 0 or 1 argument", ""));
+        return;
+    }
+    if (in->nargs == 1) {
+        bc_expr(c, in->args[0]);
+    } else {
+        bc_empty(c);
+    }
+    bc_op(c, BC_RET, exit);
+}
+
+static void bc_call(bcc *c, const filo_instr *in) {
+    for (uint32_t i = 0; i < in->nargs; i++) {
+        bc_expr(c, in->args[i]);
+    }
+    uint32_t argc = in->nargs > 0 ? in->nargs - 1 : 0;
+    bc_op(c, BC_CALL, argc);
+    bc_stack(c, -(int32_t)argc);
+}
+
+static void bc_expr(bcc *c, const filo_instr *in) {
+    if (c->failed) {
+        return;
+    }
+    switch (in->op) {
+    case OP_CONST:
+        bc_op(c, BC_PUSH_K, bc_const(c, in->val));
+        bc_stack(c, 1);
+        return;
+    case OP_LOCAL:
+        bc_local(c, in->a, in->b, false);
+        bc_stack(c, 1);
+        return;
+    case OP_GLOBAL:
+        bc_op(c, BC_PUSH_G, bc_global(c, in->a));
+        bc_stack(c, 1);
+        return;
+    case OP_DYNAMIC:
+        bc_trap(c, bc_text(c, "undefined symbol: ", in->name, ""));
+        return;
+    case OP_BUILTIN:
+        bc_trap(c, bc_text(c, "builtin cannot be used as value: ", in->name, ""));
+        return;
+    case OP_EMPTY:
+        bc_trap(c, "empty list expression");
+        return;
+    case OP_INVALID:
+        bc_trap(c, bc_text(c, "in ", in->name, bc_text(c, ": ", in->msg, "")));
+        return;
+    case OP_IF:
+        bc_if(c, in);
+        return;
+    case OP_COND:
+        bc_cond(c, in);
+        return;
+    case OP_DO:
+        if (in->nargs == 0) {
+            bc_trap(c, "do expects at least 1 expression");
+            return;
+        }
+        bc_seq(c, in->args, in->nargs);
+        return;
+    case OP_AND:
+        bc_logic(c, in, true);
+        return;
+    case OP_OR:
+        bc_logic(c, in, false);
+        return;
+    case OP_LET:
+        bc_let(c, in);
+        return;
+    case OP_LETV:
+        bc_letv(c, in);
+        return;
+    case OP_SET:
+        bc_set(c, in);
+        return;
+    case OP_FN:
+        if (in->nargs == 0) {
+            bc_trap(c, "fn expects parameters and body");
+            return;
+        }
+        bc_op(c, BC_CLOSURE, bc_queue(c, NULL, in->args, in->nargs, in->nnames));
+        bc_stack(c, 1);
+        return;
+    case OP_DEF:
+        bc_def(c, in);
+        return;
+    case OP_TUPLE:
+        for (uint32_t i = 0; i < in->nargs; i++) {
+            bc_expr(c, in->args[i]);
+        }
+        bc_op(c, BC_TUPLE, in->nargs);
+        bc_stack(c, 1 - (int32_t)in->nargs);
+        return;
+    case OP_EXIT:
+        bc_signal(c, in, 1);
+        return;
+    case OP_RETURN:
+        bc_signal(c, in, 0);
+        return;
+    case OP_CALLB:
+        for (uint32_t i = 0; i < in->nargs; i++) {
+            bc_expr(c, in->args[i]);
+        }
+        bc_op(c, BC_CALLB, in->nargs);
+        bc_uleb(c, bc_import(c, in->name));
+        bc_stack(c, 1 - (int32_t)in->nargs);
+        return;
+    case OP_CALL:
+        bc_call(c, in);
+        return;
+    default:
+        bc_trap(c, "unknown instruction");
+        return;
+    }
+}
+
+static void bc_function(bcc *c, uint32_t idx) {
+    bc_fnrec *f = &c->fns[idx];
+    c->nscopes = f->nscopes;
+    if (f->nscopes > 0) {
+        memcpy(c->scopes, &c->pool[f->scope_at], sizeof(bc_scope) * f->nscopes);
+    }
+    if (!bc_push_scope(c, true, 0)) {
+        return;
+    }
+    c->nslots = f->nparams;
+    c->depth = 0;
+    c->maxdepth = 0;
+    f->off = (uint32_t)c->len;
+    if (f->root != NULL) {
+        bc_expr(c, f->root);
+    } else {
+        bc_seq(c, f->body, f->nbody);
+    }
+    bc_op(c, BC_RET, 0);
+    f->len = (uint32_t)(c->len - f->off);
+    f->nslots = c->nslots;
+    f->maxstack = c->maxdepth;
+}
+
+/* The file, written or only measured: past cap nothing is written, but
+   the length still counts, so the caller learns the size needed. */
+typedef struct {
+    uint8_t *p;
+    size_t len;
+    size_t cap;
+} bc_out;
+
+static void out_byte(bc_out *o, uint32_t b) {
+    if (o->len < o->cap) {
+        o->p[o->len] = (uint8_t)b;
+    }
+    o->len++;
+}
+
+static void out_uleb(bc_out *o, uint32_t v) {
+    while (v >= 0x80U) {
+        out_byte(o, (v & 0x7FU) | 0x80U);
+        v >>= 7U;
+    }
+    out_byte(o, v);
+}
+
+static void out_bytes(bc_out *o, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        out_byte(o, p[i]);
+    }
+}
+
+static void out_name(bc_out *o, const char *s) {
+    size_t n = strlen(s);
+    out_uleb(o, (uint32_t)n);
+    out_bytes(o, (const uint8_t *)s, n);
+}
+
+static void put_u16(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8U);
+}
+
+static void put_u32(uint8_t *p, uint32_t v) {
+    put_u16(p, v);
+    put_u16(p + 2, v >> 16U);
+}
+
+static void bc_write_const(bc_out *o, const filo_value *v) {
+    switch (v->kind) {
+    case FILO_NUMBER: {
+        uint64_t bits = 0;
+        memcpy(&bits, &v->u.num, sizeof(bits));
+        out_byte(o, BC_K_NUMBER);
+        for (unsigned i = 0; i < 8U; i++) {
+            out_byte(o, (uint32_t)(bits >> (8U * i)) & 0xFFU);
+        }
+        return;
+    }
+    case FILO_STRING:
+        out_byte(o, BC_K_STRING);
+        out_uleb(o, v->u.str.len);
+        out_bytes(o, v->u.str.ptr, v->u.str.len);
+        return;
+    case FILO_BOOL:
+        out_byte(o, v->u.b ? BC_K_TRUE : BC_K_FALSE);
+        return;
+    default:
+        out_byte(o, BC_K_EMPTY);
+        return;
+    }
+}
+
+static void bc_write(bcc *c, const filo_bc_entry *entries, uint32_t n, bc_out *o) {
+    const size_t table = BC_HEADER;
+    const size_t hsize = BC_HEADER + ((size_t)BC_SECTIONS * BC_SECTION);
+    uint32_t off[BC_SECTIONS];
+    uint32_t len[BC_SECTIONS];
+    for (size_t i = 0; i < hsize; i++) {
+        out_byte(o, 0);
+    }
+    off[0] = (uint32_t)o->len;
+    out_uleb(o, c->nimports);
+    for (uint32_t i = 0; i < c->nimports; i++) {
+        out_name(o, c->imports[i]->name);
+    }
+    off[1] = (uint32_t)o->len;
+    out_uleb(o, c->nglobals);
+    for (uint32_t i = 0; i < c->nglobals; i++) {
+        out_name(o, c->ctx->symbols[c->globals[i]]);
+    }
+    off[2] = (uint32_t)o->len;
+    out_uleb(o, c->nconsts);
+    for (uint32_t i = 0; i < c->nconsts; i++) {
+        bc_write_const(o, &c->consts[i]);
+    }
+    off[3] = (uint32_t)o->len;
+    out_uleb(o, c->nfns);
+    uint32_t widest_stack = 0;
+    uint32_t widest_frame = 0;
+    for (uint32_t i = 0; i < c->nfns; i++) {
+        const bc_fnrec *f = &c->fns[i];
+        out_uleb(o, f->off);
+        out_uleb(o, f->len);
+        out_uleb(o, f->nparams);
+        out_uleb(o, f->nslots);
+        out_uleb(o, f->maxstack);
+        widest_stack = f->maxstack > widest_stack ? f->maxstack : widest_stack;
+        widest_frame = f->nslots > widest_frame ? f->nslots : widest_frame;
+    }
+    off[4] = (uint32_t)o->len;
+    out_bytes(o, c->code, c->len);
+    off[5] = (uint32_t)o->len;
+    out_uleb(o, n);
+    for (uint32_t i = 0; i < n; i++) {
+        out_name(o, entries[i].name);
+        out_uleb(o, i);
+    }
+    for (int i = 0; i < BC_SECTIONS - 1; i++) {
+        len[i] = off[i + 1] - off[i];
+    }
+    len[BC_SECTIONS - 1] = (uint32_t)o->len - off[BC_SECTIONS - 1];
+    if (o->len > o->cap) {
+        return;
+    }
+    uint8_t *h = o->p;
+    h[0] = 0x7F;
+    h[1] = 'F';
+    h[2] = 'B';
+    h[3] = 'C';
+    h[4] = BC_KIND_UNIT;
+    h[5] = BC_VERSION;
+    put_u16(h + 6, (uint32_t)hsize);
+    put_u16(h + 12, widest_stack > 0xFFFFU ? 0xFFFFU : widest_stack);
+    put_u16(h + 14, widest_frame > 0xFFFFU ? 0xFFFFU : widest_frame);
+    put_u16(h + 16, BC_SECTIONS);
+    for (uint32_t i = 0; i < BC_SECTIONS; i++) {
+        uint8_t *e = h + table + ((size_t)i * BC_SECTION);
+        put_u16(e, i + 1);
+        put_u32(e + 4, off[i]);
+        put_u32(e + 8, len[i]);
+    }
+    put_u32(h + 8, bc_checksum(o->p, o->len));
+}
+
+int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8_t *dst, size_t cap,
+                  size_t *len) {
+    *len = 0;
+    arena_reset(&ctx->run);
+    ctx->error[0] = '\0';
+    if (n == 0 || n > BC_EXPORTS_MAX) {
+        return filo_fail(ctx, "bytecode: a unit has 1 to 64 entry points");
+    }
+    bcc *c = ralloc(ctx, sizeof(bcc));
+    if (c == NULL) {
+        return FILO_ERR;
+    }
+    memset(c, 0, sizeof(*c));
+    c->ctx = ctx;
+    /* the code takes what the run arena has left, keeping an eighth for
+       the rest of the scratch (cond's jump lists, the texts of traps) */
+    size_t room = ctx->run.cap - ctx->run.used;
+    c->cap = room - (room / 8U);
+    if (c->cap > BC_CODE_MAX) {
+        c->cap = BC_CODE_MAX;
+    }
+    c->code = ralloc(ctx, c->cap);
+    if (c->code == NULL) {
+        return FILO_ERR;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        (void)bc_queue(c, entries[i].prog->root, NULL, 0, 0);
+    }
+    for (uint32_t i = 0; i < c->nfns && !c->failed; i++) {
+        bc_function(c, i); /* compiling one may queue the closures it makes */
+    }
+    if (c->failed) {
+        return FILO_ERR;
+    }
+    bc_out o = {dst, 0, cap};
+    bc_write(c, entries, n, &o);
+    *len = o.len;
+    if (o.len > cap) {
+        return filo_fail(ctx, "bytecode: the unit does not fit the buffer");
+    }
+    return FILO_OK;
+}
+
+/* ---- the loader ---- */
+
+typedef struct {
+    const uint8_t *p;
+    const uint8_t *end;
+    bool bad;
+} bc_rd;
+
+static uint32_t rd_byte(bc_rd *r) {
+    if (r->bad || r->p >= r->end) {
+        r->bad = true;
+        return 0;
+    }
+    uint32_t b = *r->p;
+    r->p++;
+    return b;
+}
+
+static uint32_t rd_uleb(bc_rd *r) {
+    uint32_t v = 0;
+    for (unsigned shift = 0; shift < 35U; shift += 7U) {
+        uint32_t b = rd_byte(r);
+        if (shift == 28U && b > 0x0FU) {
+            r->bad = true; /* past 32 bits */
+            return 0;
+        }
+        v |= (b & 0x7FU) << shift;
+        if ((b & 0x80U) == 0) {
+            return v;
+        }
+    }
+    r->bad = true;
+    return 0;
+}
+
+static const uint8_t *rd_bytes(bc_rd *r, uint32_t n) {
+    if (r->bad || (size_t)(r->end - r->p) < n) {
+        r->bad = true;
+        return NULL;
+    }
+    const uint8_t *p = r->p;
+    r->p += n;
+    return p;
+}
+
+static filo_str rd_name(bc_rd *r) {
+    filo_str s = {NULL, 0};
+    uint32_t n = rd_uleb(r);
+    if (n > BC_NAME_MAX) {
+        r->bad = true;
+        return s;
+    }
+    s.ptr = rd_bytes(r, n);
+    s.len = n;
+    return s;
+}
+
+static uint32_t get_u16(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8U);
+}
+
+static uint32_t get_u32(const uint8_t *p) {
+    return get_u16(p) | (get_u16(p + 2) << 16U);
+}
+
+static int bc_bad(filo_ctx *ctx, const char *what) {
+    return filo_fail2(ctx, "bytecode: malformed ", what);
+}
+
+static void *bc_palloc(filo_ctx *ctx, size_t each, uint32_t n) {
+    if (n == 0) {
+        return NULL;
+    }
+    return palloc(ctx, each * n);
+}
+
+static int bc_load_names(filo_ctx *ctx, bc_rd *r, filo_unit *u, bool imports) {
+    uint32_t n = rd_uleb(r);
+    uint32_t max = imports ? FILO_BUILTINS_MAX : FILO_SYMBOLS_MAX;
+    if (r->bad || n > max) {
+        return bc_bad(ctx, imports ? "imports" : "globals");
+    }
+    if (imports) {
+        u->imports = (const filo_builtin_entry **)bc_palloc(ctx, sizeof(*u->imports), n);
+        u->nimports = n;
+    } else {
+        u->globals = bc_palloc(ctx, sizeof(*u->globals), n);
+        u->nglobals = n;
+    }
+    if (n > 0 && (imports ? (void *)u->imports : (void *)u->globals) == NULL) {
+        return FILO_ERR;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        filo_str name = rd_name(r);
+        if (r->bad) {
+            return bc_bad(ctx, imports ? "imports" : "globals");
+        }
+        char text[BC_NAME_MAX + 1];
+        memcpy(text, name.ptr, name.len);
+        text[name.len] = '\0';
+        if (imports) {
+            u->imports[i] = builtin_by_name(ctx, name.ptr, name.len);
+            if (u->imports[i] == NULL) {
+                return filo_fail2(ctx, "missing builtin: ", text);
+            }
+            continue;
+        }
+        int32_t id = symbol_id(ctx, name.ptr, name.len);
+        if (id < 0) {
+            return filo_fail2(ctx, "undefined global: ", text);
+        }
+        u->globals[i] = (uint32_t)id;
+    }
+    return FILO_OK;
+}
+
+static int bc_load_consts(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
+    uint32_t n = rd_uleb(r);
+    if (r->bad || n > BC_CONSTS_MAX) {
+        return bc_bad(ctx, "constants");
+    }
+    u->consts = bc_palloc(ctx, sizeof(filo_value), n);
+    if (n > 0 && u->consts == NULL) {
+        return FILO_ERR;
+    }
+    u->nconsts = n;
+    for (uint32_t i = 0; i < n; i++) {
+        filo_value *v = &u->consts[i];
+        memset(v, 0, sizeof(*v));
+        uint32_t tag = rd_byte(r);
+        switch (tag) {
+        case BC_K_NUMBER: {
+            const uint8_t *b = rd_bytes(r, 8);
+            if (b == NULL) {
+                return bc_bad(ctx, "constants");
+            }
+            uint64_t bits = 0;
+            for (unsigned k = 8; k > 0; k--) {
+                bits = (bits << 8U) | b[k - 1];
+            }
+            double x = 0;
+            memcpy(&x, &bits, sizeof(x));
+            *v = filo_num(x);
+            break;
+        }
+        case BC_K_STRING: {
+            uint32_t len = rd_uleb(r);
+            const uint8_t *s = rd_bytes(r, len);
+            if (s == NULL) {
+                return bc_bad(ctx, "constants");
+            }
+            *v = filo_string(s, len);
+            break;
+        }
+        case BC_K_TRUE:
+            *v = filo_bool(true);
+            break;
+        case BC_K_FALSE:
+            *v = filo_bool(false);
+            break;
+        case BC_K_EMPTY:
+            *v = empty_list();
+            break;
+        default:
+            return bc_bad(ctx, "constants");
+        }
+    }
+    return FILO_OK;
+}
+
+static int bc_load_fns(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
+    uint32_t n = rd_uleb(r);
+    if (r->bad || n > BC_FNS_MAX) {
+        return bc_bad(ctx, "functions");
+    }
+    u->fns = bc_palloc(ctx, sizeof(bc_fn), n);
+    if (n > 0 && u->fns == NULL) {
+        return FILO_ERR;
+    }
+    u->nfns = n;
+    for (uint32_t i = 0; i < n; i++) {
+        bc_fn *f = &u->fns[i];
+        f->unit = u;
+        f->off = rd_uleb(r);
+        f->len = rd_uleb(r);
+        f->nparams = rd_uleb(r);
+        f->nslots = rd_uleb(r);
+        f->maxstack = rd_uleb(r);
+        if (r->bad || f->off > u->code_len || f->len > u->code_len - f->off ||
+            f->nparams > f->nslots || f->nslots > 0xFFFFU || f->maxstack > BC_STACK_MAX) {
+            return bc_bad(ctx, "functions");
+        }
+    }
+    return FILO_OK;
+}
+
+static int bc_load_exports(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
+    uint32_t n = rd_uleb(r);
+    if (r->bad || n == 0 || n > BC_EXPORTS_MAX) {
+        return bc_bad(ctx, "exports");
+    }
+    u->export_names = bc_palloc(ctx, sizeof(filo_str), n);
+    u->export_fns = bc_palloc(ctx, sizeof(uint32_t), n);
+    if (u->export_names == NULL || u->export_fns == NULL) {
+        return FILO_ERR;
+    }
+    u->nexports = n;
+    for (uint32_t i = 0; i < n; i++) {
+        u->export_names[i] = rd_name(r);
+        u->export_fns[i] = rd_uleb(r);
+        if (r->bad || u->export_fns[i] >= u->nfns) {
+            return bc_bad(ctx, "exports");
+        }
+    }
+    return FILO_OK;
+}
+
+int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out) {
+    ctx->error[0] = '\0';
+    *out = NULL;
+    if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C') {
+        return filo_fail(ctx, "bytecode: not a Filo unit");
+    }
+    if (data[4] != BC_KIND_UNIT || data[5] != BC_VERSION) {
+        return filo_fail(ctx, "bytecode: a kind or version this runtime does not read");
+    }
+    uint32_t hsize = get_u16(data + 6);
+    uint32_t nsec = get_u16(data + 16);
+    if (hsize < BC_HEADER || hsize > len || nsec > 64 ||
+        (size_t)BC_HEADER + ((size_t)nsec * BC_SECTION) > hsize) {
+        return bc_bad(ctx, "header");
+    }
+    if (bc_checksum(data, len) != get_u32(data + 8)) {
+        return filo_fail(ctx, "bytecode: the checksum does not match (a damaged unit)");
+    }
+    bc_rd sec[BC_SECTIONS + 1];
+    bool have[BC_SECTIONS + 1];
+    memset(have, 0, sizeof(have));
+    for (uint32_t i = 0; i < nsec; i++) {
+        const uint8_t *e = data + BC_HEADER + ((size_t)i * BC_SECTION);
+        uint32_t kind = get_u16(e);
+        uint32_t off = get_u32(e + 4);
+        uint32_t n = get_u32(e + 8);
+        if (off < hsize || off > len || n > len - off) {
+            return bc_bad(ctx, "section table");
+        }
+        if (kind < 1 || kind > BC_SECTIONS) {
+            continue; /* a kind from a later version: skipped */
+        }
+        if (have[kind]) {
+            return bc_bad(ctx, "section table");
+        }
+        have[kind] = true;
+        sec[kind].p = data + off;
+        sec[kind].end = data + off + n;
+        sec[kind].bad = false;
+    }
+    if (!have[BC_SEC_CODE] || !have[BC_SEC_FUNCTIONS] || !have[BC_SEC_EXPORTS]) {
+        return bc_bad(ctx, "section table");
+    }
+    filo_unit *u = palloc(ctx, sizeof(filo_unit));
+    if (u == NULL) {
+        return FILO_ERR;
+    }
+    memset(u, 0, sizeof(*u));
+    u->code = sec[BC_SEC_CODE].p;
+    u->code_len = (uint32_t)(sec[BC_SEC_CODE].end - sec[BC_SEC_CODE].p);
+    if ((have[BC_SEC_IMPORTS] && bc_load_names(ctx, &sec[BC_SEC_IMPORTS], u, true) != FILO_OK) ||
+        (have[BC_SEC_GLOBALS] && bc_load_names(ctx, &sec[BC_SEC_GLOBALS], u, false) != FILO_OK) ||
+        (have[BC_SEC_CONSTANTS] && bc_load_consts(ctx, &sec[BC_SEC_CONSTANTS], u) != FILO_OK) ||
+        bc_load_fns(ctx, &sec[BC_SEC_FUNCTIONS], u) != FILO_OK ||
+        bc_load_exports(ctx, &sec[BC_SEC_EXPORTS], u) != FILO_OK) {
+        return FILO_ERR;
+    }
+    *out = u;
+    return FILO_OK;
+}
+
+/* ---- the machine ---- */
+
+typedef struct bc_act bc_act;
+struct bc_act {
+    const bc_fn *fn;
+    frame *f;
+    uint32_t pc; /* in the code section */
+    filo_value *stack;
+    uint32_t sp;
+    bc_act *caller;
+    size_t mark; /* the run arena before the call, for its region */
+    uint64_t escapes;
+};
+
+static bc_act *vm_activation(filo_ctx *ctx, const bc_fn *fn, frame *parent, const filo_value *args,
+                             uint32_t n) {
+    bc_act *a = ralloc(ctx, sizeof(bc_act));
+    frame *f = ralloc(ctx, sizeof(frame));
+    if (a == NULL || f == NULL) {
+        return NULL;
+    }
+    f->slots = NULL;
+    if (fn->nslots > 0) {
+        f->slots = ralloc(ctx, sizeof(filo_value) * fn->nslots);
+        if (f->slots == NULL) {
+            return NULL;
+        }
+        memset(f->slots, 0, sizeof(filo_value) * fn->nslots);
+    }
+    if (n > fn->nslots) {
+        (void)filo_fail(ctx, "bytecode: more arguments than the frame holds");
+        return NULL;
+    }
+    if (n > 0 && f->slots != NULL) {
+        memcpy(f->slots, args, sizeof(filo_value) * n);
+    }
+    f->n = fn->nslots;
+    f->parent = parent;
+    memset(a, 0, sizeof(*a));
+    /* at least one value, so the stack is never NULL: every access is
+       checked against maxstack first */
+    a->stack = ralloc(ctx, sizeof(filo_value) * (fn->maxstack > 0 ? fn->maxstack : 1U));
+    if (a->stack == NULL) {
+        return NULL;
+    }
+    a->fn = fn;
+    a->f = f;
+    a->pc = fn->off;
+    return a;
+}
+
+static int vm_push(filo_ctx *ctx, bc_act *a, filo_value v) {
+    if (a->sp >= a->fn->maxstack) {
+        return filo_fail(ctx, "bytecode: operand stack overflow");
+    }
+    a->stack[a->sp] = v;
+    a->sp++;
+    return FILO_OK;
+}
+
+static int vm_need(filo_ctx *ctx, const bc_act *a, uint32_t n) {
+    if (a->sp < n) {
+        return filo_fail(ctx, "bytecode: operand stack underflow");
+    }
+    return FILO_OK;
+}
+
+static bool vm_uleb(const uint8_t *code, uint32_t end, uint32_t *pc, uint32_t *out) {
+    bc_rd r = {code + *pc, code + end, false};
+    *out = rd_uleb(&r);
+    *pc = (uint32_t)(r.p - code);
+    if (r.bad) {
+        return false;
+    }
+    return true;
+}
+
+static frame *vm_frame_up(const bc_act *a, uint32_t depth) {
+    frame *f = a->f;
+    for (uint32_t i = 0; i < depth && f != NULL; i++) {
+        f = f->parent;
+    }
+    return f;
+}
+
+static int vm_trap(filo_ctx *ctx, const filo_value *msg) {
+    if (msg->kind != FILO_STRING) {
+        return filo_fail(ctx, "bytecode: a trap without a message");
+    }
+    char text[FILO_ERROR_MAX] = {0};
+    size_t n = msg->u.str.len < sizeof(text) - 1 ? msg->u.str.len : sizeof(text) - 1;
+    if (n > 0) {
+        memcpy(text, msg->u.str.ptr, n);
+    }
+    text[n] = '\0';
+    return filo_fail(ctx, text);
+}
+
+static int vm_jump(filo_ctx *ctx, bc_act *a, uint32_t cond, uint32_t end) {
+    if (a->pc + 2U > end) {
+        return filo_fail(ctx, "bytecode: truncated jump");
+    }
+    const uint8_t *code = a->fn->unit->code;
+    int32_t off = (int16_t)(uint16_t)(code[a->pc] | ((uint32_t)code[a->pc + 1] << 8U));
+    a->pc += 2U;
+    bool take = cond == BC_J_ALWAYS;
+    if (cond != BC_J_ALWAYS) {
+        if (cond > BC_J_CHECK) {
+            return filo_fail(ctx, "bytecode: unknown jump condition");
+        }
+        if (vm_need(ctx, a, 1) != FILO_OK) {
+            return FILO_ERR;
+        }
+        const filo_value *v = &a->stack[a->sp - 1];
+        if (v->kind != FILO_BOOL) {
+            return fail_expected(ctx, "bool", v);
+        }
+        bool b = v->u.b;
+        if (cond == BC_J_FALSE) {
+            a->sp--;
+        }
+        if (cond == BC_J_FALSE || cond == BC_J_AND) {
+            take = true; /* these jump on false */
+            if (b) {
+                take = false;
+            }
+        }
+        if (cond == BC_J_OR) {
+            take = b;
+        }
+        if (!take && (cond == BC_J_AND || cond == BC_J_OR)) {
+            a->sp--;
+        }
+    }
+    if (!take) {
+        return FILO_OK;
+    }
+    int64_t target = (int64_t)a->pc + off;
+    if (target < (int64_t)a->fn->off || target > (int64_t)end) {
+        return filo_fail(ctx, "bytecode: a jump out of its function");
+    }
+    a->pc = (uint32_t)target;
+    return FILO_OK;
+}
+
+static int vm_callb(filo_ctx *ctx, bc_act *a, uint32_t argc, uint32_t end) {
+    const filo_unit *u = a->fn->unit;
+    uint32_t idx = 0;
+    if (!vm_uleb(u->code, end, &a->pc, &idx) || idx >= u->nimports) {
+        return filo_fail(ctx, "bytecode: a builtin outside the imports");
+    }
+    if (vm_need(ctx, a, argc) != FILO_OK) {
+        return FILO_ERR;
+    }
+    const filo_builtin_entry *e = u->imports[idx];
+    filo_value r;
+    memset(&r, 0, sizeof(r));
+    if (e->fn(ctx, &a->stack[a->sp - argc], argc, &r) != FILO_OK) {
+        if (ctx->signal == SIG_NONE) {
+            char prefix[FILO_ERROR_MAX];
+            size_t k = cstr_copy(prefix, sizeof(prefix), "in builtin \"");
+            k += cstr_copy(prefix + k, sizeof(prefix) - k, e->name);
+            (void)cstr_copy(prefix + k, sizeof(prefix) - k, "\": ");
+            (void)prefix_error(ctx, prefix);
+        }
+        return FILO_ERR;
+    }
+    a->sp -= argc;
+    return vm_push(ctx, a, r);
+}
+
+/* A call to a function value: bytecode gets a new activation and the
+   machine moves into it; an IR function runs through filo_call. */
+static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
+    bc_act *a = *ap;
+    if (vm_need(ctx, a, argc + 1) != FILO_OK) {
+        return FILO_ERR;
+    }
+    filo_value fnv = a->stack[a->sp - argc - 1];
+    if (fnv.kind != FILO_FUNC) {
+        char msg[64];
+        size_t k = cstr_copy(msg, sizeof(msg), "attempt to call non-function (got ");
+        k += cstr_copy(msg + k, sizeof(msg) - k, filo_kind_name(fnv.kind));
+        (void)cstr_copy(msg + k, sizeof(msg) - k, ")");
+        return filo_fail(ctx, msg);
+    }
+    const filo_func *fn = fnv.u.fn;
+    const filo_value *args = &a->stack[a->sp - argc];
+    if (fn->bc == NULL) {
+        filo_value r;
+        memset(&r, 0, sizeof(r));
+        if (filo_call(ctx, &fnv, args, argc, &r) != FILO_OK) {
+            return FILO_ERR;
+        }
+        a->sp -= argc + 1;
+        return vm_push(ctx, a, r);
+    }
+    if (fn->bc->nparams != argc) {
+        return fail_arity(ctx, fn->bc->nparams, argc);
+    }
+    if (enter_call(ctx) != FILO_OK) {
+        return FILO_ERR;
+    }
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
+    bc_act *n = vm_activation(ctx, fn->bc, fn->frame, args, argc);
+    if (n == NULL) {
+        ctx->recursion--;
+        return FILO_ERR;
+    }
+    a->sp -= argc + 1;
+    n->caller = a;
+    n->mark = mark;
+    n->escapes = escapes;
+    *ap = n;
+    return FILO_OK;
+}
+
+static int vm_closure(filo_ctx *ctx, bc_act *a, uint32_t idx) {
+    const filo_unit *u = a->fn->unit;
+    if (idx >= u->nfns) {
+        return filo_fail(ctx, "bytecode: a function outside the unit");
+    }
+    filo_func *fn = ralloc(ctx, sizeof(filo_func));
+    if (fn == NULL) {
+        return FILO_ERR;
+    }
+    memset(fn, 0, sizeof(*fn));
+    fn->nparams = u->fns[idx].nparams;
+    fn->frame = a->f;
+    fn->bc = &u->fns[idx];
+    ctx->escapes++; /* it captures the frame, by reference */
+    filo_value v;
+    memset(&v, 0, sizeof(v));
+    v.kind = FILO_FUNC;
+    v.u.fn = fn;
+    return vm_push(ctx, a, v);
+}
+
+static int vm_unpack(filo_ctx *ctx, bc_act *a, uint32_t n) {
+    if (vm_need(ctx, a, 1) != FILO_OK) {
+        return FILO_ERR;
+    }
+    a->sp--;
+    filo_value t = a->stack[a->sp];
+    if (t.kind != FILO_TUPLE) {
+        return filo_fail(ctx, "letv expects tuple expression");
+    }
+    if (t.u.seq.len != n) {
+        return filo_fail(ctx, "letv arity mismatch");
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (vm_push(ctx, a, seq_at(&t.u.seq, i)) != FILO_OK) {
+            return FILO_ERR;
+        }
+    }
+    return FILO_OK;
+}
+
+/* A slot of the current frame or of one further out, checked: a unit is
+   untrusted input. */
+static filo_value *vm_slot(filo_ctx *ctx, const bc_act *a, uint32_t depth, uint32_t slot) {
+    frame *f = vm_frame_up(a, depth);
+    if (f == NULL || slot >= f->n) {
+        (void)filo_fail(ctx, "bytecode: a slot outside its frame");
+        return NULL;
+    }
+    return &f->slots[slot];
+}
+
+/* Runs until base returns. */
+static int vm_loop(filo_ctx *ctx, bc_act *base, filo_value *out) {
+    bc_act *a = base;
+    for (;;) {
+        if (ctx->host.should_stop != NULL && ctx->host.should_stop(ctx->host.user)) {
+            return filo_fail(ctx, "execution cancelled");
+        }
+        ctx->steps++;
+        if (ctx->limits.step_limit > 0 && ctx->steps > ctx->limits.step_limit) {
+            return filo_fail(ctx, "step limit exceeded");
+        }
+        const filo_unit *u = a->fn->unit;
+        uint32_t end = a->fn->off + a->fn->len;
+        if (a->pc >= end) {
+            return filo_fail(ctx, "bytecode: ran past the end of a function");
+        }
+        uint32_t b = u->code[a->pc];
+        a->pc++;
+        uint32_t op = b >> 3U;
+        uint32_t x = b & 7U;
+        if (x == 7U && op != BC_JMP && !vm_uleb(u->code, end, &a->pc, &x)) {
+            return filo_fail(ctx, "bytecode: a truncated operand");
+        }
+        int rc = FILO_OK;
+        switch (op) {
+        case BC_PUSH_K:
+            if (x >= u->nconsts) {
+                return filo_fail(ctx, "bytecode: a constant outside the unit");
+            }
+            rc = vm_push(ctx, a, u->consts[x]);
+            break;
+        case BC_PUSH_G: {
+            if (x >= u->nglobals) {
+                return filo_fail(ctx, "bytecode: a global outside the unit");
+            }
+            uint32_t id = u->globals[x];
+            if (!ctx->defined[id]) {
+                return filo_fail2(ctx, "undefined global: ", ctx->symbols[id]);
+            }
+            rc = vm_push(ctx, a, ctx->globals[id]);
+            break;
+        }
+        case BC_STORE_G:
+            if (x >= u->nglobals) {
+                return filo_fail(ctx, "bytecode: a global outside the unit");
+            }
+            if (vm_need(ctx, a, 1) != FILO_OK) {
+                return FILO_ERR;
+            }
+            set_global_id(ctx, u->globals[x], a->stack[a->sp - 1]);
+            break;
+        case BC_PUSH_L:
+        case BC_STORE_L:
+        case BC_PUSH_UP:
+        case BC_STORE_UP: {
+            uint32_t depth = 0;
+            uint32_t slot = x;
+            if (op == BC_PUSH_UP || op == BC_STORE_UP) {
+                depth = x;
+                if (!vm_uleb(u->code, end, &a->pc, &slot)) {
+                    return filo_fail(ctx, "bytecode: a truncated operand");
+                }
+            }
+            filo_value *s = vm_slot(ctx, a, depth, slot);
+            if (s == NULL) {
+                return FILO_ERR;
+            }
+            if (op == BC_PUSH_L || op == BC_PUSH_UP) {
+                rc = vm_push(ctx, a, *s);
+                break;
+            }
+            if (vm_need(ctx, a, 1) != FILO_OK) {
+                return FILO_ERR;
+            }
+            if (depth > 0) {
+                ctx->escapes++; /* a frame further out now holds it */
+            }
+            *s = a->stack[a->sp - 1];
+            break;
+        }
+        case BC_POP:
+            rc = vm_need(ctx, a, x);
+            if (rc == FILO_OK) {
+                a->sp -= x;
+            }
+            break;
+        case BC_JMP:
+            rc = vm_jump(ctx, a, x, end);
+            break;
+        case BC_CALL:
+            rc = vm_call(ctx, &a, x);
+            break;
+        case BC_CALLB:
+            rc = vm_callb(ctx, a, x, end);
+            break;
+        case BC_RET: {
+            if (vm_need(ctx, a, 1) != FILO_OK) {
+                return FILO_ERR;
+            }
+            filo_value v = a->stack[a->sp - 1];
+            if (x == 1U) {
+                ctx->signal = SIG_EXIT; /* ends the run from wherever it is */
+                ctx->signaled = v;
+                return FILO_ERR;
+            }
+            if (x != 0U) {
+                return filo_fail(ctx, "bytecode: unknown return");
+            }
+            if (a == base) {
+                *out = v;
+                return FILO_OK;
+            }
+            bc_act *caller = a->caller;
+            ctx->recursion--;
+            if (ctx->escapes == a->escapes) {
+                region_release(ctx, a->mark, &v);
+            }
+            a = caller;
+            rc = vm_push(ctx, a, v);
+            break;
+        }
+        case BC_CLOSURE:
+            rc = vm_closure(ctx, a, x);
+            break;
+        case BC_TUPLE: {
+            rc = vm_need(ctx, a, x);
+            if (rc != FILO_OK) {
+                break;
+            }
+            filo_value t;
+            rc = filo_tuple(ctx, &a->stack[a->sp - x], x, &t);
+            if (rc == FILO_OK) {
+                a->sp -= x;
+                rc = vm_push(ctx, a, t);
+            }
+            break;
+        }
+        case BC_UNPACK:
+            rc = vm_unpack(ctx, a, x);
+            break;
+        case BC_TRAP:
+            if (x >= u->nconsts) {
+                return filo_fail(ctx, "bytecode: a constant outside the unit");
+            }
+            return vm_trap(ctx, &u->consts[x]);
+        default:
+            return filo_fail(ctx, "bytecode: unknown instruction");
+        }
+        if (rc != FILO_OK) {
+            return FILO_ERR;
+        }
+    }
+}
+
+static int vm_exec(filo_ctx *ctx, bc_act *base, filo_value *out) {
+    if (ctx->depth >= FILO_EVAL_DEPTH_MAX) {
+        return filo_fail(ctx, "evaluation too deep");
+    }
+    ctx->depth++;
+    int rc = vm_loop(ctx, base, out);
+    ctx->depth--;
+    return rc;
+}
+
+/* A bytecode closure called by the IR or by a builtin through filo_call:
+   the recursion depth is already counted, and released here as run_func
+   releases it. */
+static int vm_run_func(filo_ctx *ctx, const filo_func *fn, const filo_value *slots, uint32_t n,
+                       filo_value *out) {
+    bc_act *a = vm_activation(ctx, fn->bc, fn->frame, slots, n);
+    int rc = FILO_ERR;
+    if (a != NULL) {
+        rc = vm_exec(ctx, a, out);
+    }
+    ctx->recursion--;
+    return rc;
+}
+
 /* ------------------------------------------------------------- rendering */
 
 /* A sink that either counts or writes, so a value is rendered twice: once to
@@ -2494,7 +4147,9 @@ int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) 
     return FILO_OK;
 }
 
-int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, filo_value *result) {
+/* What every run does first and last, whatever runs in between: the IR or
+   a unit's bytecode. */
+static void run_begin(filo_ctx *ctx, const filo_limits *limits, filo_limits *saved) {
     arena_reset(&ctx->run);
     ctx->error[0] = '\0';
     ctx->steps = 0;
@@ -2502,7 +4157,7 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
     ctx->depth = 0;
     ctx->frame = NULL;
     ctx->signal = SIG_NONE;
-    filo_limits saved = ctx->limits;
+    *saved = ctx->limits;
     if (limits != NULL) {
         ctx->limits = *limits;
         if (ctx->limits.step_limit == 0) {
@@ -2512,10 +4167,11 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
             ctx->limits.recursion_limit = FILO_RECURSION_LIMIT_DEFAULT;
         }
     }
-    filo_value v = {0};
-    memset(&v, 0, sizeof(v));
-    int rc = eval(ctx, prog->root, &v);
-    ctx->limits = saved;
+}
+
+static int run_end(filo_ctx *ctx, int rc, filo_value v, const filo_limits *saved,
+                   filo_value *result) {
+    ctx->limits = *saved;
     if (rc != FILO_OK && ctx->signal != SIG_NONE) {
         /* exit ends the run with its value; a top-level return acts alike */
         v = ctx->signaled;
@@ -2537,6 +4193,45 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
         *result = v;
     }
     return FILO_OK;
+}
+
+int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, filo_value *result) {
+    filo_limits saved;
+    run_begin(ctx, limits, &saved);
+    filo_value v;
+    memset(&v, 0, sizeof(v));
+    int rc = eval(ctx, prog->root, &v);
+    return run_end(ctx, rc, v, &saved, result);
+}
+
+int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,
+                filo_value *result) {
+    const bc_fn *fn = NULL;
+    size_t n = strlen(entry);
+    for (uint32_t i = 0; i < unit->nexports; i++) {
+        const filo_str *name = &unit->export_names[i];
+        if (name->len == n && (n == 0 || memcmp(name->ptr, entry, n) == 0)) {
+            fn = &unit->fns[unit->export_fns[i]];
+        }
+    }
+    if (fn == NULL) {
+        ctx->error[0] = '\0';
+        return filo_fail2(ctx, "bytecode: no entry point named ", entry);
+    }
+    filo_limits saved;
+    run_begin(ctx, limits, &saved);
+    filo_value v;
+    memset(&v, 0, sizeof(v));
+    int rc = FILO_ERR;
+    if (fn->nparams != 0) {
+        rc = filo_fail(ctx, "bytecode: an entry point takes no arguments");
+    } else {
+        bc_act *a = vm_activation(ctx, fn, NULL, NULL, 0);
+        if (a != NULL) {
+            rc = vm_exec(ctx, a, &v);
+        }
+    }
+    return run_end(ctx, rc, v, &saved, result);
 }
 
 const char *filo_error(const filo_ctx *ctx) {

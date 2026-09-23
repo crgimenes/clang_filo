@@ -235,4 +235,30 @@ const char *filo_kind_name(uint8_t kind);
    it here (filo_libc.c does). NULL restores the core's integral-only pow. */
 void filo_set_pow(double (*fn)(double, double));
 
+/* ---- bytecode (docs/bytecode.md) ---- */
+
+/* A loaded unit: programs compiled to a stack machine's instructions, run
+   in place from wherever their bytes live. */
+typedef struct filo_unit filo_unit;
+
+typedef struct {
+    const char *name;      /* the entry point's name */
+    const filo_prog *prog; /* compiled in the same context */
+} filo_bc_entry;
+
+/* Compiles the programs into one unit, written to dst. The size goes to
+   *len; when cap is short the result is FILO_ERR and *len is the size
+   needed. Uses the run arena as scratch. */
+int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8_t *dst, size_t cap,
+                  size_t *len);
+
+/* Checks a unit and resolves its imports and globals by name against ctx.
+   The bytes are used in place and must outlive ctx: on a microcontroller
+   they stay in flash. */
+int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out);
+
+/* Runs an entry point of a loaded unit as filo_run runs a program. */
+int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,
+                filo_value *result);
+
 #endif

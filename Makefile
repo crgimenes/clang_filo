@@ -12,7 +12,7 @@ CORPUS = testdata/corpus/*.txt
 ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
 
-.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc fmt fmt-check tidy check qa clean freestanding fuzz bench
+.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -41,11 +41,13 @@ corpus: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c $(HDRS)
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/corpus_runner_san $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c -lm
 	./build/corpus_runner_san $(CORPUS)
+	./build/corpus_runner_san --vm $(CORPUS)
 
 # The same corpus with the libc-free host in place: a runtime that answers
 # differently depending on who formats its numbers would be two runtimes.
 corpus-nolibc: corpus
 	./build/corpus_runner_san --nolibc $(CORPUS)
+	./build/corpus_runner_san --nolibc --vm $(CORPUS)
 
 # What the Prolog spec of the Go repository answers, exported there in the
 # corpus format: the C runtime answers to the oracle the Go engine answers to.
@@ -54,6 +56,8 @@ corpus-nolibc: corpus
 oracle: corpus
 	./build/corpus_runner_san $(ORACLE)
 	./build/corpus_runner_san --nolibc $(ORACLE)
+	./build/corpus_runner_san --vm $(ORACLE)
+	./build/corpus_runner_san --nolibc --vm $(ORACLE)
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:
@@ -69,12 +73,12 @@ fmt-check:
 tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix' \
-		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c api_test.c \
+		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
 		nolibc_test.c -- -std=c11
 
 check:
 	cppcheck --enable=warning,style,performance,portability --inline-suppr \
-		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c \
+		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c \
 		api_test.c nolibc_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
@@ -110,12 +114,24 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 		|| { tail -30 build/fuzz.log; exit 1; }
 	@tail -2 build/fuzz.log
 
+# A unit is input from anywhere, so the loader and the machine are fuzzed
+# with units: the corpus compiled to bytecode as seeds, mutated from there.
+fuzz-bc: all fuzz_bc.c
+	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
+	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
+	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
+		-o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fuzz_bc.c -lm
+	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \
+		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds \
+		> build/fuzz_bc.log 2>&1 || { tail -30 build/fuzz_bc.log; exit 1; }
+	@tail -2 build/fuzz_bc.log
+
 bench: $(CORE) $(PACKS) $(HOST) bench.c $(HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o build/bench $(CORE) $(PACKS) $(HOST) bench.c -lm
 	./build/bench 2000
 
-qa: all fmt-check corpus corpus-nolibc oracle api nolibc tidy check freestanding fuzz
+qa: all fmt-check corpus corpus-nolibc oracle api nolibc tidy check freestanding fuzz fuzz-bc
 
 clean:
 	rm -rf build
