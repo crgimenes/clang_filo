@@ -183,8 +183,10 @@ static int make_seq(filo_ctx *ctx, uint8_t kind, const filo_value *items, uint32
 
 /* A range from zero holds no memory: items NULL with a length means the
    integers 0..len-1. It is a representation of this engine and nothing
-   else — a value crossing the public boundary is materialised first, so no
-   host builtin has to know about it. */
+   else, and two rules keep it that way: a range is never an element — it is
+   materialised on its way into a list or a tuple — and a value crossing the
+   public boundary is materialised first. The first is what makes the second
+   enough: a shallow check reaches everything a host can see. */
 static filo_value seq_at(const filo_seq *s, uint32_t i) {
     if (s->items == NULL) {
         return filo_num((double)i);
@@ -206,6 +208,21 @@ static filo_value *seq_items(filo_ctx *ctx, const filo_seq *s) {
         v[i] = filo_num((double)i);
     }
     return v;
+}
+
+static int materialise(filo_ctx *ctx, filo_value *v) {
+    if (v->kind != FILO_LIST && v->kind != FILO_TUPLE) {
+        return FILO_OK;
+    }
+    if (v->u.seq.items != NULL || v->u.seq.len == 0) {
+        return FILO_OK;
+    }
+    filo_value *items = seq_items(ctx, &v->u.seq);
+    if (items == NULL) {
+        return FILO_ERR;
+    }
+    v->u.seq.items = items;
+    return FILO_OK;
 }
 
 /* ------------------------------------------------------------------ regions
@@ -352,12 +369,30 @@ static void region_release(filo_ctx *ctx, size_t mark, filo_value *out) {
     ctx->run.used = mark + ((len + 7U) & ~(size_t)7U);
 }
 
+/* What list, tuple and every host builtin build from values they were
+   handed: each one goes in as an element, so each one is materialised. */
+static int make_elements(filo_ctx *ctx, uint8_t kind, const filo_value *items, uint32_t n,
+                         filo_value *out) {
+    if (make_seq(ctx, kind, items, n, out) != FILO_OK) {
+        return FILO_ERR;
+    }
+    if (items == NULL) {
+        return FILO_OK;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (materialise(ctx, &out->u.seq.items[i]) != FILO_OK) {
+            return FILO_ERR;
+        }
+    }
+    return FILO_OK;
+}
+
 int filo_list(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *out) {
-    return make_seq(ctx, FILO_LIST, items, n, out);
+    return make_elements(ctx, FILO_LIST, items, n, out);
 }
 
 int filo_tuple(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *out) {
-    return make_seq(ctx, FILO_TUPLE, items, n, out);
+    return make_elements(ctx, FILO_TUPLE, items, n, out);
 }
 
 bool filo_equal(const filo_value *a, const filo_value *b) {
@@ -2490,13 +2525,8 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
         return FILO_ERR;
     }
     if (result != NULL) {
-        if ((v.kind == FILO_LIST || v.kind == FILO_TUPLE) && v.u.seq.items == NULL &&
-            v.u.seq.len > 0) {
-            filo_value *items = seq_items(ctx, &v.u.seq); /* it crosses the boundary */
-            if (items == NULL) {
-                return FILO_ERR;
-            }
-            v.u.seq.items = items;
+        if (materialise(ctx, &v) != FILO_OK) { /* it crosses the boundary */
+            return FILO_ERR;
         }
         *result = v;
     }
@@ -2958,7 +2988,7 @@ static int b_list_append(filo_ctx *ctx, const filo_value *args, uint32_t n, filo
         }
     }
     out->u.seq.items[l.len] = args[1];
-    return FILO_OK;
+    return materialise(ctx, &out->u.seq.items[l.len]);
 }
 
 static int b_list_concat(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
@@ -3010,6 +3040,9 @@ static int b_map(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     for (uint32_t i = 0; i < l.len; i++) {
         filo_value item = seq_at(&l, i);
         if (filo_call(ctx, &args[0], &item, 1, &out->u.seq.items[i]) != FILO_OK) {
+            return FILO_ERR;
+        }
+        if (materialise(ctx, &out->u.seq.items[i]) != FILO_OK) {
             return FILO_ERR;
         }
     }

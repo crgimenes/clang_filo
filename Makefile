@@ -9,8 +9,10 @@ HOST = filo_libc.c
 NOLIBC = filo_nolibc.c
 HDRS = filo.h filo_libc.h filo_math.h filo_strings.h filo_nolibc.h
 CORPUS = testdata/corpus/*.txt
+ORACLE = testdata/oracle/*.txt
+FILO_GO ?= ../filo
 
-.PHONY: all corpus corpus-nolibc api nolibc fmt fmt-check tidy check qa clean freestanding fuzz bench
+.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc fmt fmt-check tidy check qa clean freestanding fuzz bench
 
 all: build/corpus_runner
 
@@ -44,6 +46,19 @@ corpus: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c $(HDRS)
 # differently depending on who formats its numbers would be two runtimes.
 corpus-nolibc: corpus
 	./build/corpus_runner_san --nolibc $(CORPUS)
+
+# What the Prolog spec of the Go repository answers, exported there in the
+# corpus format: the C runtime answers to the oracle the Go engine answers to.
+# Generated, so it lives apart from the corpus, which is written by hand and
+# kept identical in both repositories.
+oracle: corpus
+	./build/corpus_runner_san $(ORACLE)
+	./build/corpus_runner_san --nolibc $(ORACLE)
+
+# Rewrites the oracle files from the spec; needs the Go checkout beside this one.
+oracle-regen:
+	cd $(FILO_GO)/conformance && \
+		FILO_ORACLE_OUT=$(CURDIR)/testdata/oracle go test -run TestExportOracle -count=1 .
 
 fmt:
 	$(LLVM)/clang-format -i *.c *.h
@@ -94,7 +109,7 @@ bench: $(CORE) $(PACKS) $(HOST) bench.c $(HDRS)
 	$(CC) $(CFLAGS) -o build/bench $(CORE) $(PACKS) $(HOST) bench.c -lm
 	./build/bench 2000
 
-qa: all fmt-check corpus corpus-nolibc api nolibc tidy check freestanding fuzz
+qa: all fmt-check corpus corpus-nolibc oracle api nolibc tidy check freestanding fuzz
 
 clean:
 	rm -rf build
