@@ -1,10 +1,10 @@
 /* The libc-free number host, checked against the libc one on a machine that
-   has both. The promise it has to keep is stated in filo_nolibc.h: exact,
-   and identical to a libc host, while the value is an integer mantissa of at
-   most 15 digits times a power of ten within 22 either way. That is one
-   exact scaling step, and it covers every value a script realistically
-   holds. Outside it the last digit may differ, which this test measures and
-   reports without failing. */
+   has both. The promise it has to keep is stated in filo_nolibc.h: the same
+   text and the same values as a libc host — as Go — for every double, both
+   ways. Everyday values go through a one-step path and the rest through big
+   integers, so both are checked: values in the one-step range, arbitrary bit
+   patterns, long digit strings, and %f at any precision. Any difference is a
+   failure. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -209,20 +209,18 @@ static void test_in_range_is_exact(int rounds) {
     CHECK(diff == 0);
 }
 
-/* Outside the promised range the pair degrades in the last digit. Measured
-   here so the header's claim stays honest, not asserted. */
-static void report_out_of_range(int rounds) {
+/* Every double, not only the everyday ones: arbitrary bit patterns cover
+   subnormals, the largest values and 17-digit mantissas. */
+static void test_any_double_is_exact(int rounds) {
     int checked = 0;
     int trip = 0;
     int diff = 0;
-    int quiet = shown;
-    shown = 100; /* stop printing: these are expected */
     for (int i = 0; i < rounds; i++) {
         uint64_t bits = next_rand();
         double x = 0;
         memcpy(&x, &bits, sizeof(x));
-        if (x != x || x > 1e308 || x < -1e308 || x == 0) {
-            continue;
+        if (x - x != x - x || x == 0) {
+            continue; /* NaN, the infinities and zero have their own checks */
         }
         checked++;
         if (!round_trips(x)) {
@@ -232,26 +230,88 @@ static void report_out_of_range(int rounds) {
             diff++;
         }
     }
-    shown = quiet;
-    printf("arbitrary doubles: %d values, %d round-trip failures, %d differ from libc\n", checked,
-           trip, diff);
+    printf("any double: %d values, %d round-trip failures, %d differ from libc\n", checked, trip,
+           diff);
+    CHECK(trip == 0);
+    CHECK(diff == 0);
 }
 
-static void test_fixed_point_matches_libc(void) {
-    const double v[] = {0, 1, 1.5, 3.14159, 2, -2.5, 0.125, 1234.5678, 99.995, 1e6, -0.0001};
-    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
-        for (uint32_t prec = 0; prec <= 6; prec++) {
-            char want[64];
-            char got[64];
-            int n = snprintf(want, sizeof(want), "%.*f", (int)prec, v[i]);
-            size_t g = filo_nolibc_strings.fmt_fixed(v[i], prec, got, sizeof(got));
-            got[g] = '\0';
-            if ((size_t)n != g || memcmp(want, got, g) != 0) {
-                printf("FAIL %%.%uf of %g: libc=%s nolibc=%s\n", prec, v[i], want, got);
-                failures++;
+/* Long digit strings read as strtod reads them: correctly rounded however
+   many digits there are and wherever the exponent lands. */
+static void test_long_decimals_parse_exactly(int rounds) {
+    int diff = 0;
+    for (int i = 0; i < rounds; i++) {
+        char txt[128];
+        int n = 16 + (int)(next_rand() % 60);
+        int p = 0;
+        txt[p] = (char)('1' + (next_rand() % 9));
+        p++;
+        for (int d = 1; d < n; d++) {
+            txt[p] = (char)('0' + (next_rand() % 10));
+            p++;
+        }
+        p += snprintf(txt + p, sizeof(txt) - (size_t)p, "e%d", (int)(next_rand() % 740) - 370);
+        double want = strtod(txt, NULL);
+        double got = 0;
+        bool ok = filo_nolibc_str_to_num(NULL, (const uint8_t *)txt, (size_t)p, &got);
+        uint64_t want_bits = 0;
+        uint64_t got_bits = 0;
+        memcpy(&want_bits, &want, sizeof(want_bits));
+        memcpy(&got_bits, &got, sizeof(got_bits));
+        if (!ok || want_bits != got_bits) {
+            if (shown < 10) {
+                printf("     %s: libc=%.17g nolibc=%.17g\n", txt, want, got);
+                shown++;
             }
+            diff++;
         }
     }
+    printf("long decimals: %d strings, %d read differently from libc\n", rounds, diff);
+    CHECK(diff == 0);
+}
+
+/* %f is exact for every double and precision: the formatter works on the
+   value's exact decimal expansion, so it agrees with printf digit for digit —
+   subnormals, 1e308 and ties included. */
+static void fixed_same(double x, uint32_t prec) {
+    static char want[4096];
+    static char got[4096];
+    int n = snprintf(want, sizeof(want), "%.*f", (int)prec, x);
+    size_t g = filo_nolibc_strings.fmt_fixed(x, prec, got, sizeof(got) - 1);
+    got[g] = '\0';
+    if (n < 0 || (size_t)n != g || memcmp(want, got, g) != 0) {
+        if (shown < 10) {
+            printf("FAIL %%.%uf of %.17g: libc=%.60s nolibc=%.60s\n", prec, x, want, got);
+            shown++;
+        }
+        failures++;
+    }
+}
+
+static void test_fixed_point_matches_libc(int rounds) {
+    const double v[] = {
+        0,     -0.0,   1,         1.5,    2.5, 3.14159, 2,
+        -2.5,  0.125,  1234.5678, 99.995, 1e6, -0.0001, 9007199254740992.0,
+        1e300, 5e-324,
+    };
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        for (uint32_t prec = 0; prec <= 40; prec++) {
+            fixed_same(v[i], prec);
+        }
+        fixed_same(v[i], 1100);
+    }
+    int checked = 0;
+    for (int i = 0; i < rounds; i++) {
+        uint64_t bits = next_rand();
+        double x = 0;
+        memcpy(&x, &bits, sizeof(x));
+        if (x - x != x - x) {
+            continue; /* NaN and the infinities: str-fmt spells those itself */
+        }
+        fixed_same(x, (uint32_t)(next_rand() % 41U));
+        checked++;
+    }
+    printf("%%f: %d arbitrary doubles against printf\n", checked);
 }
 
 int main(int argc, char **argv) {
@@ -259,9 +319,10 @@ int main(int argc, char **argv) {
     int rounds = asked > 0 && asked < 100000000L ? (int)asked : 200000;
     test_everyday_values_match_libc();
     test_parse_matches_libc();
-    test_fixed_point_matches_libc();
+    test_fixed_point_matches_libc(rounds / 4);
     test_in_range_is_exact(rounds);
-    report_out_of_range(rounds / 4);
+    test_any_double_is_exact(rounds / 4);
+    test_long_decimals_parse_exactly(rounds / 8);
     if (failures > 0) {
         printf("%d failure(s)\n", failures);
         return 1;

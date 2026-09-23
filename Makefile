@@ -89,9 +89,14 @@ freestanding: $(CORE) $(PACKS) $(NOLIBC) $(HDRS)
 	done
 
 FUZZ_SECONDS ?= 15
+# Seconds one input may take. Every input runs in well under a millisecond
+# here, so one that takes seconds is a finding, not a slow machine: it once
+# ate the whole budget unseen (str-fmt walking a four-billion-column width).
+FUZZ_TIMEOUT ?= 2
 
 # Any byte string is a script and the runtime must not fault on any of them.
-# Seeds are the corpus scripts; a finding is written as build/fuzz_crash_*.
+# Seeds are the corpus scripts plus testdata/fuzz, the inputs that once went
+# wrong; a finding is written as build/fuzz_crash_* (or fuzz_crash_timeout-*).
 fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 	@mkdir -p build/fuzz_seeds build/fuzz_corpus
 	@awk '/^=== /{n++; f=sprintf("build/fuzz_seeds/%04d", n); next} \
@@ -99,8 +104,9 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 		/^(given |limits )/{next} f!=""{print > f}' $(CORPUS)
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/fuzz $(CORE) $(PACKS) $(HOST) fuzz.c -lm
-	@./build/fuzz -max_total_time=$(FUZZ_SECONDS) -max_len=2048 -dict=fuzz.dict \
-		-artifact_prefix=build/fuzz_crash_ build/fuzz_corpus build/fuzz_seeds > build/fuzz.log 2>&1 \
+	@./build/fuzz -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=2048 \
+		-dict=fuzz.dict -artifact_prefix=build/fuzz_crash_ \
+		build/fuzz_corpus build/fuzz_seeds testdata/fuzz > build/fuzz.log 2>&1 \
 		|| { tail -30 build/fuzz.log; exit 1; }
 	@tail -2 build/fuzz.log
 

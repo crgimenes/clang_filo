@@ -6,18 +6,18 @@
    that reads back as the same double, written plainly when the exponent
    lands in [-4, 6) and in scientific form otherwise.
 
-   How far the agreement goes, measured by nolibc_test.c against a libc host
-   over 300k values: for at most 15 significant digits and a magnitude from
-   1e-8 up to 1e22 the text is identical and always reads back as the same
-   double. That bound is not arbitrary: inside it the conversion is a single
-   multiply or divide by a power of ten that a double holds exactly. Outside
-   it (17-digit values, magnitudes past 1e22 or below 1e-8) the last digit
-   may differ from a libc host and the round trip may lose a unit in the last
-   place. Every value a script realistically holds is inside.
+   Both ways are exact for every double, as Go's strconv is: reading rounds
+   the decimal correctly however many digits it has, and writing gives the
+   shortest digits that read back, the closest of them. Up to 15 significant
+   digits with a power of ten within 22 either way — every value a script
+   realistically holds — the conversion is a single multiply or divide by an
+   exactly held power of ten; anything else goes through big integers on the
+   stack (about 1 KB), tens of microseconds for magnitudes near 1e300 or
+   1e-300. nolibc_test.c holds all of it to a libc host, which fails on any
+   difference.
 
-   The pair is exact with itself wherever it can be: num_to_str checks its
-   own candidate with str_to_num before returning it, so (number (string x))
-   gives back x whenever any decimal spelling does. */
+   %f for str-fmt works on the exact decimal expansion of the double too, so
+   it matches printf and Go for every value and precision. */
 #ifndef FILO_NOLIBC_H
 #define FILO_NOLIBC_H
 

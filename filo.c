@@ -8,8 +8,14 @@
 /* ---------------------------------------------------------------- memory */
 
 static void *arena_alloc(filo_arena *a, size_t n) {
+    size_t room = a->cap - a->used;
+    /* compared before rounding up: n + 7 wraps near SIZE_MAX, and an
+       impossible size would come out as zero bytes that fit */
+    if (n > room) {
+        return NULL;
+    }
     size_t aligned = (n + 7U) & ~(size_t)7U;
-    if (aligned > a->cap - a->used) {
+    if (aligned > room) {
         return NULL;
     }
     void *p = a->base + a->used;
@@ -2634,18 +2640,83 @@ static int b_div(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     return FILO_OK;
 }
 
-/* fmod without libm: r = a - trunc(a/b)*b, computed with the same rounding
-   a C library fmod would give for the magnitudes scripts use. */
-static double fmod_trunc(double a, double b) {
-    double q = a / b;
-    double t = (double)(int64_t)q; /* desvio: truncamento explícito é o algoritmo */
-    if (q < 0 && t > q) {
-        t -= 1; /* the cast rounded toward zero from the negative side */
+/* fmod without libm, and exact. The remainder of two doubles is always
+   representable, so there is one right answer and any exact method gives the
+   one Go's math.Mod gives: this one is long division on the significands as
+   integers, a bit at a time. The shortcut it replaced, a - trunc(a/b)*b
+   through an int64, was undefined past a quotient of 2^63 and inexact past
+   2^53. Special cases as Go: an infinite or NaN dividend or a NaN divisor
+   gives NaN, an infinite divisor gives the dividend back. */
+static double fmod_exact(double a, double b) {
+    const uint64_t sign_bit = 1ULL << 63U;
+    const uint64_t implicit = 1ULL << 52U;
+    const uint64_t inf = 0x7FFULL << 52U;
+    uint64_t ua = 0;
+    uint64_t ub = 0;
+    memcpy(&ua, &a, sizeof(ua));
+    memcpy(&ub, &b, sizeof(ub));
+    uint64_t sign = ua & sign_bit;
+    uint64_t ma = ua & ~sign_bit; /* magnitudes: for these, bit order is value order */
+    uint64_t mb = ub & ~sign_bit;
+    if (ma >= inf || mb > inf || mb == 0) {
+        uint64_t nan_bits = 0x7FF8000000000000ULL;
+        double nan = 0;
+        memcpy(&nan, &nan_bits, sizeof(nan));
+        return nan;
     }
-    if (q > 0 && t > q) {
-        t -= 1;
+    if (ma < mb) {
+        return a; /* an infinite divisor lands here too */
     }
-    return a - t * b;
+    uint64_t r = sign;
+    if (ma != mb) {
+        int ea = (int)(ma >> 52U);
+        int eb = (int)(mb >> 52U);
+        uint64_t fa = ma & (implicit - 1);
+        uint64_t fb = mb & (implicit - 1);
+        /* the leading one at bit 52, subnormals included */
+        if (ea == 0) {
+            ea = 1;
+            while (fa < implicit) {
+                fa <<= 1U;
+                ea--;
+            }
+        } else {
+            fa |= implicit;
+        }
+        if (eb == 0) {
+            eb = 1;
+            while (fb < implicit) {
+                fb <<= 1U;
+                eb--;
+            }
+        } else {
+            fb |= implicit;
+        }
+        while (ea > eb) {
+            if (fa >= fb) {
+                fa -= fb;
+            }
+            fa <<= 1U; /* fa < 2*fb < 2^54 throughout */
+            ea--;
+        }
+        if (fa >= fb) {
+            fa -= fb;
+        }
+        if (fa != 0) {
+            while (fa < implicit) {
+                fa <<= 1U;
+                ea--;
+            }
+            if (ea > 0) {
+                r |= ((uint64_t)ea << 52U) | (fa & (implicit - 1));
+            } else {
+                r |= fa >> (unsigned)(1 - ea); /* subnormal: the bits shifted out are zero */
+            }
+        }
+    }
+    double out = 0;
+    memcpy(&out, &r, sizeof(out));
+    return out;
 }
 
 static int b_mod(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
@@ -2661,7 +2732,7 @@ static int b_mod(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
         return filo_fail(ctx, "modulo by zero");
     }
     /* floored, as in Lua: the result takes the divisor's sign */
-    double r = fmod_trunc(a, b);
+    double r = fmod_exact(a, b);
     if (r != 0 && (r < 0) != (b < 0)) {
         r += b;
     }
@@ -2678,7 +2749,8 @@ static double core_pow(double a, double b) {
     if (b == 0) {
         return 1;
     }
-    if (b == (double)(int64_t)b && b > -1e6 && b < 1e6) {
+    /* the range first: casting 1e300 or NaN to int64 is undefined */
+    if (b > -1e6 && b < 1e6 && b == (double)(int64_t)b) {
         int64_t se = (int64_t)b;
         bool neg = se < 0;
         uint64_t e = (uint64_t)(neg ? -se : se);

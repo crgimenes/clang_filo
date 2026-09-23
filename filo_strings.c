@@ -520,18 +520,35 @@ typedef struct {
     size_t pos;
 } fsink;
 
-static void sput(fsink *s, const uint8_t *b, size_t n) {
-    if (s->dst != NULL && s->pos + n <= s->cap) {
-        memcpy(s->dst + s->pos, b, n);
-    }
-    s->pos += n;
+/* The counting pass and the writing pass share one walk, so the count must
+   never wrap: on a 32-bit target a width near four billion would, and the
+   second pass would then write into a buffer sized for the wrapped count.
+   Saturated, an impossible length fails at the allocation instead. */
+static void advance(fsink *s, size_t n) {
+    s->pos = n > SIZE_MAX - s->pos ? SIZE_MAX : s->pos + n;
 }
 
-static void sfill(fsink *s, uint8_t c, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        sput(s, &c, 1);
+/* The room is s->cap - s->pos, never s->pos + n, which could wrap. */
+static void sput(fsink *s, const uint8_t *b, size_t n) {
+    if (s->dst != NULL && s->pos <= s->cap && n <= s->cap - s->pos) {
+        memcpy(s->dst + s->pos, b, n);
     }
+    advance(s, n);
 }
+
+/* One step whatever n is: counting a width must not walk it. */
+static void sfill(fsink *s, uint8_t c, size_t n) {
+    if (s->dst != NULL && s->pos <= s->cap && n <= s->cap - s->pos) {
+        memset(s->dst + s->pos, c, n);
+    }
+    advance(s, n);
+}
+
+/* The widest width or precision: Go's fmt stops honoring one at 10,000,010
+   and writes %!(NOVERB) instead, so the Go runtime refuses past this and so
+   does this one (strFmtMax in filostrings). It also caps one call at about
+   ten megabytes. */
+enum { FMT_MAX = 10000000 };
 
 typedef struct {
     bool left;
@@ -569,10 +586,12 @@ static void pad_out(fsink *s, filo_str body, const fspec *sp, bool numeric) {
     sput(s, body.ptr, body.len);
 }
 
+/* Saturates instead of wrapping: %4294967297s must not become %1s. */
 static uint32_t digits_at(filo_str f, size_t *i) {
     uint32_t v = 0;
     while (*i < f.len && f.ptr[*i] >= '0' && f.ptr[*i] <= '9') {
-        v = v * 10 + (uint32_t)(f.ptr[*i] - '0');
+        uint32_t d = (uint32_t)(f.ptr[*i] - '0');
+        v = v > (UINT32_MAX - d) / 10U ? UINT32_MAX : (v * 10U) + d;
         (*i)++;
     }
     return v;
@@ -618,7 +637,9 @@ static int verb_int(filo_ctx *ctx, const filo_value *v, const fspec *sp, fsink *
         return fail3(ctx, "str-fmt: expected number, got ", filo_kind_name(v->kind), "");
     }
     double x = v->u.num;
-    if (trunc_d(x) != x || !(x > -9.2e18 && x < 9.2e18)) {
+    /* int64 exactly, which is what Go converts to: past it Go's own result
+       depends on the machine, so both runtimes refuse */
+    if (trunc_d(x) != x || !(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) {
         char shown[48] = {0};
         size_t n = 0;
         if (filo_value_text(ctx, v, shown, sizeof(shown), &n) != FILO_OK) {
@@ -628,37 +649,54 @@ static int verb_int(filo_ctx *ctx, const filo_value *v, const fspec *sp, fsink *
     }
     bool neg = x < 0;
     uint64_t mag = (uint64_t)(neg ? -x : x);
-    char tmp[32] = {0};
+    uint8_t tmp[24] = {0};
     size_t n = 0;
     do {
-        tmp[n] = (char)('0' + (mag % 10));
+        tmp[n] = (uint8_t)('0' + (mag % 10));
         n++;
         mag /= 10;
     } while (mag > 0);
-    uint8_t body[64] = {0};
-    size_t len = 0;
-    if (neg) {
-        body[len++] = '-';
-    } else if (sp->plus) {
-        body[len++] = '+';
+    if (sp->has_prec && sp->prec == 0 && !neg && n == 1 && tmp[0] == '0') {
+        n = 0; /* %.0d of zero prints only the padding, as in Go */
     }
+    uint8_t digits[24] = {0};
+    for (size_t i = 0; i < n; i++) {
+        digits[i] = tmp[n - 1 - i];
+    }
+    uint8_t sign = 0;
+    if (neg) {
+        sign = '-';
+    }
+    if (!neg && sp->plus && n > 0) {
+        sign = '+';
+    }
+    /* The zeros a precision asks for can be ten million long, so they go
+       straight to the output rather than through a buffer. The 0 flag pads
+       with zeros after the sign, unless '-' or a precision is given. */
     size_t zeros = 0;
     if (sp->has_prec && sp->prec > n) {
         zeros = sp->prec - n;
     }
-    while (zeros > 0 && len < sizeof(body)) {
-        body[len++] = '0';
-        zeros--;
+    size_t total = zeros + n + (sign != 0 ? 1U : 0U);
+    size_t padn = 0;
+    if (sp->width > total) {
+        padn = sp->width - total;
     }
-    while (n > 0 && len < sizeof(body)) {
-        n--;
-        body[len++] = (uint8_t)tmp[n];
+    if (sp->zero && !sp->left && !sp->has_prec) {
+        zeros += padn;
+        padn = 0;
     }
-    fspec adj = *sp;
-    if (sp->has_prec) {
-        adj.zero = false; /* fmt ignores the 0 flag when a precision is given */
+    if (!sp->left) {
+        sfill(s, ' ', padn);
     }
-    pad_out(s, bytes_of(body, len), &adj, true);
+    if (sign != 0) {
+        sput(s, &sign, 1);
+    }
+    sfill(s, '0', zeros);
+    sput(s, digits, n);
+    if (sp->left) {
+        sfill(s, ' ', padn);
+    }
     return FILO_OK;
 }
 
@@ -669,9 +707,29 @@ static int verb_fixed(filo_ctx *ctx, const filo_value *v, const fspec *sp, fsink
     if (host_fns.fmt_fixed == NULL) {
         return filo_fail(ctx, "str-fmt: %f is not available on this host");
     }
+    double x = v->u.num;
+    if (x - x != x - x) {
+        /* NaN and the infinities, spelled as Go spells them (a C library says
+           "nan" and "inf"), and never padded with zeros */
+        const char *word = x > 0 ? "+Inf" : "-Inf";
+        if (x != x) {
+            word = sp->plus ? "+NaN" : "NaN";
+        }
+        fspec adj = *sp;
+        adj.zero = false;
+        pad_out(s, bytes_of((const uint8_t *)word, strlen(word)), &adj, false);
+        return FILO_OK;
+    }
     uint32_t prec = sp->has_prec ? sp->prec : 6;
-    char buf[400] = {0};
-    size_t n = host_fns.fmt_fixed(v->u.num, prec, buf + 1, sizeof(buf) - 1);
+    /* a sign slot, the sign, up to 309 integer digits, the point, the
+       decimals: sized by the precision, which may be ten million */
+    size_t cap = (size_t)prec + 320U;
+    char *buf = filo_alloc(ctx, cap);
+    if (buf == NULL) {
+        return FILO_ERR;
+    }
+    buf[0] = '\0';
+    size_t n = host_fns.fmt_fixed(x, prec, buf + 1, cap - 1);
     if (n == 0) {
         return filo_fail(ctx, "str-fmt: number formatting failed");
     }
@@ -738,6 +796,9 @@ static int fmt_run(filo_ctx *ctx, filo_str f, const filo_value *args, uint32_t n
         }
         if (verb != 's' && verb != 'v' && verb != 'd' && verb != 'f') {
             return fail3(ctx, "str-fmt: unknown verb ", shown, "");
+        }
+        if (sp.width > FMT_MAX || (sp.has_prec && sp.prec > FMT_MAX)) {
+            return fail3(ctx, "str-fmt: width and precision stop at 10000000: ", shown, "");
         }
         if (next >= nargs) {
             return fail3(ctx, "str-fmt: missing argument for ", shown, "");
