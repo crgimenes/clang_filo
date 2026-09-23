@@ -173,6 +173,10 @@ struct filo_ctx {
     uint64_t escapes;
     void *frame; /* current local scope (internal type) */
     char error[FILO_ERROR_MAX];
+    /* where in the source the last error happened, 0 when not known: see
+       filo_error_at */
+    uint32_t error_line;
+    uint32_t error_col;
     uint8_t signal;      /* internal: exit/return unwinding */
     filo_value signaled; /* value carried by the signal */
 };
@@ -199,6 +203,13 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
 
 /* The message of the last failed call. */
 const char *filo_error(const filo_ctx *ctx);
+
+/* Where in the program's source the last error happened: line and column
+   from 1, the column in bytes, as parse errors count them. The IR knows it
+   from the node that failed, a unit from its debug section. False when it
+   is not known (a unit without debug, an error before any code ran). The
+   message itself does not carry it, so it reads as the Go engine's does. */
+bool filo_error_at(const filo_ctx *ctx, uint32_t *line, uint32_t *col);
 
 /* ---- globals ---- */
 
@@ -292,6 +303,12 @@ typedef struct {
 } filo_bundle_member;
 
 #ifndef FILO_VM_ONLY
+/* Copies a unit without its debug section (the positions errors report),
+   for a machine that does not need them; the size goes to *len as in
+   filo_bc_build. */
+int filo_bc_strip(filo_ctx *ctx, const uint8_t *src, size_t len, uint8_t *dst, size_t cap,
+                  size_t *out_len);
+
 /* Writes the units into one bundle at dst, as filo_bc_build writes a unit:
    the size to *len, and FILO_ERR with the size needed when cap is short. */
 int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t n, uint8_t *dst,

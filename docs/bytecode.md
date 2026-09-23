@@ -25,8 +25,9 @@ the VM to hold it to that.
   them (`in if: in let: …`) is not rebuilt; builtin failures keep
   `in builtin "<name>": `. The corpus asserts that an error occurred, never
   its wording.
-- **Line and column.** The IR does not carry them either; a debug section
-  is reserved for them.
+- **Line and column** of an error come from the debug section, where the IR
+  has them in its nodes; `filo_error_at` gives both, and the corpus holds
+  the VM and the IR to the same place for every error but a step limit.
 - **When a call is checked.** The IR checks that the callee is a function,
   its arity and the recursion depth before it evaluates the arguments; on a
   stack machine the arguments are already evaluated when `CALL` runs. The
@@ -88,7 +89,7 @@ Sections, each at most once; unknown kinds are skipped:
 | 4 | functions | count, then per function: code offset, code length, params, frame slots, max stack |
 | 5 | code | the instruction bytes of every function |
 | 6 | exports | count, then per export: name, function index |
-| 7 | debug | reserved |
+| 7 | debug | where each instruction came from in the source (below); optional |
 
 Constant tags: 1 number (8 bytes, IEEE 754 double), 2 string (length,
 bytes), 3 true, 4 false, 5 empty list.
@@ -99,6 +100,22 @@ slots are the parameters first, then one slot for every `let`/`letv`
 binding in the function, never reused: a closure created in one `let`
 keeps seeing that `let`'s slot, as it keeps seeing that `let`'s frame in
 the IR.
+
+## Debug
+
+Section 7 maps instructions back to the source: a line and a column (from
+1, the column in bytes, as parse errors count them) for every instruction
+where they change, in code order. Each entry is three ULEB128 numbers: the
+distance in bytes from the previous entry's pc (the first from 0), the line
+as a signed difference from the previous entry's (zigzag: 0, -1, 1, -2, 2 …
+written 0, 1, 2, 3, 4 …) and the column as it is. The position of any pc is
+that of the last entry at or before it.
+
+The runtime reads it only when an error needs a place (`filo_error_at`); a
+unit without it runs the same and its errors have no place. `filo_bc_strip`
+writes a unit without it, every other byte kept. It costs a quarter of a
+small program's unit and two fifths of the board's screens, whose
+instructions change place almost one by one.
 
 ## Bundles
 

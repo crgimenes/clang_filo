@@ -1,12 +1,13 @@
-bundle: 336 bytes, format 1, checksum 2c22ea69 ok
+bundle: 380 bytes, format 1, checksum 9037c988 ok
 widest stack 2, widest frame 1
 members (2)
-  ola                 121 bytes at 56
-  dobro               152 bytes at 184
+  ola                 136 bytes at 56
+  dobro               188 bytes at 192
 
 == ola
-unit: 121 bytes, format 1, checksum 022f3fe3 ok
+unit: 136 bytes, format 1, checksum bddcb726 ok
 widest stack 1, widest frame 0
+debug: line and column of each instruction
 
 imports (0): what the loading context must provide
 globals (0)
@@ -16,12 +17,13 @@ exports (1)
   ola -> fn 0
 
 fn 0 (entry "ola"): params 0, slots 0, stack 1, 2 bytes
-  0000  00              PUSH_K   0         "olá mundo"
-  0001  58              RET      0         return
+  0000  00              2:1    PUSH_K   0         "olá mundo"
+  0001  58                     RET      0         return
 
 == dobro
-unit: 152 bytes, format 1, checksum cde4b0cf ok
+unit: 188 bytes, format 1, checksum 00a7c8dd ok
 widest stack 2, widest frame 1
+debug: line and column of each instruction
 
 imports (1): what the loading context must provide
      0  *
@@ -34,16 +36,16 @@ exports (1)
   dobro -> fn 0
 
 fn 0 (entry "dobro"): params 0, slots 0, stack 2, 7 bytes
-  0000  61              CLOSURE  1         fn 1
-  0001  10              STORE_G  0         dobro
-  0002  39              POP      1
-  0003  08              PUSH_G   0         dobro
-  0004  00              PUSH_K   0         21
-  0005  49              CALL     1
-  0006  58              RET      0         return
+  0000  61              2:12   CLOSURE  1         fn 1
+  0001  10              2:1    STORE_G  0         dobro
+  0002  39                     POP      1
+  0003  08              3:2    PUSH_G   0         dobro
+  0004  00              3:8    PUSH_K   0         21
+  0005  49              3:1    CALL     1
+  0006  58                     RET      0         return
 
 fn 1: params 1, slots 1, stack 2, 5 bytes
-  0007  18              PUSH_L   0         slot 0
-  0008  01              PUSH_K   1         2
-  0009  52 00           CALLB    2 0       *
-  0011  58              RET      0         return
+  0007  18              2:23   PUSH_L   0         slot 0
+  0008  01              2:25   PUSH_K   1         2
+  0009  52 00           2:20   CALLB    2 0       *
+  0011  58                     RET      0         return

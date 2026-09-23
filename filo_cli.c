@@ -33,7 +33,7 @@ static fbc_unit listing;
 
 static const char usage[] =
     "usage: filo run [--vm | --trace] FILE [MEMBER] [ENTRY...]\n"
-    "       filo build -o OUT FILE...\n"
+    "       filo build [--strip] -o OUT FILE...\n"
     "       filo bundle -o OUT UNIT...\n"
     "       filo dump FILE\n"
     "\n"
@@ -44,6 +44,7 @@ static const char usage[] =
     "\n"
     "  --vm      run source as bytecode, compiled in memory\n"
     "  --trace   run as bytecode and show every instruction with the stack\n"
+    "  --strip   build without the debug section (errors then have no line)\n"
     "  MEMBER    for a bundle: the unit to run (default: main, or the first)\n"
     "  ENTRY     for a unit: the entries to run, in order, sharing globals\n"
     "            (default: main, or the unit's first entry)\n"
@@ -64,6 +65,20 @@ static int complain2(const char *a, const char *b) {
     char line[512];
     (void)snprintf(line, sizeof(line), "%s: %s", a, b);
     return complain(line);
+}
+
+/* An error of a run, as compilers say them: where:line:col: message, when
+   the runtime knows the place. A parse error already says it. */
+static int complain_at(const char *where) {
+    uint32_t line = 0;
+    uint32_t col = 0;
+    const char *msg = filo_error(&ctx);
+    if (strncmp(msg, "parse error", 11) == 0 || !filo_error_at(&ctx, &line, &col)) {
+        return complain2(where, msg);
+    }
+    char place[300];
+    (void)snprintf(place, sizeof(place), "%s:%u:%u", where, line, col);
+    return complain2(place, msg);
 }
 
 static void start(void) {
@@ -119,7 +134,7 @@ static size_t build(char **paths, int n) {
             return 0;
         }
         if (filo_compile(&ctx, (const uint8_t *)sources[i], len, &progs[i]) != FILO_OK) {
-            (void)complain2(paths[i], filo_error(&ctx));
+            (void)complain_at(paths[i]);
             return 0;
         }
         entry_name(paths[i], ".filo", names[i], sizeof(names[i]));
@@ -215,7 +230,7 @@ static int run_unit(const uint8_t *data, size_t len, char **entries, int nentrie
     filo_value v = {0};
     for (int i = 0; i < nentries; i++) {
         if (filo_bc_run(&ctx, unit, entries[i], NULL, &v) != FILO_OK) {
-            return complain2(entries[i], filo_error(&ctx));
+            return complain_at(entries[i]); /* an entry is named by its source */
         }
         if (trace) {
             printf("-- %s: %u steps\n", entries[i], ctx.steps);
@@ -292,12 +307,18 @@ static int cmd_run(int argc, char **argv) {
     filo_value v = {0};
     if (filo_compile(&ctx, unit_mem, len, &prog) != FILO_OK ||
         filo_run(&ctx, &prog, NULL, &v) != FILO_OK) {
-        return complain(filo_error(&ctx));
+        return complain_at(argv[i]);
     }
     return show_value(&v);
 }
 
 static int cmd_build(int argc, char **argv) {
+    bool strip = false;
+    if (argc > 0 && strcmp(argv[0], "--strip") == 0) {
+        strip = true;
+        argc--;
+        argv++;
+    }
     if (argc < 3 || strcmp(argv[0], "-o") != 0) {
         fputs(usage, stderr);
         return 2;
@@ -305,6 +326,13 @@ static int cmd_build(int argc, char **argv) {
     size_t len = build(argv + 2, argc - 2);
     if (len == 0) {
         return 1;
+    }
+    if (strip) {
+        size_t full = len;
+        memcpy(bundle_mem, unit_mem, full);
+        if (filo_bc_strip(&ctx, bundle_mem, full, unit_mem, sizeof(unit_mem), &len) != FILO_OK) {
+            return complain(filo_error(&ctx));
+        }
     }
     FILE *f = fopen(argv[1], "wb");
     if (f == NULL || fwrite(unit_mem, 1, len, f) != len) {

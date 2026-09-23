@@ -1,5 +1,6 @@
-unit: 182 bytes, format 1, checksum b18a27c2 ok
+unit: 260 bytes, format 1, checksum 7992bd69 ok
 widest stack 4, widest frame 1
+debug: line and column of each instruction
 
 imports (3): what the loading context must provide
      0  <
@@ -15,30 +16,30 @@ exports (1)
   fib -> fn 0
 
 fn 0 (entry "fib"): params 0, slots 0, stack 2, 7 bytes
-  0000  61              CLOSURE  1         fn 1
-  0001  10              STORE_G  0         fib
-  0002  39              POP      1
-  0003  08              PUSH_G   0         fib
-  0004  00              PUSH_K   0         10
-  0005  49              CALL     1
-  0006  58              RET      0         return
+  0000  61              3:10   CLOSURE  1         fn 1
+  0001  10              3:1    STORE_G  0         fib
+  0002  39                     POP      1
+  0003  08              4:2    PUSH_G   0         fib
+  0004  00              4:6    PUSH_K   0         10
+  0005  49              4:1    CALL     1
+  0006  58                     RET      0         return
 
 fn 1: params 1, slots 1, stack 4, 26 bytes
-  0007  18              PUSH_L   0         slot 0
-  0008  01              PUSH_K   1         2
-  0009  52 00           CALLB    2 0       <
-  0011  41 04 00        JMP      if false  -> 0018
-  0014  18              PUSH_L   0         slot 0
-  0015  40 0e 00        JMP      always    -> 0032
-  0018  08              PUSH_G   0         fib
-  0019  18              PUSH_L   0         slot 0
-  0020  02              PUSH_K   2         1
-  0021  52 01           CALLB    2 1       -
-  0023  49              CALL     1
-  0024  08              PUSH_G   0         fib
-  0025  18              PUSH_L   0         slot 0
-  0026  01              PUSH_K   1         2
-  0027  52 01           CALLB    2 1       -
-  0029  49              CALL     1
-  0030  52 02           CALLB    2 2       +
-  0032  58              RET      0         return
+  0007  18              3:25   PUSH_L   0         slot 0
+  0008  01              3:27   PUSH_K   1         2
+  0009  52 00           3:22   CALLB    2 0       <
+  0011  41 04 00        3:18   JMP      if false  -> 0018
+  0014  18              3:30   PUSH_L   0         slot 0
+  0015  40 0e 00        3:18   JMP      always    -> 0032
+  0018  08              3:36   PUSH_G   0         fib
+  0019  18              3:43   PUSH_L   0         slot 0
+  0020  02              3:45   PUSH_K   2         1
+  0021  52 01           3:40   CALLB    2 1       -
+  0023  49              3:35   CALL     1
+  0024  08              3:50   PUSH_G   0         fib
+  0025  18              3:57   PUSH_L   0         slot 0
+  0026  01              3:59   PUSH_K   1         2
+  0027  52 01           3:54   CALLB    2 1       -
+  0029  49              3:49   CALL     1
+  0030  52 02           3:32   CALLB    2 2       +
+  0032  58                     RET      0         return

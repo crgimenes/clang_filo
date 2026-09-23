@@ -380,6 +380,59 @@ static void test_bundle_carries_units_whole(void) {
     CHECK(strstr(filo_error(&CTX), "not a unit") != NULL);
 }
 
+/* An error says where it happened, apart from its message: the IR from
+   the node that failed, a unit from its debug section — the same place —
+   and a stripped unit not at all. */
+static uint8_t stripped[1U << 16U];
+
+static void test_errors_say_where(void) {
+    start();
+    uint32_t line = 0;
+    uint32_t col = 0;
+    filo_prog prog;
+    const char *bad = "(list 1\n  2";
+    CHECK(filo_compile(&CTX, (const uint8_t *)bad, strlen(bad), &prog) == FILO_ERR);
+    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 4);
+    CHECK(strstr(filo_error(&CTX), "line 2, col 4") != NULL);
+
+    const char *src = "(let ((x 1))\n  (+ x \"a\"))";
+    filo_value v;
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    CHECK(filo_run(&CTX, &prog, NULL, &v) == FILO_ERR);
+    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 3);
+    CHECK(strstr(filo_error(&CTX), "line") == NULL); /* the message reads as Go's */
+
+    const char *srcs[] = {src};
+    size_t len = build(srcs, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_ERR);
+    line = 0;
+    col = 0;
+    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 3);
+
+    size_t slen = 0;
+    CHECK(filo_bc_strip(&CTX, unit_buf, len, stripped, sizeof(stripped), &slen) == FILO_OK);
+    CHECK(slen < len);
+    CHECK(filo_bc_load(&CTX, stripped, slen, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_ERR);
+    CHECK(!filo_error_at(&CTX, &line, &col));
+    size_t again = 0;
+    CHECK(filo_bc_strip(&CTX, stripped, slen, unit_buf, sizeof(unit_buf), &again) == FILO_OK);
+    CHECK(again == slen && memcmp(unit_buf, stripped, slen) == 0); /* nothing left to strip */
+
+    const char *ok = "(+ 1 2)";
+    CHECK(filo_compile(&CTX, (const uint8_t *)ok, strlen(ok), &prog) == FILO_OK);
+    CHECK(filo_run(&CTX, &prog, NULL, &v) == FILO_OK);
+    CHECK(!filo_error_at(&CTX, &line, &col)); /* a run that worked leaves no place behind */
+
+    CHECK(filo_set_global(&CTX, "w", filo_num(1)) == FILO_OK);
+    filo_seal_globals(&CTX);
+    const char *typo = "(+ w\n   wdith)";
+    CHECK(filo_compile(&CTX, (const uint8_t *)typo, strlen(typo), &prog) == FILO_ERR);
+    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 4);
+}
+
 int main(void) {
     filo_libc_install();
     test_globals_cross_both_ways();
@@ -387,6 +440,7 @@ int main(void) {
     test_seal_is_off_until_asked();
     test_symbol_table_is_bounded();
     test_bundle_carries_units_whole();
+    test_errors_say_where();
     test_host_calls_a_script_function();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();

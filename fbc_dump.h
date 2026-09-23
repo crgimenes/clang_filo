@@ -51,6 +51,7 @@ typedef struct {
     fbc_span export_names[FBC_EXPORTS_MAX];
     uint32_t export_fns[FBC_EXPORTS_MAX];
     uint32_t nexports;
+    fbc_span debug; /* empty when the unit was stripped */
 } fbc_unit;
 
 /* A bundle: its header and where each member is. */
@@ -86,6 +87,10 @@ bool fbc_read(fbc_unit *u, const uint8_t *data, size_t len, char *why, size_t ca
 /* The instruction at pc of the code section, as text ("CALLB 1 print");
    returns its length in bytes, 0 when it cannot be read. */
 uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap);
+
+/* The source position of the instruction at pc, by the debug section;
+   false without one. */
+bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col);
 
 /* A number as Filo writes it (Go's strconv, 'g', shortest). */
 void fbc_number(double x, char *dst, size_t cap);

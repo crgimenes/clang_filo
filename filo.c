@@ -62,6 +62,12 @@ int filo_fail(filo_ctx *ctx, const char *msg) {
     return FILO_ERR;
 }
 
+static void clear_error(filo_ctx *ctx) {
+    ctx->error[0] = '\0';
+    ctx->error_line = 0;
+    ctx->error_col = 0;
+}
+
 int filo_fail2(filo_ctx *ctx, const char *msg, const char *detail) {
     size_t n = cstr_copy(ctx->error, sizeof(ctx->error), msg);
     if (detail != NULL) {
@@ -457,6 +463,8 @@ typedef enum {
 typedef struct node node;
 struct node {
     uint8_t kind;
+    uint32_t line; /* where it starts, counted as parse errors count */
+    uint32_t col;
     double num;
     bool b;
     filo_str text; /* string bytes or symbol name */
@@ -470,6 +478,10 @@ typedef struct {
     size_t len;
     size_t i;
     uint32_t depth;
+    size_t start; /* where the node being read starts */
+    size_t at;    /* how far line and col have been counted */
+    uint32_t line;
+    uint32_t col;
 } parser;
 
 static bool is_ws(uint8_t c) {
@@ -503,6 +515,21 @@ static void skip_ws(parser *p) {
     }
 }
 
+/* Line and column of the byte at off. The parser only moves forward, and
+   so does the count. */
+static void parser_pos(parser *p, size_t off, uint32_t *line, uint32_t *col) {
+    for (; p->at < off && p->at < p->len; p->at++) {
+        if (p->src[p->at] == '\n') {
+            p->line++;
+            p->col = 1;
+        } else {
+            p->col++;
+        }
+    }
+    *line = p->line;
+    *col = p->col;
+}
+
 static node *new_node(parser *p, uint8_t kind) {
     node *n = ralloc(p->ctx, sizeof(node));
     if (n == NULL) {
@@ -510,6 +537,7 @@ static node *new_node(parser *p, uint8_t kind) {
     }
     memset(n, 0, sizeof(*n));
     n->kind = kind;
+    parser_pos(p, p->start, &n->line, &n->col);
     return n;
 }
 
@@ -530,7 +558,10 @@ static int parse_fail(parser *p, const char *what) {
     n += cstr_copy(prefix + n, sizeof(prefix) - n, ", col ");
     n += u32_text(prefix + n, sizeof(prefix) - n, col);
     (void)cstr_copy(prefix + n, sizeof(prefix) - n, ": ");
-    return filo_fail2(p->ctx, prefix, what);
+    (void)filo_fail2(p->ctx, prefix, what);
+    p->ctx->error_line = line;
+    p->ctx->error_col = col;
+    return FILO_ERR;
 }
 
 static node *read_node(parser *p);
@@ -769,6 +800,7 @@ static node *read_node(parser *p) {
         (void)parse_fail(p, "unexpected end of input");
         return NULL;
     }
+    p->start = p->i;
     uint8_t c = p->src[p->i];
     if (c == '(') {
         p->i++;
@@ -790,7 +822,7 @@ static node *read_node(parser *p) {
 /* Parses the whole source. Several top-level expressions are wrapped in an
    implicit (let () ...), exactly as the Go parser does. */
 static node *parse_all(filo_ctx *ctx, const uint8_t *src, size_t len) {
-    parser p = {ctx, src, len, 0, 0};
+    parser p = {ctx, src, len, 0, 0, 0, 0, 1, 1};
     if (len >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF) {
         p.i = 3; /* a BOM is not part of the first token */
     }
@@ -818,6 +850,8 @@ static node *parse_all(filo_ctx *ctx, const uint8_t *src, size_t len) {
                 return NULL;
             }
             let->text = filo_cstring("let").u.str;
+            wrapper->line = first->line; /* the implicit let is where the program starts */
+            wrapper->col = first->col;
             cap = 8;
             wrapper->elems = (node **)ralloc(ctx, sizeof(node *) * cap);
             if (wrapper->elems == NULL) {
@@ -888,6 +922,8 @@ typedef struct {
    persistent arena. */
 struct filo_instr {
     uint8_t op;
+    uint32_t line; /* of the node it was lowered from; 0 when made up */
+    uint32_t col;
     uint32_t a;
     uint32_t b;
     const char *name;
@@ -1010,6 +1046,8 @@ struct scope {
 typedef struct {
     filo_ctx *ctx;
     scope *scope;
+    uint32_t line; /* of the node being lowered: what new instructions carry */
+    uint32_t col;
 } lowerer;
 
 static scope *scope_enter(lowerer *lw) {
@@ -1069,6 +1107,8 @@ static filo_instr *new_instr(lowerer *lw, uint8_t op) {
     }
     memset(in, 0, sizeof(*in));
     in->op = op;
+    in->line = lw->line;
+    in->col = lw->col;
     return in;
 }
 
@@ -1467,7 +1507,26 @@ static const filo_instr *lower_list(lowerer *lw, const node *list) {
     return in;
 }
 
+static const filo_instr *lower_node(lowerer *lw, const node *n);
+
+/* Lowers n with its position in effect, so everything made for it carries
+   it, and puts the enclosing one back. */
 static const filo_instr *lower(lowerer *lw, const node *n) {
+    uint32_t line = lw->line;
+    uint32_t col = lw->col;
+    lw->line = n->line;
+    lw->col = n->col;
+    const filo_instr *in = lower_node(lw, n);
+    if (in == NULL && lw->ctx->error_line == 0) {
+        lw->ctx->error_line = n->line; /* a lowering error: the node it was about */
+        lw->ctx->error_col = n->col;
+    }
+    lw->line = line;
+    lw->col = col;
+    return in;
+}
+
+static const filo_instr *lower_node(lowerer *lw, const node *n) {
     switch (n->kind) {
     case N_NUMBER: {
         filo_instr *in = new_instr(lw, OP_CONST);
@@ -2010,16 +2069,26 @@ static int eval_signal(filo_ctx *ctx, const filo_instr *in, uint8_t sig) {
     return FILO_ERR;
 }
 
+/* The innermost node that failed is where the error happened; the ones
+   around it only add their "in ..." on the way out. */
+static int failed_at(filo_ctx *ctx, const filo_instr *in, int rc) {
+    if (rc != FILO_OK && ctx->signal == SIG_NONE && ctx->error_line == 0) {
+        ctx->error_line = in->line;
+        ctx->error_col = in->col;
+    }
+    return rc;
+}
+
 static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     if (ctx->host.should_stop != NULL && ctx->host.should_stop(ctx->host.user)) {
-        return filo_fail(ctx, "execution cancelled");
+        return failed_at(ctx, in, filo_fail(ctx, "execution cancelled"));
     }
     ctx->steps++;
     if (ctx->limits.step_limit > 0 && ctx->steps > ctx->limits.step_limit) {
-        return filo_fail(ctx, "step limit exceeded");
+        return failed_at(ctx, in, filo_fail(ctx, "step limit exceeded"));
     }
     if (ctx->depth >= FILO_EVAL_DEPTH_MAX) {
-        return filo_fail(ctx, "evaluation too deep");
+        return failed_at(ctx, in, filo_fail(ctx, "evaluation too deep"));
     }
     ctx->depth++;
     int rc = FILO_ERR;
@@ -2123,7 +2192,7 @@ static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         break;
     }
     ctx->depth--;
-    return rc;
+    return failed_at(ctx, in, rc);
 }
 
 #endif
@@ -2372,6 +2441,7 @@ enum {
     BC_SEC_FUNCTIONS,
     BC_SEC_CODE,
     BC_SEC_EXPORTS,
+    BC_SEC_DEBUG,
 };
 
 enum {
@@ -2385,7 +2455,7 @@ enum {
 enum {
     BC_HEADER = 20,
     BC_SECTION = 12,
-    BC_SECTIONS = 6,
+    BC_SECTIONS = 7,
     BC_VERSION = 1,
     BC_KIND_UNIT = 1,
     BC_KIND_BUNDLE = 2,
@@ -2427,6 +2497,8 @@ struct filo_unit {
     filo_str *export_names;
     uint32_t *export_fns;
     uint32_t nexports;
+    const uint8_t *debug; /* pc to line and column, read only when an error needs it */
+    uint32_t debug_len;
 };
 
 static uint32_t fnv1a(uint32_t h, const uint8_t *p, size_t n) {
@@ -2443,6 +2515,10 @@ static uint32_t get_u16(const uint8_t *p) {
 
 static uint32_t get_u32(const uint8_t *p) {
     return get_u16(p) | (get_u16(p + 2) << 16U);
+}
+
+static int bc_bad(filo_ctx *ctx, const char *what) {
+    return filo_fail2(ctx, "bytecode: malformed ", what);
 }
 
 /* The checksum of a unit: all of it, with its own field read as zero. */
@@ -2496,6 +2572,16 @@ typedef struct {
     uint32_t depth; /* values on its stack at this point */
     uint32_t maxdepth;
     bool failed; /* the message is in ctx */
+    /* the debug section as it is written: the position in effect, and the
+       last one recorded with the pc it starts at */
+    uint8_t *dbg;
+    size_t dlen;
+    size_t dcap;
+    uint32_t line;
+    uint32_t col;
+    uint32_t dbg_pc;
+    uint32_t dbg_line;
+    uint32_t dbg_col;
 } bcc;
 
 static void bc_fail(bcc *c, const char *msg) {
@@ -2515,6 +2601,39 @@ static void bc_byte(bcc *c, uint32_t b) {
     c->len++;
 }
 
+static void dbg_uleb(bcc *c, uint32_t v) {
+    for (;;) {
+        if (c->dlen >= c->dcap) {
+            bc_fail(c, "bytecode: the debug table does not fit the run arena");
+            return;
+        }
+        uint32_t b = v & 0x7FU;
+        v >>= 7U;
+        c->dbg[c->dlen] = (uint8_t)(v != 0 ? b | 0x80U : b);
+        c->dlen++;
+        if (v == 0) {
+            return;
+        }
+    }
+}
+
+/* An instruction starts here: when the position in effect is not the last
+   one recorded, the debug table gets an entry — the pc since the last
+   entry, the line as a signed difference (zigzag), the column as is. */
+static void bc_mark(bcc *c) {
+    if (c->line == 0 || (c->line == c->dbg_line && c->col == c->dbg_col)) {
+        return;
+    }
+    uint32_t pc = (uint32_t)c->len;
+    int64_t dl = (int64_t)c->line - (int64_t)c->dbg_line;
+    dbg_uleb(c, pc - c->dbg_pc);
+    dbg_uleb(c, (uint32_t)(dl < 0 ? ((uint64_t)(-dl) * 2U) - 1U : (uint64_t)dl * 2U));
+    dbg_uleb(c, c->col);
+    c->dbg_pc = pc;
+    c->dbg_line = c->line;
+    c->dbg_col = c->col;
+}
+
 static void bc_uleb(bcc *c, uint32_t v) {
     while (v >= 0x80U) {
         bc_byte(c, (v & 0x7FU) | 0x80U);
@@ -2525,6 +2644,7 @@ static void bc_uleb(bcc *c, uint32_t v) {
 
 /* The first byte, and the operand after it when three bits cannot hold it. */
 static void bc_op(bcc *c, uint32_t op, uint32_t x) {
+    bc_mark(c);
     if (x < 7U) {
         bc_byte(c, (op << 3U) | x);
         return;
@@ -2546,6 +2666,7 @@ static void bc_stack(bcc *c, int32_t delta) {
 
 /* A jump forward to a place not known yet: returns where its offset goes. */
 static size_t bc_jump(bcc *c, uint32_t cond) {
+    bc_mark(c);
     bc_byte(c, ((uint32_t)BC_JMP << 3U) | cond);
     size_t at = c->len;
     bc_byte(c, 0);
@@ -2952,7 +3073,23 @@ static void bc_call(bcc *c, const filo_instr *in) {
     bc_stack(c, -(int32_t)argc);
 }
 
+static void bc_node(bcc *c, const filo_instr *in);
+
+/* Compiles in with its position in effect, so the instructions made for it
+   are marked with it, and puts the enclosing one back. */
 static void bc_expr(bcc *c, const filo_instr *in) {
+    uint32_t line = c->line;
+    uint32_t col = c->col;
+    if (in->line != 0) {
+        c->line = in->line;
+        c->col = in->col;
+    }
+    bc_node(c, in);
+    c->line = line;
+    c->col = col;
+}
+
+static void bc_node(bcc *c, const filo_instr *in) {
     if (c->failed) {
         return;
     }
@@ -3189,6 +3326,8 @@ static void bc_write(bcc *c, const filo_bc_entry *entries, uint32_t n, bc_out *o
         out_name(o, entries[i].name);
         out_uleb(o, i);
     }
+    off[6] = (uint32_t)o->len;
+    out_bytes(o, c->dbg, c->dlen);
     for (int i = 0; i < BC_SECTIONS - 1; i++) {
         len[i] = off[i + 1] - off[i];
     }
@@ -3220,7 +3359,7 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
                   size_t *len) {
     *len = 0;
     arena_reset(&ctx->run);
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     if (n == 0 || n > BC_EXPORTS_MAX) {
         return filo_fail(ctx, "bytecode: a unit has 1 to 64 entry points");
     }
@@ -3230,15 +3369,22 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
     }
     memset(c, 0, sizeof(*c));
     c->ctx = ctx;
-    /* the code takes what the run arena has left, keeping an eighth for
-       the rest of the scratch (cond's jump lists, the texts of traps) */
+    /* the code takes two thirds of what the run arena has left and the
+       debug table one, keeping an eighth for the rest of the scratch (cond's
+       jump lists, the texts of traps) */
     size_t room = ctx->run.cap - ctx->run.used;
-    c->cap = room - (room / 8U);
+    size_t avail = room - (room / 8U);
+    c->cap = avail - (avail / 3U);
+    c->dcap = avail / 3U;
     if (c->cap > BC_CODE_MAX) {
         c->cap = BC_CODE_MAX;
     }
+    if (c->dcap > BC_CODE_MAX) {
+        c->dcap = BC_CODE_MAX;
+    }
     c->code = ralloc(ctx, c->cap);
-    if (c->code == NULL) {
+    c->dbg = ralloc(ctx, c->dcap);
+    if (c->code == NULL || c->dbg == NULL) {
         return FILO_ERR;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -3259,13 +3405,75 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
     return FILO_OK;
 }
 
+/* The unit without its debug section, for a machine that has no use for
+   positions: every other section byte for byte, the table one entry
+   shorter and the checksum recomputed. A unit without one is copied. */
+int filo_bc_strip(filo_ctx *ctx, const uint8_t *src, size_t len, uint8_t *dst, size_t cap,
+                  size_t *out_len) {
+    *out_len = 0;
+    clear_error(ctx);
+    if (len < BC_HEADER || src[0] != 0x7F || src[1] != 'F' || src[2] != 'B' || src[3] != 'C' ||
+        src[4] != BC_KIND_UNIT) {
+        return filo_fail(ctx, "bytecode: not a Filo unit");
+    }
+    uint32_t hsize = get_u16(src + 6);
+    uint32_t nsec = get_u16(src + 16);
+    if (hsize < BC_HEADER || hsize > len || nsec > 64 ||
+        (size_t)BC_HEADER + ((size_t)nsec * BC_SECTION) > hsize) {
+        return bc_bad(ctx, "header");
+    }
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < nsec; i++) {
+        const uint8_t *e = src + BC_HEADER + ((size_t)i * BC_SECTION);
+        uint32_t off = get_u32(e + 4);
+        uint32_t n = get_u32(e + 8);
+        if (off < hsize || off > len || n > len - off) {
+            return bc_bad(ctx, "section table");
+        }
+        if (get_u16(e) != BC_SEC_DEBUG) {
+            keep++;
+        }
+    }
+    size_t nh = BC_HEADER + ((size_t)keep * BC_SECTION);
+    bc_out o = {dst, 0, cap};
+    for (size_t i = 0; i < nh; i++) {
+        out_byte(&o, i < BC_HEADER ? src[i] : 0U);
+    }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < nsec; i++) {
+        const uint8_t *e = src + BC_HEADER + ((size_t)i * BC_SECTION);
+        if (get_u16(e) == BC_SEC_DEBUG) {
+            continue;
+        }
+        uint32_t off = get_u32(e + 4);
+        uint32_t n = get_u32(e + 8);
+        size_t at = o.len;
+        out_bytes(&o, src + off, n);
+        if (o.len <= cap) {
+            uint8_t *d = dst + BC_HEADER + ((size_t)k * BC_SECTION);
+            memcpy(d, e, 4);
+            put_u32(d + 4, (uint32_t)at);
+            put_u32(d + 8, n);
+        }
+        k++;
+    }
+    *out_len = o.len;
+    if (o.len > cap) {
+        return filo_fail(ctx, "bytecode: the unit does not fit the buffer");
+    }
+    put_u16(dst + 6, (uint32_t)nh);
+    put_u16(dst + 16, keep);
+    put_u32(dst + 8, bc_checksum(dst, o.len));
+    return FILO_OK;
+}
+
 /* Several units, each whole and named, in one file (docs/bytecode.md,
    "Bundles"). A member is a unit as filo_bc_build wrote it, copied in
    unchanged, so it loads in place from the bundle's bytes. */
 int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t n, uint8_t *dst,
                       size_t cap, size_t *len) {
     *len = 0;
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     if (n == 0 || n > BC_MEMBERS_MAX) {
         return filo_fail(ctx, "bytecode: a bundle holds 1 to 256 units");
     }
@@ -3387,10 +3595,6 @@ static filo_str rd_name(bc_rd *r) {
     s.ptr = rd_bytes(r, n);
     s.len = n;
     return s;
-}
-
-static int bc_bad(filo_ctx *ctx, const char *what) {
-    return filo_fail2(ctx, "bytecode: malformed ", what);
 }
 
 static void *bc_palloc(filo_ctx *ctx, size_t each, uint32_t n) {
@@ -3546,7 +3750,7 @@ static int bc_load_exports(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
    still a unit to load: filo_bc_load checks it again, as any unit. */
 int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
                      const uint8_t **unit, size_t *unit_len) {
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     *unit = NULL;
     *unit_len = 0;
     if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C' ||
@@ -3592,7 +3796,7 @@ int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char 
 }
 
 int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out) {
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     *out = NULL;
     if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C') {
         return filo_fail(ctx, "bytecode: not a Filo unit");
@@ -3641,6 +3845,10 @@ int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit
     memset(u, 0, sizeof(*u));
     u->code = sec[BC_SEC_CODE].p;
     u->code_len = (uint32_t)(sec[BC_SEC_CODE].end - sec[BC_SEC_CODE].p);
+    if (have[BC_SEC_DEBUG]) {
+        u->debug = sec[BC_SEC_DEBUG].p;
+        u->debug_len = (uint32_t)(sec[BC_SEC_DEBUG].end - sec[BC_SEC_DEBUG].p);
+    }
     if ((have[BC_SEC_IMPORTS] && bc_load_names(ctx, &sec[BC_SEC_IMPORTS], u, true) != FILO_OK) ||
         (have[BC_SEC_GLOBALS] && bc_load_names(ctx, &sec[BC_SEC_GLOBALS], u, false) != FILO_OK) ||
         (have[BC_SEC_CONSTANTS] && bc_load_consts(ctx, &sec[BC_SEC_CONSTANTS], u) != FILO_OK) ||
@@ -3923,7 +4131,63 @@ static filo_value *vm_slot(filo_ctx *ctx, const bc_act *a, uint32_t depth, uint3
 }
 
 /* Runs until base returns. */
-static int vm_loop(filo_ctx *ctx, bc_act *base, filo_value *out) {
+/* Where pc came from in the source: the last entry of the unit's debug
+   table at or before it. The table is untrusted like the rest of a unit, so
+   a malformed one only stops the search. */
+static bool bc_position(const filo_unit *u, uint32_t pc, uint32_t *line, uint32_t *col) {
+    if (u->debug == NULL) {
+        return false;
+    }
+    bc_rd r = {u->debug, u->debug + u->debug_len, false};
+    uint32_t at = 0;
+    int64_t l = 0;
+    uint32_t cl = 0;
+    bool found = false;
+    while (r.p < r.end) {
+        uint32_t d = rd_uleb(&r);
+        uint32_t z = rd_uleb(&r);
+        uint32_t cc = rd_uleb(&r);
+        if (r.bad || d > UINT32_MAX - at) {
+            break;
+        }
+        at += d;
+        if (at > pc) {
+            break;
+        }
+        l += (z & 1U) != 0 ? -(int64_t)((z + 1U) / 2U) : (int64_t)(z / 2U);
+        if (l < 1 || l > (int64_t)UINT32_MAX) {
+            break;
+        }
+        cl = cc;
+        found = true;
+    }
+    if (found) {
+        *line = (uint32_t)l;
+        *col = cl;
+    }
+    return found;
+}
+
+/* The instruction that failed is the one just decoded in a: its position
+   is the error's, unless one further in (a builtin calling back) already
+   said where. */
+static void vm_where(filo_ctx *ctx, const bc_act *a) {
+    if (ctx->signal != SIG_NONE || ctx->error_line != 0) {
+        return;
+    }
+    uint32_t pc = a->pc > a->fn->off ? a->pc - 1U : a->fn->off;
+    uint32_t line = 0;
+    uint32_t col = 0;
+    if (bc_position(a->fn->unit, pc, &line, &col)) {
+        ctx->error_line = line;
+        ctx->error_col = col;
+    }
+}
+
+/* *cur follows the activation that is running, written when a call or a
+   return changes it and never per instruction: the caller reads it only
+   when the loop fails, to say where. */
+static int vm_loop(filo_ctx *ctx, bc_act *base, bc_act **cur, filo_value *out) {
     bc_act *a = base;
     for (;;) {
         if (ctx->host.should_stop != NULL && ctx->host.should_stop(ctx->host.user)) {
@@ -4017,6 +4281,7 @@ static int vm_loop(filo_ctx *ctx, bc_act *base, filo_value *out) {
             break;
         case BC_CALL:
             rc = vm_call(ctx, &a, x);
+            *cur = a;
             break;
         case BC_CALLB:
             rc = vm_callb(ctx, a, x, end);
@@ -4044,6 +4309,7 @@ static int vm_loop(filo_ctx *ctx, bc_act *base, filo_value *out) {
                 region_release(ctx, a->mark, &v);
             }
             a = caller;
+            *cur = a;
             rc = vm_push(ctx, a, v);
             break;
         }
@@ -4085,7 +4351,11 @@ static int vm_exec(filo_ctx *ctx, bc_act *base, filo_value *out) {
         return filo_fail(ctx, "evaluation too deep");
     }
     ctx->depth++;
-    int rc = vm_loop(ctx, base, out);
+    bc_act *cur = base;
+    int rc = vm_loop(ctx, base, &cur, out);
+    if (rc != FILO_OK) {
+        vm_where(ctx, cur);
+    }
     ctx->depth--;
     return rc;
 }
@@ -4296,12 +4566,12 @@ int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn) {
 int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) {
     /* the parse tree and the lowering scopes are run-arena temporaries */
     arena_reset(&ctx->run);
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     const node *tree = parse_all(ctx, src, len);
     if (tree == NULL) {
         return FILO_ERR;
     }
-    lowerer lw = {ctx, NULL};
+    lowerer lw = {ctx, NULL, 0, 0};
     if (scope_enter(&lw) == NULL) {
         return FILO_ERR;
     }
@@ -4318,7 +4588,7 @@ int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) 
    a unit's bytecode. */
 static void run_begin(filo_ctx *ctx, const filo_limits *limits, filo_limits *saved) {
     arena_reset(&ctx->run);
-    ctx->error[0] = '\0';
+    clear_error(ctx);
     ctx->steps = 0;
     ctx->recursion = 0;
     ctx->depth = 0;
@@ -4343,7 +4613,7 @@ static int run_end(filo_ctx *ctx, int rc, filo_value v, const filo_limits *saved
         /* exit ends the run with its value; a top-level return acts alike */
         v = ctx->signaled;
         ctx->signal = SIG_NONE;
-        ctx->error[0] = '\0';
+        clear_error(ctx);
         rc = FILO_OK;
     }
     if (rc != FILO_OK) {
@@ -4393,7 +4663,7 @@ int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const f
                 filo_value *result) {
     const bc_fn *fn = bc_export(unit, entry);
     if (fn == NULL) {
-        ctx->error[0] = '\0';
+        clear_error(ctx);
         return filo_fail2(ctx, "bytecode: no entry point named ", entry);
     }
     filo_limits saved;
@@ -4414,6 +4684,15 @@ int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const f
 
 const char *filo_error(const filo_ctx *ctx) {
     return ctx->error;
+}
+
+bool filo_error_at(const filo_ctx *ctx, uint32_t *line, uint32_t *col) {
+    if (ctx->error_line == 0) {
+        return false;
+    }
+    *line = ctx->error_line;
+    *col = ctx->error_col;
+    return true;
 }
 
 /* --------------------------------------------------------------- builtins */

@@ -52,7 +52,10 @@ static bool want_strings = false;
    differently depending on who formats its numbers is two runtimes. */
 static bool use_nolibc = false;
 /* --vm: every case goes through the bytecode too — compiled, written as a
-   unit, loaded back from the bytes and run by the VM. */
+   unit, loaded back from the bytes and run by the VM. A case that fails
+   there fails on the IR too, and both must say it happened at the same
+   line and column; steps count differently on the two, so a step limit is
+   the one error whose place may differ. */
 static bool use_vm = false;
 static uint8_t unit_mem[1U << 20U];
 /* --write-units DIR: each case's unit is also written there (NNNNN.fbc),
@@ -85,6 +88,8 @@ static size_t build_unit(filo_ctx *ctx, const filo_prog *prog) {
     return len;
 }
 
+static int misplaced = 0; /* errors the VM and the IR place differently */
+
 static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits,
                        filo_value *out) {
     if (!use_vm) {
@@ -99,7 +104,29 @@ static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *
         write_file(".fbc", unit_mem, len);
         unit_written = true;
     }
-    return filo_bc_run(ctx, unit, "main", limits, out);
+    if (filo_bc_run(ctx, unit, "main", limits, out) == FILO_OK) {
+        return FILO_OK;
+    }
+    char vm_error[FILO_ERROR_MAX];
+    uint32_t vm_line = 0;
+    uint32_t vm_col = 0;
+    bool vm_at = filo_error_at(ctx, &vm_line, &vm_col);
+    snprintf(vm_error, sizeof(vm_error), "%s", filo_error(ctx));
+    if (strstr(vm_error, "step limit exceeded") != NULL) {
+        return FILO_ERR;
+    }
+    filo_value ignored;
+    uint32_t ir_line = 0;
+    uint32_t ir_col = 0;
+    (void)filo_run(ctx, prog, limits, &ignored);
+    bool ir_at = filo_error_at(ctx, &ir_line, &ir_col);
+    if (vm_at != ir_at || vm_line != ir_line || vm_col != ir_col) {
+        printf("position: the VM says %u:%u, the IR %u:%u (%s)\n", vm_line, vm_col, ir_line, ir_col,
+               vm_error);
+        misplaced++;
+    }
+    snprintf(ctx->error, sizeof(ctx->error), "%s", vm_error);
+    return FILO_ERR;
 }
 
 static void init_ctx(filo_ctx *ctx, void *p, size_t pcap, void *r, size_t rcap) {
@@ -539,6 +566,10 @@ int main(int argc, char **argv) {
     }
     for (int i = first; i < argc; i++) {
         (void)run_file(argv[i]);
+    }
+    if (misplaced > 0) {
+        printf("%d error(s) placed differently by the VM and the IR\n", misplaced);
+        failures += misplaced;
     }
     if (skipped > 0) {
         printf("%d passed, %d failed, %d skipped (host cannot compute them)\n", passed, failures,

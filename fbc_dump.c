@@ -195,6 +195,10 @@ static bool read_section(fbc_unit *u, uint32_t kind, uint32_t off, uint32_t len)
         return true;
     case 6:
         return read_exports(&r, u);
+    case 7:
+        u->debug.off = off;
+        u->debug.len = len;
+        return true;
     default:
         return true; /* a kind this reader does not know is skipped, as the spec says */
     }
@@ -492,6 +496,34 @@ uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap) {
     return (uint32_t)(r.at - u->code.off - pc);
 }
 
+bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col) {
+    reader r = {u->data, u->debug.off, (size_t)u->debug.off + u->debug.len, false};
+    uint32_t at = 0;
+    int64_t l = 0;
+    uint32_t c = 0;
+    bool found = false;
+    while (r.at < r.end) {
+        uint32_t d = rd_uleb(&r);
+        uint32_t z = rd_uleb(&r);
+        uint32_t cc = rd_uleb(&r);
+        if (r.bad || d > UINT32_MAX - at) {
+            break;
+        }
+        at += d;
+        if (at > pc) {
+            break;
+        }
+        l += (z & 1U) != 0 ? -(int64_t)((z + 1U) / 2U) : (int64_t)(z / 2U);
+        c = cc;
+        found = l >= 1;
+    }
+    if (found) {
+        *line = (uint32_t)l;
+        *col = c;
+    }
+    return found;
+}
+
 /* ---- the listing ---- */
 
 static void say(fbc_out out, void *user, const char *fmt, ...)
@@ -539,6 +571,8 @@ static void list_fn(const fbc_unit *u, uint32_t i, fbc_out out, void *user) {
         f->slots, f->stack, f->len);
     uint32_t pc = f->off;
     uint32_t end = f->off + f->len;
+    uint32_t last_line = 0;
+    uint32_t last_col = 0;
     while (pc < end) {
         char text[160];
         uint32_t n = fbc_insn(u, pc, text, sizeof(text));
@@ -552,7 +586,16 @@ static void list_fn(const fbc_unit *u, uint32_t i, fbc_out out, void *user) {
             at += (size_t)snprintf(hex + at, sizeof(hex) - at, "%02x ",
                                    u->data[u->code.off + pc + k]);
         }
-        say(out, user, "  %04u  %-15s %s", pc, hex, text);
+        /* where it came from, shown when that changes: a map of the source */
+        char where[24] = "";
+        uint32_t line = 0;
+        uint32_t col = 0;
+        if (fbc_position(u, pc, &line, &col) && (line != last_line || col != last_col)) {
+            (void)snprintf(where, sizeof(where), "%u:%u", line, col);
+            last_line = line;
+            last_col = col;
+        }
+        say(out, user, "  %04u  %-15s %-6s %s", pc, hex, where, text);
         pc += n;
     }
     if (pc > end) {
@@ -564,6 +607,8 @@ void fbc_dump(const fbc_unit *u, fbc_out out, void *user) {
     say(out, user, "unit: %zu bytes, format %u, checksum %08x %s", u->len, u->version, u->checksum,
         u->checksum_ok ? "ok" : "WRONG");
     say(out, user, "widest stack %u, widest frame %u", u->widest_stack, u->widest_frame);
+    say(out, user, "debug: %s",
+        u->debug.len > 0 ? "line and column of each instruction" : "none (stripped)");
     say(out, user, "");
     list_names(u, u->imports, u->nimports, "imports", ": what the loading context must provide",
                out, user);

@@ -1,5 +1,6 @@
-unit: 121 bytes, format 1, checksum 022f3fe3 ok
+unit: 136 bytes, format 1, checksum bddcb726 ok
 widest stack 1, widest frame 0
+debug: line and column of each instruction
 
 imports (0): what the loading context must provide
 globals (0)
@@ -9,5 +10,5 @@ exports (1)
   ola -> fn 0
 
 fn 0 (entry "ola"): params 0, slots 0, stack 1, 2 bytes
-  0000  00              PUSH_K   0         "olá mundo"
-  0001  58              RET      0         return
+  0000  00              2:1    PUSH_K   0         "olá mundo"
+  0001  58                     RET      0         return
