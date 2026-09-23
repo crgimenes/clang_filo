@@ -64,7 +64,7 @@ last).
     offset  size  field
     0       4     magic 7F 46 42 43 ("\x7fFBC": the first byte is not ASCII,
                   so no source text can start this way)
-    4       1     kind: 1 = unit (2 = bundle, reserved)
+    4       1     kind: 1 = unit (2 = bundle, below)
     5       1     format version: 1
     6       2     header size, in bytes; a reader skips what it does not know
     8       4     FNV-1a 32 of the whole file, computed with this field zero
@@ -99,6 +99,37 @@ slots are the parameters first, then one slot for every `let`/`letv`
 binding in the function, never reused: a closure created in one `let`
 keeps seeing that `let`'s slot, as it keeps seeing that `let`'s frame in
 the IR.
+
+## Bundles
+
+A **bundle** is several units in one file, each whole and named: a program
+that travels as one file however many units it has (the screens of a board,
+one unit each, since each has its own globals). It is the `.jar` to the
+unit's `a.out`, from the same family of signatures.
+
+    offset  size  field
+    0       4     magic 7F 46 42 43, as a unit's
+    4       1     kind: 2 = bundle
+    5       1     format version: 1
+    6       2     header size, table included
+    8       4     FNV-1a 32 of the whole file, computed with this field zero
+    12      2     widest operand stack of any member
+    14      2     widest frame of any member
+    16      2     number of members, 1 to 256
+    18      2     reserved, zero
+    20      12×n  member table: offset (u32), length (u32) and the offset of
+                  its name (u32), all from the start of the file
+
+The names follow the table (length, bytes, as names are in a unit), then the
+members, each starting on a multiple of 8 so it can run from memory-mapped
+flash as it lies. A member is a unit exactly as the compiler wrote it,
+checksum included: cut out, it is a unit file again. Names are unique.
+
+Opening a bundle checks it whole (its checksum, its table, every member
+inside the file and aligned); loading a member is loading a unit, with the
+unit's own checks. The runtime writes one with `filo_bundle_build` and finds
+a member with `filo_bundle_find`. What memory a bundle needs is the most any
+one member needs, not the sum: a host runs one unit at a time.
 
 ## Instructions
 
@@ -176,6 +207,8 @@ view:
     filo build -o dobro.fbc examples/dobro.filo
     filo dump dobro.fbc                     # the unit, every operand named
     filo run --trace dobro.fbc              # each instruction, with the stack
+    filo bundle -o demo.fbb ola.fbc dobro.fbc
+    filo run demo.fbb dobro                 # one member of the bundle
 
 The listing reads units with `fbc_dump.c`, written from this document alone
 and sharing no code with the loader: a second reading of the format, held to

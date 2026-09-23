@@ -330,12 +330,63 @@ static void test_bc_sealed_context_refuses_unknown_globals(void) {
     CHECK(strstr(filo_error(&CTX), "other") != NULL);
 }
 
+/* A bundle carries units whole: each member loads and runs as the unit it
+   was, the bundle is checked whole, and a name it does not have says so. */
+static uint8_t bundle_buf[1U << 16U];
+static uint8_t second_unit[1U << 16U];
+
+static void test_bundle_carries_units_whole(void) {
+    start();
+    const char *one[] = {"(* 6 7)"};
+    size_t len_one = build(one, 1);
+    memcpy(second_unit, unit_buf, len_one);
+    const char *two[] = {"(string (+ 40 2))"};
+    size_t len_two = build(two, 1);
+    filo_bundle_member m[2] = {{"answer", second_unit, len_one}, {"text", unit_buf, len_two}};
+    size_t len = 0;
+    CHECK(filo_bundle_build(&CTX, m, 2, bundle_buf, 16, &len) == FILO_ERR); /* says the size */
+    size_t need = len;
+    CHECK(filo_bundle_build(&CTX, m, 2, bundle_buf, sizeof(bundle_buf), &len) == FILO_OK);
+    CHECK(len == need);
+
+    const uint8_t *u = NULL;
+    size_t ulen = 0;
+    CHECK(filo_bundle_find(&CTX, bundle_buf, len, "answer", &u, &ulen) == FILO_OK);
+    CHECK(ulen == len_one && memcmp(u, second_unit, ulen) == 0); /* copied in unchanged */
+    CHECK((size_t)(u - bundle_buf) % 8 == 0);
+    const filo_unit *unit = NULL;
+    filo_value v;
+    CHECK(filo_bc_load(&CTX, u, ulen, &unit) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, unit, "e0", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 42);
+    CHECK(filo_bundle_find(&CTX, bundle_buf, len, "text", &u, &ulen) == FILO_OK);
+    CHECK(filo_bc_load(&CTX, u, ulen, &unit) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, unit, "e0", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_STRING && v.u.str.len == 2 && memcmp(v.u.str.ptr, "42", 2) == 0);
+
+    CHECK(filo_bundle_find(&CTX, bundle_buf, len, "nope", &u, &ulen) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "no bundle member named nope") != NULL);
+    bundle_buf[len - 1] ^= 1U; /* a bit anywhere: the whole bundle is refused */
+    CHECK(filo_bundle_find(&CTX, bundle_buf, len, "answer", &u, &ulen) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "checksum") != NULL);
+    bundle_buf[len - 1] ^= 1U;
+    CHECK(filo_bundle_find(&CTX, second_unit, len_one, "answer", &u, &ulen) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "not a Filo bundle") != NULL);
+
+    filo_bundle_member same[2] = {{"x", second_unit, len_one}, {"x", unit_buf, len_two}};
+    CHECK(filo_bundle_build(&CTX, same, 2, bundle_buf, sizeof(bundle_buf), &len) == FILO_ERR);
+    filo_bundle_member bad[1] = {{"src", (const uint8_t *)"(+ 1 2) is not a unit", 21}};
+    CHECK(filo_bundle_build(&CTX, bad, 1, bundle_buf, sizeof(bundle_buf), &len) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "not a unit") != NULL);
+}
+
 int main(void) {
     filo_libc_install();
     test_globals_cross_both_ways();
     test_seal_refuses_new_globals();
     test_seal_is_off_until_asked();
     test_symbol_table_is_bounded();
+    test_bundle_carries_units_whole();
     test_host_calls_a_script_function();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();

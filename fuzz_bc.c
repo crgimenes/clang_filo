@@ -7,6 +7,7 @@
    the machine reaches, so both are held to the same rule. */
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "fbc_dump.h"
@@ -20,6 +21,7 @@ static uint8_t run_mem[1U << 20U];
 static uint8_t unit[1U << 16U];
 static filo_ctx ctx;
 static fbc_unit listing;
+static fbc_bundle bundle;
 static bool listed = false;
 
 static void discard(void *user, const char *line) {
@@ -55,9 +57,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         unit[8 + i] = (uint8_t)(h >> (8U * i));
     }
     char why[128];
-    listed = fbc_read(&listing, unit, size, why, sizeof(why));
-    if (listed) {
-        fbc_dump(&listing, discard, NULL);
+    const uint8_t *code = unit;
+    size_t code_len = size;
+    if (fbc_read_bundle(&bundle, unit, size, why, sizeof(why))) {
+        fbc_dump_bundle(&bundle, discard, NULL);
     }
     filo_libc_install();
     filo_init(&ctx, &filo_libc_host, persistent_mem, sizeof(persistent_mem), run_mem,
@@ -65,8 +68,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)filo_math_register(&ctx, &filo_libc_math);
     (void)filo_strings_register(&ctx, &filo_libc_strings);
     ctx.host.trace = follow;
+    /* a bundle: its first member runs, found the way a host finds one */
+    if (unit[4] == 2 && bundle.n > 0) {
+        char name[260];
+        const fbc_member *m = &bundle.members[0];
+        (void)snprintf(name, sizeof(name), "%.*s", (int)m->name.len,
+                       (const char *)unit + m->name.off);
+        if (filo_bundle_find(&ctx, unit, size, name, &code, &code_len) != FILO_OK) {
+            return 0;
+        }
+    }
+    listed = fbc_read(&listing, code, code_len, why, sizeof(why));
+    if (listed) {
+        fbc_dump(&listing, discard, NULL);
+    }
     const filo_unit *u = NULL;
-    if (filo_bc_load(&ctx, unit, size, &u) != FILO_OK) {
+    if (filo_bc_load(&ctx, code, code_len, &u) != FILO_OK) {
         return 0;
     }
     filo_limits limits = {20000U, 64U};

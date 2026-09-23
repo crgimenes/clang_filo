@@ -2388,6 +2388,10 @@ enum {
     BC_SECTIONS = 6,
     BC_VERSION = 1,
     BC_KIND_UNIT = 1,
+    BC_KIND_BUNDLE = 2,
+    BC_MEMBER = 12,       /* a bundle's table entry */
+    BC_MEMBERS_MAX = 256, /* units one bundle may hold */
+    BC_ALIGN = 8,         /* where a member starts, from the start of the file */
     /* what one unit may hold: the compiler stops there, the loader refuses
        past it */
     BC_CONSTS_MAX = 4096,
@@ -2431,6 +2435,14 @@ static uint32_t fnv1a(uint32_t h, const uint8_t *p, size_t n) {
         h *= 16777619U;
     }
     return h;
+}
+
+static uint32_t get_u16(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8U);
+}
+
+static uint32_t get_u32(const uint8_t *p) {
+    return get_u16(p) | (get_u16(p + 2) << 16U);
 }
 
 /* The checksum of a unit: all of it, with its own field read as zero. */
@@ -3247,6 +3259,77 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
     return FILO_OK;
 }
 
+/* Several units, each whole and named, in one file (docs/bytecode.md,
+   "Bundles"). A member is a unit as filo_bc_build wrote it, copied in
+   unchanged, so it loads in place from the bundle's bytes. */
+int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t n, uint8_t *dst,
+                      size_t cap, size_t *len) {
+    *len = 0;
+    ctx->error[0] = '\0';
+    if (n == 0 || n > BC_MEMBERS_MAX) {
+        return filo_fail(ctx, "bytecode: a bundle holds 1 to 256 units");
+    }
+    uint32_t name_at[BC_MEMBERS_MAX];
+    uint32_t unit_at[BC_MEMBERS_MAX];
+    uint32_t widest_stack = 0;
+    uint32_t widest_frame = 0;
+    const size_t hsize = BC_HEADER + ((size_t)n * BC_MEMBER);
+    bc_out o = {dst, 0, cap};
+    for (size_t i = 0; i < hsize; i++) {
+        out_byte(&o, 0);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const filo_bundle_member *m = &members[i];
+        size_t nl = strlen(m->name);
+        if (nl == 0 || nl > BC_NAME_MAX) {
+            return filo_fail(ctx, "bytecode: a bundle member needs a name of 1 to 256 bytes");
+        }
+        for (uint32_t k = 0; k < i; k++) {
+            if (strcmp(members[k].name, m->name) == 0) {
+                return filo_fail2(ctx, "bytecode: two bundle members named ", m->name);
+            }
+        }
+        const uint8_t *u = m->data;
+        if (m->len < BC_HEADER || u[0] != 0x7F || u[1] != 'F' || u[2] != 'B' || u[3] != 'C' ||
+            u[4] != BC_KIND_UNIT) {
+            return filo_fail2(ctx, "bytecode: a bundle member is not a unit: ", m->name);
+        }
+        widest_stack = get_u16(u + 12) > widest_stack ? get_u16(u + 12) : widest_stack;
+        widest_frame = get_u16(u + 14) > widest_frame ? get_u16(u + 14) : widest_frame;
+        name_at[i] = (uint32_t)o.len;
+        out_name(&o, m->name);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        while (o.len % BC_ALIGN != 0) {
+            out_byte(&o, 0);
+        }
+        unit_at[i] = (uint32_t)o.len;
+        out_bytes(&o, members[i].data, members[i].len);
+    }
+    *len = o.len;
+    if (o.len > cap) {
+        return filo_fail(ctx, "bytecode: the bundle does not fit the buffer");
+    }
+    dst[0] = 0x7F;
+    dst[1] = 'F';
+    dst[2] = 'B';
+    dst[3] = 'C';
+    dst[4] = BC_KIND_BUNDLE;
+    dst[5] = BC_VERSION;
+    put_u16(dst + 6, (uint32_t)hsize);
+    put_u16(dst + 12, widest_stack);
+    put_u16(dst + 14, widest_frame);
+    put_u16(dst + 16, n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t *e = dst + BC_HEADER + ((size_t)i * BC_MEMBER);
+        put_u32(e, unit_at[i]);
+        put_u32(e + 4, (uint32_t)members[i].len);
+        put_u32(e + 8, name_at[i]);
+    }
+    put_u32(dst + 8, bc_checksum(dst, o.len));
+    return FILO_OK;
+}
+
 #endif
 
 /* ---- the loader ---- */
@@ -3304,14 +3387,6 @@ static filo_str rd_name(bc_rd *r) {
     s.ptr = rd_bytes(r, n);
     s.len = n;
     return s;
-}
-
-static uint32_t get_u16(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8U);
-}
-
-static uint32_t get_u32(const uint8_t *p) {
-    return get_u16(p) | (get_u16(p + 2) << 16U);
 }
 
 static int bc_bad(filo_ctx *ctx, const char *what) {
@@ -3462,6 +3537,56 @@ static int bc_load_exports(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
         if (r->bad || u->export_fns[i] >= u->nfns) {
             return bc_bad(ctx, "exports");
         }
+    }
+    return FILO_OK;
+}
+
+/* Checks a whole bundle — its checksum, its table, every member inside the
+   file on its alignment — and finds one member by name. The member is
+   still a unit to load: filo_bc_load checks it again, as any unit. */
+int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
+                     const uint8_t **unit, size_t *unit_len) {
+    ctx->error[0] = '\0';
+    *unit = NULL;
+    *unit_len = 0;
+    if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C' ||
+        data[4] != BC_KIND_BUNDLE) {
+        return filo_fail(ctx, "bytecode: not a Filo bundle");
+    }
+    if (data[5] != BC_VERSION) {
+        return filo_fail(ctx, "bytecode: a kind or version this runtime does not read");
+    }
+    uint32_t hsize = get_u16(data + 6);
+    uint32_t n = get_u16(data + 16);
+    if (n == 0 || n > BC_MEMBERS_MAX || hsize > len ||
+        (size_t)BC_HEADER + ((size_t)n * BC_MEMBER) > hsize) {
+        return bc_bad(ctx, "bundle header");
+    }
+    if (bc_checksum(data, len) != get_u32(data + 8)) {
+        return filo_fail(ctx, "bytecode: the checksum does not match (a damaged bundle)");
+    }
+    size_t want = strlen(name);
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = data + BC_HEADER + ((size_t)i * BC_MEMBER);
+        uint32_t off = get_u32(e);
+        uint32_t mlen = get_u32(e + 4);
+        uint32_t name_off = get_u32(e + 8);
+        if (off < hsize || off > len || mlen > len - off || off % BC_ALIGN != 0 ||
+            name_off < hsize || name_off >= len) {
+            return bc_bad(ctx, "bundle table");
+        }
+        bc_rd r = {data + name_off, data + len, false};
+        filo_str s = rd_name(&r);
+        if (r.bad || s.len == 0) {
+            return bc_bad(ctx, "bundle table");
+        }
+        if (*unit == NULL && s.len == want && memcmp(s.ptr, name, want) == 0) {
+            *unit = data + off;
+            *unit_len = mlen;
+        }
+    }
+    if (*unit == NULL) {
+        return filo_fail2(ctx, "bytecode: no bundle member named ", name);
     }
     return FILO_OK;
 }

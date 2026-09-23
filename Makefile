@@ -78,7 +78,7 @@ device: all device_test.c
 # to the runtime on how numbers are written. What the examples show is kept
 # in testdata/cli: a change to the compiler is a change to what a lesson
 # shows, and it shows up here (make cli-regen rewrites them).
-CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace
+CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace demo.run demo.dump
 CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c
 
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
@@ -86,7 +86,14 @@ build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/filo $(CLI_SRC) filo_cli.c -lm
 
-cli: device build/filo dump_test.c
+# the demo bundle: two examples, built and bundled as a lesson would
+build/cli/demo.fbb: build/filo examples/ola.filo examples/dobro.filo
+	@mkdir -p build/cli
+	./build/filo build -o build/cli/ola.fbc examples/ola.filo
+	./build/filo build -o build/cli/dobro.fbc examples/dobro.filo
+	./build/filo bundle -o $@ build/cli/ola.fbc build/cli/dobro.fbc
+
+cli: device build/filo build/cli/demo.fbb dump_test.c
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/dump_test $(CLI_SRC) dump_test.c -lm
 	./build/dump_test build/units
@@ -95,7 +102,7 @@ cli: device build/filo dump_test.c
 		diff -u testdata/cli/$$c build/cli.out || exit 1; \
 	done; echo "cli: $(words $(CLI_CASES)) outputs as kept"
 
-cli-regen: build/filo
+cli-regen: build/filo build/cli/demo.fbb
 	@for c in $(CLI_CASES); do ./build/filo $$(sh testdata/cli/args.sh $$c) > testdata/cli/$$c 2>&1; done
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
@@ -162,10 +169,13 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 # A unit is input from anywhere, so the loader and the machine are fuzzed
 # with units: the corpus compiled to bytecode as seeds, mutated from there.
 # The target is the device build, which is where units from anywhere run.
-fuzz-bc: all fuzz_bc.c fbc_dump.c fbc_dump.h
+fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h
 	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
 	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
 	@rm -f build/fuzz_bc_seeds/*.expect
+	@./build/filo bundle -o build/fuzz_bc_seeds/b1.fbb build/fuzz_bc_seeds/00001.fbc \
+		build/fuzz_bc_seeds/00002.fbc build/fuzz_bc_seeds/00003.fbc
+	@./build/filo bundle -o build/fuzz_bc_seeds/b2.fbb build/fuzz_bc_seeds/00100.fbc
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
 		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fbc_dump.c fuzz_bc.c -lm
 	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \

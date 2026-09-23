@@ -15,6 +15,7 @@ enum {
     FBC_CONSTS_MAX = 4096,
     FBC_FNS_MAX = 1024,
     FBC_EXPORTS_MAX = 64,
+    FBC_MEMBERS_MAX = 256,
 };
 
 typedef struct {
@@ -52,6 +53,30 @@ typedef struct {
     uint32_t nexports;
 } fbc_unit;
 
+/* A bundle: its header and where each member is. */
+typedef struct {
+    fbc_span name;
+    fbc_span unit;
+} fbc_member;
+
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    uint32_t version;
+    uint32_t checksum;
+    bool checksum_ok;
+    uint32_t widest_stack;
+    uint32_t widest_frame;
+    fbc_member members[FBC_MEMBERS_MAX];
+    uint32_t n;
+} fbc_bundle;
+
+/* 1 for a unit, 2 for a bundle, 0 for anything else. */
+uint32_t fbc_kind(const uint8_t *data, size_t len);
+
+/* Reads a bundle's table into b, as fbc_read reads a unit. */
+bool fbc_read_bundle(fbc_bundle *b, const uint8_t *data, size_t len, char *why, size_t cap);
+
 /* Reads a unit's header and sections into u, which points into data. False,
    with the reason in why, when the bytes are not a unit this reader can
    list. A wrong checksum is reported in u, not refused: the listing of a
@@ -68,5 +93,7 @@ void fbc_number(double x, char *dst, size_t cap);
 /* The whole listing, a line at a time. */
 typedef void (*fbc_out)(void *user, const char *line);
 void fbc_dump(const fbc_unit *u, fbc_out out, void *user);
+/* A bundle's listing: its table, then every member's. */
+void fbc_dump_bundle(const fbc_bundle *b, fbc_out out, void *user);
 
 #endif

@@ -16,7 +16,8 @@ screens of the author's board take 766 KB of IR and 25 KB as units. Its
 imports are its capability list — a context without one of them refuses the
 unit — and a unit is treated as untrusted input: checksummed, bounds-checked
 and fuzzed. Every corpus case and the Prolog oracle run through both the IR
-and the bytecode.
+and the bytecode. A bundle puts several units, whole and named, in one file
+that travels as one.
 
 Built with `-DFILO_VM_ONLY`, the runtime keeps only what runs a unit: no
 parser, no IR, no compiler. On an ESP32-S3 that is 17 KB of code instead of
@@ -25,7 +26,7 @@ build, on that build. `FILO_SYMBOLS_MAX` (512 by default, about 40 bytes a
 name in every context) is a build setting too; the device check runs with
 128.
 
-`filo run`, `filo build`, `filo dump` and `filo run --trace` show the road
+`filo run`, `filo build`, `filo bundle`, `filo dump` and `filo run --trace` show the road
 from source to the machine: `examples/` starts at "olá mundo".
 
 ## Memory

@@ -200,6 +200,62 @@ static bool read_section(fbc_unit *u, uint32_t kind, uint32_t off, uint32_t len)
     }
 }
 
+static uint32_t checksum_of(const uint8_t *data, size_t len) {
+    static const uint8_t zero[4] = {0, 0, 0, 0};
+    uint32_t h = fnv1a(2166136261U, data, 8);
+    h = fnv1a(h, zero, 4);
+    return fnv1a(h, data + 12, len - 12);
+}
+
+uint32_t fbc_kind(const uint8_t *data, size_t len) {
+    if (len < HEADER || memcmp(data,
+                               "\x7f"
+                               "FBC",
+                               4) != 0) {
+        return 0;
+    }
+    if (data[4] == 1 || data[4] == 2) {
+        return data[4];
+    }
+    return 0;
+}
+
+bool fbc_read_bundle(fbc_bundle *b, const uint8_t *data, size_t len, char *why, size_t cap) {
+    memset(b, 0, sizeof(*b));
+    b->data = data;
+    b->len = len;
+    if (fbc_kind(data, len) != 2) {
+        return fail(why, cap, "not a Filo bundle");
+    }
+    b->version = data[5];
+    uint32_t hsize = get_u16(data + 6);
+    b->checksum = get_u32(data + 8);
+    b->checksum_ok = checksum_of(data, len) == b->checksum;
+    b->widest_stack = get_u16(data + 12);
+    b->widest_frame = get_u16(data + 14);
+    b->n = get_u16(data + 16);
+    if (b->n == 0 || b->n > FBC_MEMBERS_MAX || hsize > len || HEADER + (b->n * 12U) > hsize) {
+        return fail(why, cap, "the bundle's header does not fit the file");
+    }
+    for (uint32_t i = 0; i < b->n; i++) {
+        const uint8_t *e = data + HEADER + ((size_t)i * 12U);
+        fbc_member *m = &b->members[i];
+        m->unit.off = get_u32(e);
+        m->unit.len = get_u32(e + 4);
+        uint32_t name_at = get_u32(e + 8);
+        if (m->unit.off < hsize || m->unit.off > len || m->unit.len > len - m->unit.off ||
+            m->unit.off % 8U != 0 || name_at < hsize || name_at >= len) {
+            return fail(why, cap, "a member lies outside the bundle");
+        }
+        reader r = {data, name_at, len, false};
+        m->name = rd_name(&r);
+        if (r.bad || m->name.len == 0) {
+            return fail(why, cap, "a member's name does not read");
+        }
+    }
+    return true;
+}
+
 bool fbc_read(fbc_unit *u, const uint8_t *data, size_t len, char *why, size_t cap) {
     memset(u, 0, sizeof(*u));
     u->data = data;
@@ -219,10 +275,7 @@ bool fbc_read(fbc_unit *u, const uint8_t *data, size_t len, char *why, size_t ca
     if (hsize < HEADER || hsize > len || nsec > (hsize - HEADER) / SECTION) {
         return fail(why, cap, "the header does not fit the file");
     }
-    static const uint8_t zero[4] = {0, 0, 0, 0};
-    uint32_t h = fnv1a(2166136261U, data, 8);
-    h = fnv1a(h, zero, 4);
-    u->checksum_ok = fnv1a(h, data + 12, len - 12) == u->checksum;
+    u->checksum_ok = checksum_of(data, len) == u->checksum;
     bool seen[8] = {false};
     for (uint32_t i = 0; i < nsec; i++) {
         const uint8_t *e = data + HEADER + ((size_t)i * SECTION);
@@ -529,5 +582,29 @@ void fbc_dump(const fbc_unit *u, fbc_out out, void *user) {
     }
     for (uint32_t i = 0; i < u->nfns; i++) {
         list_fn(u, i, out, user);
+    }
+}
+
+void fbc_dump_bundle(const fbc_bundle *b, fbc_out out, void *user) {
+    say(out, user, "bundle: %zu bytes, format %u, checksum %08x %s", b->len, b->version,
+        b->checksum, b->checksum_ok ? "ok" : "WRONG");
+    say(out, user, "widest stack %u, widest frame %u", b->widest_stack, b->widest_frame);
+    say(out, user, "members (%u)", b->n);
+    for (uint32_t i = 0; i < b->n; i++) {
+        const fbc_member *m = &b->members[i];
+        say(out, user, "  %-16.*s %6u bytes at %u", (int)m->name.len,
+            (const char *)b->data + m->name.off, m->unit.len, m->unit.off);
+    }
+    for (uint32_t i = 0; i < b->n; i++) {
+        const fbc_member *m = &b->members[i];
+        static fbc_unit u;
+        char why[128];
+        say(out, user, "");
+        say(out, user, "== %.*s", (int)m->name.len, (const char *)b->data + m->name.off);
+        if (!fbc_read(&u, b->data + m->unit.off, m->unit.len, why, sizeof(why))) {
+            say(out, user, "(not a unit: %s)", why);
+            continue;
+        }
+        fbc_dump(&u, out, user);
     }
 }

@@ -283,6 +283,26 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
                   size_t *len);
 #endif
 
+/* A bundle: several units, each whole and named, in one file that travels
+   as one (docs/bytecode.md, "Bundles"). */
+typedef struct {
+    const char *name;
+    const uint8_t *data; /* a unit, as filo_bc_build wrote it */
+    size_t len;
+} filo_bundle_member;
+
+#ifndef FILO_VM_ONLY
+/* Writes the units into one bundle at dst, as filo_bc_build writes a unit:
+   the size to *len, and FILO_ERR with the size needed when cap is short. */
+int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t n, uint8_t *dst,
+                      size_t cap, size_t *len);
+#endif
+
+/* Checks a bundle whole and finds the member named name: *unit points at
+   its bytes inside data, ready for filo_bc_load. */
+int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
+                     const uint8_t **unit, size_t *unit_len);
+
 /* Checks a unit and resolves its imports and globals by name against ctx.
    The bytes are used in place and must outlive ctx: on a microcontroller
    they stay in flash. */

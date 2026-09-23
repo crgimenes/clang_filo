@@ -26,21 +26,25 @@ enum {
 static uint8_t persistent_mem[MEM_PERSISTENT];
 static uint8_t run_mem[MEM_RUN];
 static uint8_t unit_mem[FILE_MAX];
+static uint8_t bundle_mem[FILE_MAX];
 static char sources[FILES_MAX][FILE_MAX / FILES_MAX];
 static filo_ctx ctx;
 static fbc_unit listing;
 
 static const char usage[] =
-    "usage: filo run [--vm | --trace] FILE [ENTRY...]\n"
+    "usage: filo run [--vm | --trace] FILE [MEMBER] [ENTRY...]\n"
     "       filo build -o OUT FILE...\n"
+    "       filo bundle -o OUT UNIT...\n"
     "       filo dump FILE\n"
     "\n"
     "Runs a Filo program and prints its value; builds programs into one unit\n"
-    "of bytecode (docs/bytecode.md), each an entry named by its file; lists a\n"
-    "unit. FILE is source or a unit, told apart by the unit's magic bytes.\n"
+    "of bytecode (docs/bytecode.md), each an entry named by its file; puts\n"
+    "units into one bundle, each a member named by its file; lists a unit or\n"
+    "a bundle. FILE is source, a unit or a bundle, told apart by the magic.\n"
     "\n"
     "  --vm      run source as bytecode, compiled in memory\n"
     "  --trace   run as bytecode and show every instruction with the stack\n"
+    "  MEMBER    for a bundle: the unit to run (default: main, or the first)\n"
     "  ENTRY     for a unit: the entries to run, in order, sharing globals\n"
     "            (default: main, or the unit's first entry)\n"
     "\n"
@@ -84,23 +88,18 @@ static size_t read_file(const char *path, void *dst, size_t cap) {
     return n;
 }
 
-static bool is_unit(const uint8_t *p, size_t n) {
-    if (n < 4) {
-        return false;
-    }
-    return memcmp(p,
-                  "\x7f"
-                  "FBC",
-                  4) == 0;
+static bool is_bytecode(const uint8_t *p, size_t n) {
+    return fbc_kind(p, n) != 0;
 }
 
-/* "lib/ola.filo" is the entry "ola" */
-static void entry_name(const char *path, char *dst, size_t cap) {
+/* "lib/ola.filo" is the entry "ola", and "lib/ola.fbc" the member "ola" */
+static void entry_name(const char *path, const char *ext, char *dst, size_t cap) {
     const char *base = strrchr(path, '/');
     base = base != NULL ? base + 1 : path;
     size_t n = strlen(base);
-    if (n > 5 && strcmp(base + n - 5, ".filo") == 0) {
-        n -= 5;
+    size_t e = strlen(ext);
+    if (n > e && strcmp(base + n - e, ext) == 0) {
+        n -= e;
     }
     (void)snprintf(dst, cap, "%.*s", (int)n, base);
 }
@@ -123,7 +122,7 @@ static size_t build(char **paths, int n) {
             (void)complain2(paths[i], filo_error(&ctx));
             return 0;
         }
-        entry_name(paths[i], names[i], sizeof(names[i]));
+        entry_name(paths[i], ".filo", names[i], sizeof(names[i]));
         entries[i].name = names[i];
         entries[i].prog = &progs[i];
     }
@@ -191,16 +190,16 @@ static int show_value(const filo_value *v) {
     return 0;
 }
 
-static int run_unit(size_t len, char **entries, int nentries, bool trace) {
+static int run_unit(const uint8_t *data, size_t len, char **entries, int nentries, bool trace) {
     char why[128];
-    if (!fbc_read(&listing, unit_mem, len, why, sizeof(why))) {
+    if (!fbc_read(&listing, data, len, why, sizeof(why))) {
         return complain(why);
     }
     if (trace) {
         ctx.host.trace = show_step;
     }
     const filo_unit *unit = NULL;
-    if (filo_bc_load(&ctx, unit_mem, len, &unit) != FILO_OK) {
+    if (filo_bc_load(&ctx, data, len, &unit) != FILO_OK) {
         return complain(filo_error(&ctx));
     }
     char first[256] = "main";
@@ -208,8 +207,7 @@ static int run_unit(size_t len, char **entries, int nentries, bool trace) {
     if (nentries == 0) {
         if (!filo_bc_has(unit, "main") && listing.nexports > 0) {
             fbc_span s = listing.export_names[0];
-            (void)snprintf(first, sizeof(first), "%.*s", (int)s.len,
-                           (const char *)unit_mem + s.off);
+            (void)snprintf(first, sizeof(first), "%.*s", (int)s.len, (const char *)data + s.off);
         }
         entries = fallback;
         nentries = 1;
@@ -224,6 +222,30 @@ static int run_unit(size_t len, char **entries, int nentries, bool trace) {
         }
     }
     return show_value(&v);
+}
+
+/* A bundle's member, by the name given or the default. */
+static int run_member(size_t len, char **args, int nargs, bool trace) {
+    static fbc_bundle b;
+    char why[128];
+    if (!fbc_read_bundle(&b, unit_mem, len, why, sizeof(why))) {
+        return complain(why);
+    }
+    char name[256] = "main";
+    const uint8_t *unit = NULL;
+    size_t ulen = 0;
+    if (nargs > 0) {
+        (void)snprintf(name, sizeof(name), "%s", args[0]);
+        args++;
+        nargs--;
+    } else if (filo_bundle_find(&ctx, unit_mem, len, name, &unit, &ulen) != FILO_OK) {
+        (void)snprintf(name, sizeof(name), "%.*s", (int)b.members[0].name.len,
+                       (const char *)unit_mem + b.members[0].name.off);
+    }
+    if (filo_bundle_find(&ctx, unit_mem, len, name, &unit, &ulen) != FILO_OK) {
+        return complain(filo_error(&ctx));
+    }
+    return run_unit(unit, ulen, args, nargs, trace);
 }
 
 static int cmd_run(int argc, char **argv) {
@@ -249,8 +271,11 @@ static int cmd_run(int argc, char **argv) {
     if (len == 0) {
         return 1;
     }
-    if (is_unit(unit_mem, len)) {
-        return run_unit(len, argv + i + 1, argc - i - 1, trace);
+    if (fbc_kind(unit_mem, len) == 1) {
+        return run_unit(unit_mem, len, argv + i + 1, argc - i - 1, trace);
+    }
+    if (fbc_kind(unit_mem, len) == 2) {
+        return run_member(len, argv + i + 1, argc - i - 1, trace);
     }
     if (i + 1 < argc) {
         (void)complain2("entries are for units, and this is source", argv[i]);
@@ -261,7 +286,7 @@ static int cmd_run(int argc, char **argv) {
         if (len == 0) {
             return 1;
         }
-        return run_unit(len, NULL, 0, trace);
+        return run_unit(unit_mem, len, NULL, 0, trace);
     }
     filo_prog prog;
     filo_value v = {0};
@@ -295,6 +320,48 @@ static int cmd_build(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_bundle(int argc, char **argv) {
+    static filo_bundle_member members[FILES_MAX];
+    static char names[FILES_MAX][256];
+    static uint8_t units[FILES_MAX][FILE_MAX / FILES_MAX];
+    if (argc < 3 || argc - 2 > FILES_MAX || strcmp(argv[0], "-o") != 0) {
+        (void)fputs(usage, stderr);
+        return 2;
+    }
+    int n = argc - 2;
+    for (int i = 0; i < n; i++) {
+        const char *path = argv[2 + i];
+        size_t len = read_file(path, units[i], sizeof(units[i]));
+        if (len == 0) {
+            return 1;
+        }
+        if (fbc_kind(units[i], len) != 1) {
+            return complain2("not a unit", path);
+        }
+        entry_name(path, ".fbc", names[i], sizeof(names[i]));
+        members[i].name = names[i];
+        members[i].data = units[i];
+        members[i].len = len;
+    }
+    size_t len = 0;
+    if (filo_bundle_build(&ctx, members, (uint32_t)n, bundle_mem, sizeof(bundle_mem), &len) !=
+        FILO_OK) {
+        return complain(filo_error(&ctx));
+    }
+    FILE *f = fopen(argv[1], "wb");
+    if (f == NULL || fwrite(bundle_mem, 1, len, f) != len) {
+        (void)complain2("cannot write", argv[1]);
+        if (f != NULL) {
+            fclose(f);
+        }
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        return complain2("cannot write", argv[1]);
+    }
+    return 0;
+}
+
 static int cmd_dump(int argc, char **argv) {
     if (argc != 1) {
         fputs(usage, stderr);
@@ -304,7 +371,16 @@ static int cmd_dump(int argc, char **argv) {
     if (len == 0) {
         return 1;
     }
-    if (!is_unit(unit_mem, len)) {
+    if (fbc_kind(unit_mem, len) == 2) {
+        static fbc_bundle b;
+        char why[128];
+        if (!fbc_read_bundle(&b, unit_mem, len, why, sizeof(why))) {
+            return complain(why);
+        }
+        fbc_dump_bundle(&b, print_line, NULL);
+        return 0;
+    }
+    if (!is_bytecode(unit_mem, len)) {
         len = build(argv, 1);
         if (len == 0) {
             return 1;
@@ -330,6 +406,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "build") == 0) {
         return cmd_build(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "bundle") == 0) {
+        return cmd_bundle(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "dump") == 0) {
         return cmd_dump(argc - 2, argv + 2);
