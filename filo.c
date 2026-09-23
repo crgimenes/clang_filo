@@ -1033,6 +1033,140 @@ static bool name_is(const filo_str *s, const char *lit) {
     return memcmp(s->ptr, lit, n) == 0;
 }
 
+/* ---- folding: the Go engine's FoldConstants, on the parse tree ---- */
+
+/* The builtins a fold may run: pure, atom in and atom out. The same list as
+   the Go engine's pureFunctions; "list" is not in it, since no literal node
+   could hold a list. */
+static const char *const pure_builtins[] = {
+    "+",        "-",      "*",      "/",    "%",    "pow",    "=",      "!=",
+    "<",        ">",      "<=",     ">=",   "not",  "string", "number", "type-of",
+    "is-empty", "is-nil", "length", "head", "tail", "nth",
+};
+
+static bool is_literal(const node *n, filo_value *out) {
+    switch (n->kind) {
+    case N_NUMBER:
+        *out = filo_num(n->num);
+        return true;
+    case N_BOOL:
+        *out = filo_bool(n->b);
+        return true;
+    case N_STRING:
+        *out = filo_string(n->text.ptr, n->text.len);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static node *fold_node(filo_ctx *ctx, const node *at, uint8_t kind) {
+    node *n = ralloc(ctx, sizeof(node));
+    if (n != NULL) {
+        memset(n, 0, sizeof(*n));
+        n->kind = kind;
+        n->line = at->line;
+        n->col = at->col;
+    }
+    return n;
+}
+
+/* (name literal...) evaluated now when name is pure and the call works; an
+   error is left to happen when the program runs, as it would have. */
+static node *fold_call(filo_ctx *ctx, node *list, const filo_str *name) {
+    const filo_builtin_entry *bi = NULL;
+    for (size_t i = 0; i < sizeof(pure_builtins) / sizeof(pure_builtins[0]); i++) {
+        if (name_is(name, pure_builtins[i])) {
+            bi = builtin_by_name(ctx, name->ptr, name->len);
+        }
+    }
+    uint32_t n = list->nelems - 1;
+    if (bi == NULL) {
+        return list;
+    }
+    filo_value *args = NULL;
+    if (n > 0) {
+        args = ralloc(ctx, sizeof(filo_value) * n);
+        if (args == NULL) {
+            clear_error(ctx);
+            return list;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!is_literal(list->elems[i + 1], &args[i])) {
+            return list;
+        }
+    }
+    filo_value v = {0};
+    if (bi->fn(ctx, args, n, &v) != FILO_OK) {
+        clear_error(ctx);
+        return list;
+    }
+    uint8_t kind = N_NUMBER;
+    if (v.kind == FILO_BOOL) {
+        kind = N_BOOL;
+    } else if (v.kind == FILO_STRING) {
+        kind = N_STRING;
+    } else if (v.kind != FILO_NUMBER) {
+        return list; /* a list or a tuple has no literal to become */
+    }
+    node *lit = fold_node(ctx, list, kind);
+    if (lit == NULL) {
+        return list;
+    }
+    if (v.kind == FILO_NUMBER) {
+        lit->num = v.u.num;
+    } else if (v.kind == FILO_BOOL) {
+        lit->b = v.u.b;
+    } else {
+        lit->text = v.u.str;
+    }
+    return lit;
+}
+
+/* Children first, then the list itself: an if whose condition is a literal
+   becomes the branch it takes, and a pure call on literals its value. The
+   Go engine folds every program it compiles, IR included, so this one does
+   too: a program keeps the same steps and the same compile-time errors on
+   both. */
+static node *fold(filo_ctx *ctx, node *n) {
+    if (n->kind != N_LIST) {
+        return n;
+    }
+    for (uint32_t i = 0; i < n->nelems; i++) {
+        n->elems[i] = fold(ctx, n->elems[i]);
+    }
+    if (n->nelems == 0 || n->elems[0]->kind != N_SYMBOL) {
+        return n;
+    }
+    const filo_str *head = &n->elems[0]->text;
+    if (!name_is(head, "if")) {
+        return fold_call(ctx, n, head);
+    }
+    if (n->nelems < 3 || n->nelems > 4 || n->elems[1]->kind != N_BOOL) {
+        return n;
+    }
+    if (n->elems[1]->b) {
+        return n->elems[2];
+    }
+    if (n->nelems == 4) {
+        return n->elems[3];
+    }
+    /* (if #f x) is the empty list: the call (list), since a bare () would be
+       an error where the if was not */
+    node *call = fold_node(ctx, n, N_LIST);
+    node *sym = fold_node(ctx, n, N_SYMBOL);
+    node **elems = (node **)ralloc(ctx, sizeof(node *));
+    if (call == NULL || sym == NULL || elems == NULL) {
+        return n;
+    }
+    sym->text = filo_cstring("list").u.str;
+    elems[0] = sym;
+    call->elems = elems;
+    call->nelems = 1;
+    return call;
+}
+
 /* A lexical scope while lowering; lives in the run arena and dies with the
    compile. */
 typedef struct scope scope;
@@ -2363,6 +2497,17 @@ static void rollback_globals(filo_ctx *ctx) {
     }
 }
 
+/* A paused run lives in the run arena, so whatever resets it ends the run
+   first, as a failed one ends: its globals go back. */
+static void cancel_paused(filo_ctx *ctx) {
+    if (ctx->paused == NULL) {
+        return;
+    }
+    ctx->paused = NULL;
+    ctx->limits = ctx->paused_limits;
+    rollback_globals(ctx);
+}
+
 int filo_set_global(filo_ctx *ctx, const char *name, filo_value v) {
     int32_t id = symbol_id(ctx, (const uint8_t *)name, (uint32_t)strlen(name));
     if (id < 0) {
@@ -3358,6 +3503,7 @@ static void bc_write(bcc *c, const filo_bc_entry *entries, uint32_t n, bc_out *o
 int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8_t *dst, size_t cap,
                   size_t *len) {
     *len = 0;
+    cancel_paused(ctx);
     arena_reset(&ctx->run);
     clear_error(ctx);
     if (n == 0 || n > BC_EXPORTS_MAX) {
@@ -4187,15 +4333,25 @@ static void vm_where(filo_ctx *ctx, const bc_act *a) {
 /* *cur follows the activation that is running, written when a call or a
    return changes it and never per instruction: the caller reads it only
    when the loop fails, to say where. */
-static int vm_loop(filo_ctx *ctx, bc_act *base, bc_act **cur, filo_value *out) {
-    bc_act *a = base;
+static int vm_loop(filo_ctx *ctx, const bc_act *base, bc_act **cur, bool pausable,
+                   filo_value *out) {
+    bc_act *a = *cur;
     for (;;) {
         if (ctx->host.should_stop != NULL && ctx->host.should_stop(ctx->host.user)) {
             return filo_fail(ctx, "execution cancelled");
         }
         ctx->steps++;
-        if (ctx->limits.step_limit > 0 && ctx->steps > ctx->limits.step_limit) {
-            return filo_fail(ctx, "step limit exceeded");
+        /* one comparison per instruction for both: past vm_stop it is the
+           step limit, or the pause, which only the run's own loop takes (a
+           loop under a builtin cannot stop; the one above it will) */
+        if (ctx->steps > ctx->vm_stop) {
+            if (ctx->limits.step_limit > 0 && ctx->steps > ctx->limits.step_limit) {
+                return filo_fail(ctx, "step limit exceeded");
+            }
+            if (pausable) {
+                ctx->steps--; /* the instruction did not run */
+                return FILO_PAUSED;
+            }
         }
         const filo_unit *u = a->fn->unit;
         uint32_t end = a->fn->off + a->fn->len;
@@ -4346,18 +4502,24 @@ static int vm_loop(filo_ctx *ctx, bc_act *base, bc_act **cur, filo_value *out) {
     }
 }
 
-static int vm_exec(filo_ctx *ctx, bc_act *base, filo_value *out) {
+/* Runs from *cur, an activation of base's run; *cur is where it stopped. */
+static int vm_exec_from(filo_ctx *ctx, const bc_act *base, bc_act **cur, bool pausable,
+                        filo_value *out) {
     if (ctx->depth >= FILO_EVAL_DEPTH_MAX) {
         return filo_fail(ctx, "evaluation too deep");
     }
     ctx->depth++;
-    bc_act *cur = base;
-    int rc = vm_loop(ctx, base, &cur, out);
-    if (rc != FILO_OK) {
-        vm_where(ctx, cur);
+    int rc = vm_loop(ctx, base, cur, pausable, out);
+    if (rc == FILO_ERR) {
+        vm_where(ctx, *cur);
     }
     ctx->depth--;
     return rc;
+}
+
+static int vm_exec(filo_ctx *ctx, bc_act *base, filo_value *out) {
+    bc_act *cur = base;
+    return vm_exec_from(ctx, base, &cur, false, out);
 }
 
 /* A bytecode closure called by the IR or by a builtin through filo_call:
@@ -4565,12 +4727,14 @@ int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn) {
 #ifndef FILO_VM_ONLY
 int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) {
     /* the parse tree and the lowering scopes are run-arena temporaries */
+    cancel_paused(ctx);
     arena_reset(&ctx->run);
     clear_error(ctx);
-    const node *tree = parse_all(ctx, src, len);
+    node *tree = parse_all(ctx, src, len);
     if (tree == NULL) {
         return FILO_ERR;
     }
+    tree = fold(ctx, tree);
     lowerer lw = {ctx, NULL, 0, 0};
     if (scope_enter(&lw) == NULL) {
         return FILO_ERR;
@@ -4584,9 +4748,181 @@ int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) 
 }
 #endif
 
+#ifndef FILO_VM_ONLY
+/* ---- the stages, shown ---- */
+
+static const char *const op_names[] = {
+    "const", "local", "global", "dynamic", "builtin", "empty", "invalid", "if",
+    "cond",  "do",    "and",    "or",      "let",     "letv",  "set",     "fn",
+    "def",   "tuple", "exit",   "return",  "callb",   "call",
+};
+
+typedef struct {
+    filo_ctx *ctx;
+    filo_line out;
+    void *user;
+} shower;
+
+/* "line:col" and the text, indented by depth. */
+static void show_line(shower *s, uint32_t line, uint32_t col, uint32_t depth, const char *text) {
+    char buf[FILO_ERROR_MAX + 64];
+    char at[24];
+    size_t n = u32_text(at, sizeof(at), line);
+    n += cstr_copy(at + n, sizeof(at) - n, ":");
+    (void)u32_text(at + n, sizeof(at) - n, col);
+    size_t k = cstr_copy(buf, sizeof(buf), at);
+    while (k < 8 && k + 1 < sizeof(buf)) {
+        buf[k] = ' ';
+        k++;
+    }
+    for (uint32_t i = 0; i < depth * 2U && k + 1 < sizeof(buf); i++) {
+        buf[k] = ' ';
+        k++;
+    }
+    (void)cstr_copy(buf + k, sizeof(buf) - k, text);
+    s->out(s->user, buf);
+}
+
+/* A value as source, cut to what a line can hold. */
+static void show_value_text(shower *s, const filo_value *v, char *dst, size_t cap) {
+    size_t n = 0;
+    if (filo_value_repr(s->ctx, v, dst, cap, &n) != FILO_OK) {
+        (void)cstr_copy(dst, cap, "?");
+        return;
+    }
+    dst[n < cap ? n : cap - 1] = '\0';
+}
+
+static void show_tree(shower *s, const node *n, uint32_t depth) {
+    char text[FILO_ERROR_MAX];
+    char val[160];
+    filo_value v = {0};
+    switch (n->kind) {
+    case N_LIST: {
+        size_t k = cstr_copy(text, sizeof(text), "list of ");
+        (void)u32_text(text + k, sizeof(text) - k, n->nelems);
+        show_line(s, n->line, n->col, depth, text);
+        for (uint32_t i = 0; i < n->nelems; i++) {
+            show_tree(s, n->elems[i], depth + 1);
+        }
+        return;
+    }
+    case N_SYMBOL: {
+        size_t k = cstr_copy(text, sizeof(text), "symbol ");
+        size_t take = n->text.len < sizeof(text) - k - 1 ? n->text.len : sizeof(text) - k - 1;
+        memcpy(text + k, n->text.ptr, take);
+        text[k + take] = '\0';
+        show_line(s, n->line, n->col, depth, text);
+        return;
+    }
+    case N_NUMBER:
+        v = filo_num(n->num);
+        break;
+    case N_BOOL:
+        v = filo_bool(n->b);
+        break;
+    default:
+        v = filo_string(n->text.ptr, n->text.len);
+        break;
+    }
+    show_value_text(s, &v, val, sizeof(val));
+    size_t k = cstr_copy(text, sizeof(text),
+                         n->kind == N_NUMBER ? "number "
+                         : n->kind == N_BOOL ? "bool "
+                                             : "string ");
+    (void)cstr_copy(text + k, sizeof(text) - k, val);
+    show_line(s, n->line, n->col, depth, text);
+}
+
+static void show_ir(shower *s, const filo_instr *in, uint32_t depth) {
+    char text[FILO_ERROR_MAX];
+    size_t k = cstr_copy(text, sizeof(text), in->op < 22 ? op_names[in->op] : "?");
+    if (in->op == OP_CONST) {
+        char val[160];
+        show_value_text(s, &in->val, val, sizeof(val));
+        k += cstr_copy(text + k, sizeof(text) - k, " ");
+        k += cstr_copy(text + k, sizeof(text) - k, val);
+    } else if (in->name != NULL) {
+        k += cstr_copy(text + k, sizeof(text) - k, " ");
+        k += cstr_copy(text + k, sizeof(text) - k, in->name);
+    }
+    if (in->op == OP_LOCAL) {
+        k += cstr_copy(text + k, sizeof(text) - k, "  (frame ");
+        k += u32_text(text + k, sizeof(text) - k, in->a);
+        k += cstr_copy(text + k, sizeof(text) - k, " out, slot ");
+        k += u32_text(text + k, sizeof(text) - k, in->b);
+        k += cstr_copy(text + k, sizeof(text) - k, ")");
+    }
+    if (in->nnames > 0) {
+        k += cstr_copy(text + k, sizeof(text) - k, "  names");
+        for (uint32_t i = 0; i < in->nnames; i++) {
+            k += cstr_copy(text + k, sizeof(text) - k, " ");
+            k += cstr_copy(text + k, sizeof(text) - k, in->names[i]);
+        }
+    }
+    if (in->msg != NULL) {
+        k += cstr_copy(text + k, sizeof(text) - k, "  error: ");
+        (void)cstr_copy(text + k, sizeof(text) - k, in->msg);
+    }
+    show_line(s, in->line, in->col, depth, text);
+    for (uint32_t i = 0; i < in->nargs; i++) {
+        show_ir(s, in->args[i], depth + 1);
+    }
+    for (uint32_t i = 0; i < in->nclauses; i++) {
+        const clause *cl = &in->clauses[i];
+        show_line(s, in->line, in->col, depth + 1, cl->is_else ? "clause else" : "clause");
+        if (cl->test != NULL) {
+            show_ir(s, cl->test, depth + 2);
+        }
+        for (uint32_t j = 0; j < cl->nbody; j++) {
+            show_ir(s, cl->body[j], depth + 2);
+        }
+    }
+}
+
+int filo_show(filo_ctx *ctx, const uint8_t *src, size_t len, const char *stage, filo_line out,
+              void *user) {
+    bool tree = strcmp(stage, "tree") == 0;
+    bool folded = strcmp(stage, "folded") == 0;
+    bool ir = strcmp(stage, "ir") == 0;
+    if (!tree && !folded && !ir) {
+        clear_error(ctx);
+        return filo_fail2(ctx, "no stage named ", stage);
+    }
+    cancel_paused(ctx);
+    arena_reset(&ctx->run);
+    clear_error(ctx);
+    shower s = {ctx, out, user};
+    node *n = parse_all(ctx, src, len);
+    if (n == NULL) {
+        return FILO_ERR;
+    }
+    if (tree) {
+        show_tree(&s, n, 0);
+        return FILO_OK;
+    }
+    n = fold(ctx, n);
+    if (folded) {
+        show_tree(&s, n, 0);
+        return FILO_OK;
+    }
+    lowerer lw = {ctx, NULL, 0, 0};
+    if (scope_enter(&lw) == NULL) {
+        return FILO_ERR;
+    }
+    const filo_instr *root = lower(&lw, n);
+    if (root == NULL) {
+        return FILO_ERR;
+    }
+    show_ir(&s, root, 0);
+    return FILO_OK;
+}
+#endif
+
 /* What every run does first and last, whatever runs in between: the IR or
    a unit's bytecode. */
 static void run_begin(filo_ctx *ctx, const filo_limits *limits, filo_limits *saved) {
+    cancel_paused(ctx);
     arena_reset(&ctx->run);
     clear_error(ctx);
     ctx->steps = 0;
@@ -4604,6 +4940,7 @@ static void run_begin(filo_ctx *ctx, const filo_limits *limits, filo_limits *sav
             ctx->limits.recursion_limit = FILO_RECURSION_LIMIT_DEFAULT;
         }
     }
+    ctx->vm_stop = ctx->limits.step_limit > 0 ? ctx->limits.step_limit : UINT32_MAX;
 }
 
 static int run_end(filo_ctx *ctx, int rc, filo_value v, const filo_limits *saved,
@@ -4680,6 +5017,61 @@ int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const f
         }
     }
     return run_end(ctx, rc, v, &saved, result);
+}
+
+/* Runs the paused or new run from start for at most budget instructions. */
+static int bc_go_on(filo_ctx *ctx, bc_act *base, bc_act *start, uint32_t budget,
+                    filo_value *result) {
+    uint32_t stop = ctx->limits.step_limit > 0 ? ctx->limits.step_limit : UINT32_MAX;
+    if (budget > 0 && budget < stop - ctx->steps) {
+        stop = ctx->steps + budget;
+    }
+    ctx->vm_stop = stop;
+    filo_value v;
+    memset(&v, 0, sizeof(v));
+    bc_act *cur = start;
+    int rc = vm_exec_from(ctx, base, &cur, true, &v);
+    if (rc == FILO_PAUSED) {
+        ctx->paused = cur;
+        ctx->paused_base = base;
+        return FILO_PAUSED;
+    }
+    filo_limits saved = ctx->paused_limits;
+    return run_end(ctx, rc, v, &saved, result);
+}
+
+int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                  const filo_limits *limits, uint32_t budget, filo_value *result) {
+    const bc_fn *fn = bc_export(unit, entry);
+    if (fn == NULL) {
+        cancel_paused(ctx);
+        clear_error(ctx);
+        return filo_fail2(ctx, "bytecode: no entry point named ", entry);
+    }
+    run_begin(ctx, limits, &ctx->paused_limits);
+    if (fn->nparams != 0) {
+        filo_limits saved = ctx->paused_limits;
+        filo_value v = {0};
+        return run_end(ctx, filo_fail(ctx, "bytecode: an entry point takes no arguments"), v,
+                       &saved, result);
+    }
+    bc_act *a = vm_activation(ctx, fn, NULL, NULL, 0);
+    if (a == NULL) {
+        filo_limits saved = ctx->paused_limits;
+        filo_value v = {0};
+        return run_end(ctx, FILO_ERR, v, &saved, result);
+    }
+    return bc_go_on(ctx, a, a, budget, result);
+}
+
+int filo_bc_resume(filo_ctx *ctx, uint32_t budget, filo_value *result) {
+    clear_error(ctx);
+    if (ctx->paused == NULL) {
+        return filo_fail(ctx, "bytecode: no run is paused");
+    }
+    bc_act *start = ctx->paused;
+    ctx->paused = NULL;
+    return bc_go_on(ctx, ctx->paused_base, start, budget, result);
 }
 
 const char *filo_error(const filo_ctx *ctx) {

@@ -88,7 +88,43 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     filo_limits limits = {20000U, 64U};
     filo_value v;
-    (void)filo_bc_run(&ctx, u, "main", &limits, &v);
+    int whole = filo_bc_run(&ctx, u, "main", &limits, &v);
+    char text[2][256];
+    char err[2][FILO_ERROR_MAX];
+    size_t n = 0;
+    size_t full[2] = {0, 0}; /* repr says the whole length, and writes what fits */
+    bool shown[2] = {false, false};
+    if (whole == FILO_OK && filo_value_repr(&ctx, &v, text[0], sizeof(text[0]), &n) == FILO_OK) {
+        shown[0] = true;
+    }
+    full[0] = shown[0] ? n : 0;
+    text[0][full[0] < sizeof(text[0]) ? full[0] : sizeof(text[0]) - 1] = '\0';
+    (void)snprintf(err[0], sizeof(err[0]), "%s", filo_error(&ctx));
     (void)filo_bc_run(&ctx, u, "main", &limits, &v); /* a second run on the same unit */
+
+    /* the same unit on a fresh context, a few instructions at a time, must
+       end as the run in one go ended */
+    filo_init(&ctx, &filo_libc_host, persistent_mem, sizeof(persistent_mem), run_mem,
+              sizeof(run_mem));
+    (void)filo_math_register(&ctx, &filo_libc_math);
+    (void)filo_strings_register(&ctx, &filo_libc_strings);
+    if (filo_bc_load(&ctx, code, code_len, &u) != FILO_OK) {
+        __builtin_trap(); /* it loaded a moment ago */
+    }
+    uint32_t budget = 1U + (uint32_t)(size % 5U);
+    int sliced = filo_bc_start(&ctx, u, "main", &limits, budget, &v);
+    while (sliced == FILO_PAUSED) {
+        sliced = filo_bc_resume(&ctx, budget, &v);
+    }
+    if (sliced == FILO_OK && filo_value_repr(&ctx, &v, text[1], sizeof(text[1]), &n) == FILO_OK) {
+        shown[1] = true;
+    }
+    full[1] = shown[1] ? n : 0;
+    text[1][full[1] < sizeof(text[1]) ? full[1] : sizeof(text[1]) - 1] = '\0';
+    (void)snprintf(err[1], sizeof(err[1]), "%s", filo_error(&ctx));
+    if (whole != sliced || shown[0] != shown[1] || full[0] != full[1] ||
+        strcmp(text[0], text[1]) != 0 || strcmp(err[0], err[1]) != 0) {
+        __builtin_trap();
+    }
     return 0;
 }

@@ -90,6 +90,69 @@ static size_t build_unit(filo_ctx *ctx, const filo_prog *prog) {
 
 static int misplaced = 0; /* errors the VM and the IR place differently */
 
+/* --pause N: the VM runs each case N instructions at a time, paused and
+   resumed until it ends, and must end as a run in one go does */
+static uint32_t pause_budget = 0;
+static unsigned long pauses = 0;
+
+static int vm_run(filo_ctx *ctx, const filo_unit *unit, const filo_limits *limits,
+                  filo_value *out) {
+    if (pause_budget == 0) {
+        return filo_bc_run(ctx, unit, "main", limits, out);
+    }
+    int rc = filo_bc_start(ctx, unit, "main", limits, pause_budget, out);
+    while (rc == FILO_PAUSED) {
+        pauses++;
+        rc = filo_bc_resume(ctx, pause_budget, out);
+    }
+    return rc;
+}
+
+/* --steps FILE: the steps each case takes on the Go engine (tools/gosteps),
+   "file<TAB>case<TAB>steps" a line. The IR counts a step per node as the
+   Go engine does, and folds constants as it does, so the counts are the
+   same — a step limit is behavior a script can see. */
+enum { STEPS_MAX = 4096 };
+static struct {
+    char key[320];
+    uint32_t steps;
+} go_steps[STEPS_MAX];
+static int ngo_steps = 0;
+static int miscounted = 0;
+static const char *current_file = "";
+
+static void load_steps(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        printf("cannot open %s\n", path);
+        return;
+    }
+    char line[512];
+    while (ngo_steps < STEPS_MAX && fgets(line, sizeof(line), f) != NULL) {
+        char *tab = strrchr(line, '\t');
+        if (tab == NULL) {
+            continue;
+        }
+        *tab = '\0';
+        snprintf(go_steps[ngo_steps].key, sizeof(go_steps[ngo_steps].key), "%s", line);
+        go_steps[ngo_steps].steps = (uint32_t)strtoul(tab + 1, NULL, 10);
+        ngo_steps++;
+    }
+    fclose(f);
+}
+
+static void check_steps(const char *name, uint32_t steps) {
+    char key[320];
+    snprintf(key, sizeof(key), "%s\t%s", current_file, name);
+    for (int i = 0; i < ngo_steps; i++) {
+        if (strcmp(go_steps[i].key, key) == 0 && go_steps[i].steps != steps) {
+            printf("steps: %s/%s takes %u here and %u on the Go engine\n", current_file, name,
+                   steps, go_steps[i].steps);
+            miscounted++;
+        }
+    }
+}
+
 static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits,
                        filo_value *out) {
     if (!use_vm) {
@@ -104,7 +167,7 @@ static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *
         write_file(".fbc", unit_mem, len);
         unit_written = true;
     }
-    if (filo_bc_run(ctx, unit, "main", limits, out) == FILO_OK) {
+    if (vm_run(ctx, unit, limits, out) == FILO_OK) {
         return FILO_OK;
     }
     char vm_error[FILO_ERROR_MAX];
@@ -182,7 +245,9 @@ static void show(filo_ctx *ctx, const filo_value *v, char *buf, size_t cap) {
     size_t n = 0;
     if (filo_value_text(ctx, v, buf, cap, &n) != FILO_OK) {
         snprintf(buf, cap, "<%s>", filo_error(ctx));
+        return;
     }
+    buf[n < cap ? n : cap - 1] = '\0'; /* a longer value is shown cut */
 }
 
 /* Evaluates an expression on a fresh context; the value is copied into the
@@ -242,13 +307,14 @@ static void write_expect(filo_ctx *ctx, const corpus_case *c, const filo_value *
     }
     if (got == NULL) {
         n += (size_t)snprintf(text + n, sizeof(text) - n, "error\n");
-    } else if (filo_value_repr(ctx, got, repr, sizeof(repr), &len) == FILO_OK && n < sizeof(text)) {
+    } else if (filo_value_repr(ctx, got, repr, sizeof(repr), &len) == FILO_OK && n < sizeof(text) &&
+               len < sizeof(repr)) {
         n += (size_t)snprintf(text + n, sizeof(text) - n, "result %.*s\n", (int)len, repr);
     }
     for (int i = 0; i < c->nglobals && got != NULL && n < sizeof(text); i++) {
         filo_value v;
         if (filo_get_global(ctx, c->globals[i].name, &v) &&
-            filo_value_repr(ctx, &v, repr, sizeof(repr), &len) == FILO_OK) {
+            filo_value_repr(ctx, &v, repr, sizeof(repr), &len) == FILO_OK && len < sizeof(repr)) {
             n += (size_t)snprintf(text + n, sizeof(text) - n, "global %s %.*s\n",
                                   c->globals[i].name, (int)len, repr);
         }
@@ -277,6 +343,9 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
     if (filo_compile(ctx, (const uint8_t *)c->script, strlen(c->script), &prog) == FILO_OK &&
         run_program(ctx, &prog, c->has_limits ? &c->limits : NULL, &got) == FILO_OK) {
         failed = false;
+        if (!use_vm && ngo_steps > 0 && c->ngiven == 0) {
+            check_steps(c->name, ctx->steps);
+        }
     }
     if (unit_written) {
         write_expect(ctx, c, failed ? NULL : &got);
@@ -453,6 +522,7 @@ static bool run_file(const char *path) {
     }
     const char *base = strrchr(path, '/');
     base = base != NULL ? base + 1 : path;
+    current_file = base;
     corpus_case *c = calloc(1, sizeof(corpus_case));
     if (c == NULL) {
         fclose(f);
@@ -543,7 +613,9 @@ static bool run_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("usage: corpus_runner [--nolibc] [--vm] [--write-units DIR] FILE...\n");
+        printf(
+            "usage: corpus_runner [--nolibc] [--vm [--pause N]] [--steps FILE] [--write-units DIR] "
+            "FILE...\n");
         return 2;
     }
     int first = 1;
@@ -552,6 +624,12 @@ int main(int argc, char **argv) {
             use_nolibc = true;
         } else if (strcmp(argv[first], "--vm") == 0) {
             use_vm = true;
+        } else if (strcmp(argv[first], "--pause") == 0 && first + 1 < argc) {
+            first++;
+            pause_budget = (uint32_t)strtoul(argv[first], NULL, 10);
+        } else if (strcmp(argv[first], "--steps") == 0 && first + 1 < argc) {
+            first++;
+            load_steps(argv[first]);
         } else if (strcmp(argv[first], "--write-units") == 0 && first + 1 < argc) {
             first++;
             units_dir = argv[first];
@@ -571,10 +649,17 @@ int main(int argc, char **argv) {
         printf("%d error(s) placed differently by the VM and the IR\n", misplaced);
         failures += misplaced;
     }
+    if (miscounted > 0) {
+        printf("%d case(s) take other steps than on the Go engine\n", miscounted);
+        failures += miscounted;
+    }
     if (skipped > 0) {
         printf("%d passed, %d failed, %d skipped (host cannot compute them)\n", passed, failures,
                skipped);
         return failures > 255 ? 255 : failures;
+    }
+    if (pauses > 0) {
+        printf("(%lu pauses, every run resumed to its end)\n", pauses);
     }
     printf("%d passed, %d failed\n", passed, failures);
     return failures > 255 ? 255 : failures;

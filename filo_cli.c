@@ -32,18 +32,22 @@ static filo_ctx ctx;
 static fbc_unit listing;
 
 static const char usage[] =
-    "usage: filo run [--vm | --trace] FILE [MEMBER] [ENTRY...]\n"
+    "usage: filo run [--vm | --trace | --both] FILE [MEMBER] [ENTRY...]\n"
     "       filo build [--strip] -o OUT FILE...\n"
     "       filo bundle -o OUT UNIT...\n"
     "       filo dump FILE\n"
+    "       filo show tree|folded|ir FILE\n"
     "\n"
     "Runs a Filo program and prints its value; builds programs into one unit\n"
     "of bytecode (docs/bytecode.md), each an entry named by its file; puts\n"
     "units into one bundle, each a member named by its file; lists a unit or\n"
-    "a bundle. FILE is source, a unit or a bundle, told apart by the magic.\n"
+    "a bundle; shows a stage of the compiling: the tree as read, the tree once\n"
+    "constants folded, the IR. FILE is source, a unit or a bundle, told apart\n"
+    "by the magic.\n"
     "\n"
     "  --vm      run source as bytecode, compiled in memory\n"
     "  --trace   run as bytecode and show every instruction with the stack\n"
+    "  --both    run source on the IR and on the VM, side by side\n"
     "  --strip   build without the debug section (errors then have no line)\n"
     "  MEMBER    for a bundle: the unit to run (default: main, or the first)\n"
     "  ENTRY     for a unit: the entries to run, in order, sharing globals\n"
@@ -195,13 +199,20 @@ static void show_step(void *user, const filo_trace *t) {
            stack[0] != '\0' ? " " : "", stack);
 }
 
+/* The value whole, however long: measured first, then written. */
 static int show_value(const filo_value *v) {
-    char text[4096];
     size_t n = 0;
-    if (filo_value_text(&ctx, v, text, sizeof(text), &n) != FILO_OK) {
+    if (filo_value_text(&ctx, v, NULL, 0, &n) != FILO_OK) {
         return complain(filo_error(&ctx));
     }
-    printf("%.*s\n", (int)n, text);
+    char *text = malloc(n + 1);
+    if (text == NULL) {
+        return complain("out of memory");
+    }
+    (void)filo_value_text(&ctx, v, text, n + 1, &n);
+    (void)fwrite(text, 1, n, stdout);
+    (void)fputc('\n', stdout);
+    free(text);
     return 0;
 }
 
@@ -263,13 +274,66 @@ static int run_member(size_t len, char **args, int nargs, bool trace) {
     return run_unit(unit, ulen, args, nargs, trace);
 }
 
+/* One run's end as a line: the value, or the error and where. */
+static void say_end(const char *who, int rc, const filo_value *v, uint32_t steps,
+                    const char *unit) {
+    char text[200];
+    size_t n = 0;
+    if (rc != FILO_OK) {
+        uint32_t line = 0;
+        uint32_t col = 0;
+        char at[40] = "";
+        if (filo_error_at(&ctx, &line, &col)) {
+            (void)snprintf(at, sizeof(at), " at %u:%u", line, col);
+        }
+        printf("%s  error%s: %s  (%u %s)\n", who, at, filo_error(&ctx), steps, unit);
+        return;
+    }
+    if (filo_value_repr(&ctx, v, text, sizeof(text), &n) != FILO_OK) {
+        n = (size_t)snprintf(text, sizeof(text), "?");
+    }
+    printf("%s  %.*s%s  (%u %s)\n", who, n < sizeof(text) ? (int)n : (int)sizeof(text) - 1, text,
+           n < sizeof(text) ? "" : "...", steps, unit);
+}
+
+/* The same source on the IR, as the Go engine runs it, and on the VM: the
+   same value or the same error in the same place, in steps of their own. */
+static int run_both(const char *path, size_t len) {
+    static char src[FILE_MAX];
+    memcpy(src, unit_mem, len);
+    filo_prog prog;
+    filo_value v = {0};
+    if (filo_compile(&ctx, (const uint8_t *)src, len, &prog) != FILO_OK) {
+        return complain_at(path);
+    }
+    int rc = filo_run(&ctx, &prog, NULL, &v);
+    say_end("ir", rc, &v, ctx.steps, "steps, one a node");
+    char *paths[1] = {(char *)path};
+    size_t ulen = build(paths, 1);
+    if (ulen == 0) {
+        return 1;
+    }
+    const filo_unit *unit = NULL;
+    if (filo_bc_load(&ctx, unit_mem, ulen, &unit) != FILO_OK) {
+        return complain(filo_error(&ctx));
+    }
+    char name[256];
+    entry_name(path, ".filo", name, sizeof(name));
+    rc = filo_bc_run(&ctx, unit, name, NULL, &v);
+    say_end("vm", rc, &v, ctx.steps, "steps, one an instruction");
+    return 0;
+}
+
 static int cmd_run(int argc, char **argv) {
     bool vm = false;
     bool trace = false;
+    bool both = false;
     int i = 0;
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (strcmp(argv[i], "--vm") == 0) {
             vm = true;
+        } else if (strcmp(argv[i], "--both") == 0) {
+            both = true;
         } else if (strcmp(argv[i], "--trace") == 0) {
             trace = true;
         } else {
@@ -295,6 +359,9 @@ static int cmd_run(int argc, char **argv) {
     if (i + 1 < argc) {
         (void)complain2("entries are for units, and this is source", argv[i]);
         return 2;
+    }
+    if (both) {
+        return run_both(argv[i], len);
     }
     if (vm || trace) {
         len = build(argv + i, 1);
@@ -390,6 +457,21 @@ static int cmd_bundle(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_show(int argc, char **argv) {
+    if (argc != 2) {
+        (void)fputs(usage, stderr);
+        return 2;
+    }
+    size_t len = read_file(argv[1], unit_mem, sizeof(unit_mem));
+    if (len == 0) {
+        return 1;
+    }
+    if (filo_show(&ctx, unit_mem, len, argv[0], print_line, NULL) != FILO_OK) {
+        return complain_at(argv[1]);
+    }
+    return 0;
+}
+
 static int cmd_dump(int argc, char **argv) {
     if (argc != 1) {
         fputs(usage, stderr);
@@ -434,6 +516,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "build") == 0) {
         return cmd_build(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "show") == 0) {
+        return cmd_show(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "bundle") == 0) {
         return cmd_bundle(argc - 2, argv + 2);

@@ -12,6 +12,11 @@ static uint8_t persistent_mem[256U << 10U];
 static uint8_t run_mem[1U << 20U];
 static filo_ctx ctx;
 
+static void discard(void *user, const char *line) {
+    (void)user;
+    (void)line;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -20,6 +25,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
               sizeof(run_mem));
     (void)filo_math_register(&ctx, &filo_libc_math);
     (void)filo_strings_register(&ctx, &filo_libc_strings);
+    /* every stage the teaching views show, on whatever the input is */
+    (void)filo_show(&ctx, data, size, "tree", discard, NULL);
+    (void)filo_show(&ctx, data, size, "folded", discard, NULL);
+    (void)filo_show(&ctx, data, size, "ir", discard, NULL);
     filo_prog prog;
     if (filo_compile(&ctx, data, size, &prog) != FILO_OK) {
         return 0;

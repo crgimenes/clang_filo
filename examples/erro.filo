@@ -1,0 +1,3 @@
+; a mistake on the third line
+(def dobro (fn (x) (* x 2)))
+(dobro "vinte e um")

@@ -26,7 +26,7 @@ build, on that build. `FILO_SYMBOLS_MAX` (512 by default, about 40 bytes a
 name in every context) is a build setting too; the device check runs with
 128.
 
-`filo run`, `filo build`, `filo bundle`, `filo dump` and `filo run --trace` show the road
+`filo show`, `filo run` (`--both`, `--trace`), `filo build`, `filo bundle` and `filo dump` show the road
 from source to the machine: `examples/` starts at "olá mundo".
 
 ## Memory
@@ -116,6 +116,7 @@ sustain. Case mapping covers ASCII and the Latin-1 letters.
 | `make corpus-nolibc` | the same corpus with the libc-free host |
 | `make oracle` | the Prolog spec's answers, exported from the Go repository |
 | `make oracle-regen` | rewrites them; needs the Go checkout beside this one |
+| `make steps-regen` | the steps each corpus case takes on the Go engine, which `make corpus` holds the IR to |
 | `make api` | host API behavior the corpus cannot express |
 | `make nolibc` | the libc-free number text against the libc one |
 | `make device` | the corpus and the oracle as units, on the `FILO_VM_ONLY` build |

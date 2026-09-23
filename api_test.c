@@ -433,6 +433,88 @@ static void test_errors_say_where(void) {
     CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 4);
 }
 
+/* Constants fold before lowering, as the Go engine folds them: a branch an
+   if can never take is gone before a sealed table could refuse its names,
+   and a call that fails is left to fail when it runs. */
+static void test_constants_fold_as_on_go(void) {
+    start();
+    CHECK(filo_set_global(&CTX, "w", filo_num(1)) == FILO_OK);
+    filo_seal_globals(&CTX);
+    filo_value v = {0};
+    CHECK(run("(if #t (+ w 1) wdith)", &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 2);
+    CHECK(run("(if (< 1 2) 10 wdith)", &v) == FILO_OK); /* (< 1 2) folds to #t first */
+    CHECK(v.u.num == 10);
+    CHECK(run("(if #f wdith)", &v) == FILO_OK); /* the empty list, as unfolded */
+    CHECK(v.kind == FILO_LIST && v.u.seq.len == 0);
+    filo_prog prog;
+    const char *src = "(+ 1 \"a\")";
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    CHECK(filo_run(&CTX, &prog, NULL, &v) == FILO_ERR);
+    filo_limits one = {1, 0};
+    src = "(* (+ 1 2) (- 10 4))"; /* one node once folded: one step */
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    CHECK(filo_run(&CTX, &prog, &one, &v) == FILO_OK && v.u.num == 18);
+}
+
+/* A run can stop between any two of its instructions and go on later: the
+   same value, the same steps; a builtin calling back runs to its end first;
+   anything else started on the context cancels the paused run. */
+static void test_runs_pause_and_resume(void) {
+    start();
+    const char *sum[] = {"(def sum (fn (n) (if (= n 0) 0 (+ n (sum (- n 1)))))) (sum 50)"};
+    size_t len = build(sum, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    filo_value v = {0};
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 1275);
+    uint32_t steps = CTX.steps;
+    int pauses = 0;
+    int rc = filo_bc_start(&CTX, u, "e0", NULL, 1, &v);
+    while (rc == FILO_PAUSED) {
+        pauses++;
+        rc = filo_bc_resume(&CTX, 1, &v);
+    }
+    CHECK(rc == FILO_OK && v.kind == FILO_NUMBER && v.u.num == 1275);
+    CHECK(CTX.steps == steps);
+    CHECK((uint32_t)pauses + 1U == steps); /* every instruction boundary of its own */
+
+    /* map calls the function back on the C stack: no pause inside it */
+    const char *mapped[] = {"(length (map (fn (x) (* x x)) (range 100)))"};
+    len = build(mapped, 1);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
+    steps = CTX.steps;
+    pauses = 0;
+    rc = filo_bc_start(&CTX, u, "e0", NULL, 1, &v);
+    while (rc == FILO_PAUSED) {
+        pauses++;
+        rc = filo_bc_resume(&CTX, 1, &v);
+    }
+    CHECK(rc == FILO_OK && v.u.num == 100 && CTX.steps == steps);
+    CHECK((uint32_t)pauses < steps / 10U);
+
+    /* the step limit counts across resumes */
+    filo_limits few = {100, 0};
+    len = build(sum, 1);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    rc = filo_bc_start(&CTX, u, "e0", &few, 10, &v);
+    while (rc == FILO_PAUSED) {
+        rc = filo_bc_resume(&CTX, 10, &v);
+    }
+    CHECK(rc == FILO_ERR && strstr(filo_error(&CTX), "step limit") != NULL);
+
+    /* anything else started cancels it, and its globals go back */
+    const char *setg[] = {"(def g 1) (sum 20)"};
+    len = build(setg, 1);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_start(&CTX, u, "e0", NULL, 5, &v) == FILO_PAUSED);
+    CHECK(run("(+ 1 1)", &v) == FILO_OK);
+    CHECK(!filo_get_global(&CTX, "g", &v));
+    CHECK(filo_bc_resume(&CTX, 5, &v) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "no run is paused") != NULL);
+}
+
 int main(void) {
     filo_libc_install();
     test_globals_cross_both_ways();
@@ -441,6 +523,8 @@ int main(void) {
     test_symbol_table_is_bounded();
     test_bundle_carries_units_whole();
     test_errors_say_where();
+    test_constants_fold_as_on_go();
+    test_runs_pause_and_resume();
     test_host_calls_a_script_function();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();

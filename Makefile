@@ -13,7 +13,7 @@ ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
 TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix
 
-.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: steps-regen all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -41,8 +41,9 @@ corpus: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/corpus_runner_san $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c -lm
-	./build/corpus_runner_san $(CORPUS)
+	./build/corpus_runner_san --steps testdata/steps.txt $(CORPUS)
 	./build/corpus_runner_san --vm $(CORPUS)
+	./build/corpus_runner_san --vm --pause 1 $(CORPUS)
 
 # The same corpus with the libc-free host in place: a runtime that answers
 # differently depending on who formats its numbers would be two runtimes.
@@ -59,6 +60,7 @@ oracle: corpus
 	./build/corpus_runner_san --nolibc $(ORACLE)
 	./build/corpus_runner_san --vm $(ORACLE)
 	./build/corpus_runner_san --nolibc --vm $(ORACLE)
+	./build/corpus_runner_san --vm --pause 1 $(ORACLE)
 
 # The device build: the core without its front end (FILO_VM_ONLY: no parser,
 # no IR, no compiler), the libc-free number host, no libm, and the symbol
@@ -78,7 +80,8 @@ device: all device_test.c
 # to the runtime on how numbers are written. What the examples show is kept
 # in testdata/cli: a change to the compiler is a change to what a lesson
 # shows, and it shows up here (make cli-regen rewrites them).
-CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace demo.run demo.dump
+CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace demo.run demo.dump \
+	constantes.tree constantes.folded dobro.ir dobro.both erro.both
 CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c
 
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
@@ -104,6 +107,12 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 
 cli-regen: build/filo build/cli/demo.fbb
 	@for c in $(CLI_CASES); do ./build/filo $$(sh testdata/cli/args.sh $$c) > testdata/cli/$$c 2>&1; done
+
+# The steps of every corpus case on the Go engine, which the IR run above
+# must match (the Go engine folds constants, so the C must fold the same).
+# Needs the Go checkout beside this one, as oracle-regen does.
+steps-regen:
+	cd tools/gosteps && GOFLAGS=-mod=mod go run . $(addprefix ../../,$(CORPUS)) > ../../testdata/steps.txt
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:
@@ -169,6 +178,9 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 # A unit is input from anywhere, so the loader and the machine are fuzzed
 # with units: the corpus compiled to bytecode as seeds, mutated from there.
 # The target is the device build, which is where units from anywhere run.
+# Each unit also runs a few instructions at a time, paused and resumed, and
+# must end as it ended in one go; testdata/fuzz-bc keeps the inputs that
+# once went wrong.
 fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h
 	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
 	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
@@ -179,7 +191,7 @@ fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
 		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fbc_dump.c fuzz_bc.c -lm
 	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \
-		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds \
+		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds testdata/fuzz-bc \
 		> build/fuzz_bc.log 2>&1 || { tail -30 build/fuzz_bc.log; exit 1; }
 	@tail -2 build/fuzz_bc.log
 

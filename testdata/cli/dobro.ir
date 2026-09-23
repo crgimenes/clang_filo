@@ -1,0 +1,9 @@
+2:1     let
+2:1       def dobro
+2:12        fn  names x
+2:20          callb *
+2:23            local x  (frame 0 out, slot 0)
+2:25            const 2
+3:1       call
+3:2         global dobro
+3:8         const 21

@@ -220,12 +220,20 @@ with the libc-free number host, no libm and a symbol table of 128
 `filo` (built by `make cli`) takes a program from source to the machine in
 view:
 
+    filo show tree examples/constantes.filo   # the tree as read
+    filo show folded examples/constantes.filo # once constants fold: 10
+    filo show ir examples/dobro.filo        # the IR, frames and slots named
     filo run examples/dobro.filo            # 42, from the IR
+    filo run --both examples/erro.filo      # IR and VM side by side
     filo build -o dobro.fbc examples/dobro.filo
     filo dump dobro.fbc                     # the unit, every operand named
     filo run --trace dobro.fbc              # each instruction, with the stack
     filo bundle -o demo.fbb ola.fbc dobro.fbc
     filo run demo.fbb dobro                 # one member of the bundle
+
+The C reader goes from characters straight to the tree, so there is no
+token stage to show; `filo_show` shows the three that exist before the
+bytecode, each line with where it came from.
 
 The listing reads units with `fbc_dump.c`, written from this document alone
 and sharing no code with the loader: a second reading of the format, held to
@@ -236,6 +244,25 @@ the run is; the host decodes the instruction from the unit's bytes. It costs
 a check per instruction, as `should_stop` does (about 3% on a recursive
 `fib`), and the IR has no trace. What the examples show is kept in
 `testdata/cli`.
+
+## Pausing a run
+
+`filo_bc_start` runs an entry point for at most a budget of instructions and
+returns `FILO_PAUSED` when it runs out; `filo_bc_resume` goes on with
+another budget, until the run ends as `filo_bc_run` would have ended — the
+same value, the same error, the same steps. Calls between bytecode functions
+are activation records in the run arena, not C frames, so a pause keeps
+them as they are and costs no copy. The one place a run cannot stop is
+inside a builtin that calls a function back (`map`, `fold`): that call runs
+to its end on the C stack, and the run pauses at its next instruction. A
+paused run holds the run arena, so any other run, compile or build on the
+same context cancels it, and the globals it wrote go back.
+
+The check costs nothing per instruction: the machine already compares the
+steps with the step limit, and it now compares them with the smaller of the
+limit and the pause. The corpus and the oracle run paused at every
+instruction boundary (`corpus_runner --vm --pause 1`), and the unit fuzzer
+runs every unit whole and in slices and requires the same end.
 
 ## Loading is a trust boundary
 

@@ -24,7 +24,8 @@
 
 enum {
     FILO_OK = 0,
-    FILO_ERR = 1, /* filo_error() describes it */
+    FILO_ERR = 1,    /* filo_error() describes it */
+    FILO_PAUSED = 2, /* filo_bc_start or filo_bc_resume: the budget ran out */
 };
 
 enum {
@@ -172,6 +173,14 @@ struct filo_ctx {
        know whether it may hand its memory back; see "regions" in filo.c. */
     uint64_t escapes;
     void *frame; /* current local scope (internal type) */
+    /* a bytecode run paused at its budget (internal): the activation it
+       stopped in, its entry point's, the host's limits to put back when it
+       ends, and the step at which the machine stops to look — the step
+       limit, or the pause when that comes first */
+    void *paused;
+    void *paused_base;
+    filo_limits paused_limits;
+    uint32_t vm_stop;
     char error[FILO_ERROR_MAX];
     /* where in the source the last error happened, 0 when not known: see
        filo_error_at */
@@ -195,6 +204,15 @@ int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn);
 #ifndef FILO_VM_ONLY
 /* Parses and lowers src; the program lives in the persistent arena. */
 int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out);
+
+/* One stage of what the compiler makes of src, a line at a time, each with
+   the line and column it came from: "tree" as the reader read it, "folded"
+   after the constants folded, "ir" as lowered. It is for learning how a
+   program becomes something to run; the bytecode has its listing in
+   fbc_dump.c. The run arena is its scratch, as a compile's. */
+typedef void (*filo_line)(void *user, const char *line);
+int filo_show(filo_ctx *ctx, const uint8_t *src, size_t len, const char *stage, filo_line out,
+              void *user);
 
 /* Runs prog. Resets the run arena first; copies surviving globals out at the
    end. result may be NULL. The default limits apply when limits is NULL. */
@@ -327,6 +345,17 @@ int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit
 
 /* Whether a loaded unit has an entry point of that name. */
 bool filo_bc_has(const filo_unit *unit, const char *entry);
+
+/* Runs an entry point for at most budget instructions (0: no budget). When
+   they run out it returns FILO_PAUSED with the run held in ctx, calls and
+   all, and filo_bc_resume goes on from there with another budget; the end
+   is FILO_OK or FILO_ERR as filo_bc_run's. A run pauses only between two of
+   its own instructions: a builtin calling a function back (map, fold) runs
+   that call to the end first. While a run is paused, any other run, compile
+   or build on ctx cancels it, and the globals it wrote go back. */
+int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                  const filo_limits *limits, uint32_t budget, filo_value *result);
+int filo_bc_resume(filo_ctx *ctx, uint32_t budget, filo_value *result);
 
 /* Runs an entry point of a loaded unit as filo_run runs a program. */
 int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,

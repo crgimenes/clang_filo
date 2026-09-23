@@ -1,0 +1,273 @@
+arithmetic.txt	add	1
+arithmetic.txt	add variadic	1
+arithmetic.txt	add one	1
+arithmetic.txt	add zero args is identity	1
+arithmetic.txt	add floats	1
+arithmetic.txt	sub	1
+arithmetic.txt	sub variadic	1
+arithmetic.txt	sub unary negates	1
+arithmetic.txt	mul	1
+arithmetic.txt	mul variadic	1
+arithmetic.txt	mul zero args is identity	1
+arithmetic.txt	div	1
+arithmetic.txt	div variadic	1
+arithmetic.txt	div float result	1
+arithmetic.txt	mod	1
+arithmetic.txt	mod is floored: negative divisor	1
+arithmetic.txt	mod is floored: negative dividend	1
+arithmetic.txt	mod exact	1
+arithmetic.txt	mod floats	1
+arithmetic.txt	mod negative float dividend	1
+arithmetic.txt	mod is exact however large the quotient	1
+arithmetic.txt	mod of a huge negative dividend is floored	1
+arithmetic.txt	mod by a tiny divisor	1
+arithmetic.txt	mod by infinity gives the dividend back	1
+arithmetic.txt	mod by infinity is floored like any other	1
+arithmetic.txt	mod of infinity is NaN	1
+arithmetic.txt	pow	1
+arithmetic.txt	pow of a negative base to a fractional exponent is NaN	1
+arithmetic.txt	pow zero zero	1
+arithmetic.txt	nested arithmetic	1
+arithmetic.txt	large integers stay exact	1
+arithmetic.txt	unary division is the reciprocal	1
+arithmetic.txt	unary division of one	1
+casts.txt	string of integer	1
+casts.txt	string of float	1
+casts.txt	string of small float	1
+casts.txt	string of large number uses exponent	1
+casts.txt	string switches to exponent form at a million	1
+casts.txt	string stays decimal below a million	1
+casts.txt	string keeps fraction digits in exponent form	1
+casts.txt	string stays decimal down to ten-thousandths	1
+casts.txt	string switches to exponent form below that	1
+casts.txt	string of a negative number	1
+casts.txt	string of true	1
+casts.txt	string of false	1
+casts.txt	string passes through	1
+casts.txt	string of list	4
+casts.txt	string of nested list with string	5
+casts.txt	string of tuple	4
+casts.txt	number of numeric string	1
+casts.txt	number trims whitespace	1
+casts.txt	number with exponent	1
+casts.txt	number with plus sign	1
+casts.txt	number accepts inf	1
+casts.txt	number accepts an underscore separator	1
+casts.txt	number of a number	1
+casts.txt	cross-kind compare via string	1
+casts.txt	cross-kind compare via number	1
+casts.txt	type-of number	1
+casts.txt	type-of string	1
+casts.txt	type-of bool	1
+casts.txt	type-of list	3
+casts.txt	type-of tuple	3
+casts.txt	type-of function	2
+casts.txt	string of a 17-digit result	1
+casts.txt	string of a huge number	1
+casts.txt	string of the smallest subnormal	1
+casts.txt	string of the largest double	1
+casts.txt	string of the smallest normal	1
+casts.txt	a 17-digit literal reads as the nearest double	1
+casts.txt	number reads past twenty zeros after the point	1
+casts.txt	number underflows to zero	1
+casts.txt	number rounds just above half the smallest subnormal up	1
+casts.txt	number of thirty digits	1
+comparison.txt	equal numbers	1
+comparison.txt	unequal numbers	1
+comparison.txt	equal variadic	1
+comparison.txt	equal variadic fails	1
+comparison.txt	equal bools	1
+comparison.txt	equal strings	1
+comparison.txt	unequal strings	1
+comparison.txt	equal lists deep	9
+comparison.txt	unequal lists	7
+comparison.txt	unequal list lengths	6
+comparison.txt	equal tuples	7
+comparison.txt	not equal	1
+comparison.txt	not equal false	1
+comparison.txt	less	1
+comparison.txt	less false	1
+comparison.txt	less chained	1
+comparison.txt	less chained fails	1
+comparison.txt	less equal	1
+comparison.txt	greater	1
+comparison.txt	greater equal	1
+comparison.txt	greater equal false	1
+control.txt	if true	1
+control.txt	if false	1
+control.txt	if without else, true	1
+control.txt	if without else, false is the empty list	1
+control.txt	if only evaluates the taken branch	1
+control.txt	if nested	1
+control.txt	cond first match	4
+control.txt	cond else	3
+control.txt	cond no match is the empty list	3
+control.txt	cond empty	1
+control.txt	cond only else	2
+control.txt	cond body is an implicit do	5
+control.txt	cond stops at the first match	3
+control.txt	do returns the last	4
+control.txt	do nested	5
+control.txt	do with side effects	8
+control.txt	exit no value	1
+control.txt	exit with value	2
+control.txt	exit with string	2
+control.txt	exit in if branch	2
+control.txt	exit in do	4
+control.txt	exit in let	4
+control.txt	exit stops execution	4
+control.txt	exit with expression	2
+control.txt	exit from inside a function ends the script	7
+control.txt	exit inside a builtin-called function ends the script	7
+control.txt	exit inside fold ends the script with the value seen so far	28
+control.txt	exit inside filter ends the script	7
+control.txt	exit in a builtin argument ends the script	4
+control.txt	exit in a list argument ends the script	4
+control.txt	exit in a function call argument ends the script	4
+control.txt	exit in a defined function call argument ends the script	7
+control.txt	exit in a let binding ends the script	3
+control.txt	exit from a nested closure keeps the globals set so far	10
+control.txt	return at top level acts like exit	2
+control.txt	return at top level no value	1
+control.txt	return in function	5
+control.txt	return early	9
+control.txt	return not taken	8
+control.txt	return from a let inside a function	8
+control.txt	return inside map	25
+control.txt	return inside fold	31
+control.txt	return nested functions	17
+control.txt	return with expression	4
+errors.txt	error inside a branch not taken does not raise	1
+errors.txt	error not raised on the happy path	11
+functions.txt	identity	4
+functions.txt	no parameters	3
+functions.txt	body is a sequence	8
+functions.txt	function is a value	2
+functions.txt	function stored in a global	9
+functions.txt	function stored in a local	8
+functions.txt	function passed to a function	12
+functions.txt	function returned from a function	8
+functions.txt	argument evaluation order is left to right	32
+functions.txt	arguments are evaluated before the body runs	7
+limits.txt	deep recursion fails under a small recursion limit	461
+limits.txt	the same recursion succeeds with the default limits	461
+limits.txt	a long loop fails under a small step limit	305
+limits.txt	the same loop succeeds with the default limits	305
+limits.txt	limits reset between runs	305
+lists.txt	list	4
+lists.txt	list evaluates its elements	3
+lists.txt	length	5
+lists.txt	length empty	2
+lists.txt	length tuple	4
+lists.txt	head	5
+lists.txt	tail	5
+lists.txt	tail of one	3
+lists.txt	nth	6
+lists.txt	nth first	6
+lists.txt	nth accepts an integral float	5
+lists.txt	list-append	4
+lists.txt	list-append nests a list	5
+lists.txt	list-append does not mutate	7
+lists.txt	list-concat	5
+lists.txt	list-concat three	7
+lists.txt	map	15
+lists.txt	map empty	3
+lists.txt	map with a named function	18
+lists.txt	filter	15
+lists.txt	filter keeps none	7
+lists.txt	filter empty	3
+lists.txt	fold	20
+lists.txt	fold empty returns init	4
+lists.txt	fold builds a list	22
+lists.txt	range one argument	2
+lists.txt	range two arguments	3
+lists.txt	range non-increasing is empty	3
+lists.txt	range zero	2
+lists.txt	range negative start	3
+lists.txt	range accepts integral floats	3
+lists.txt	a range kept in a list is an ordinary list	4
+lists.txt	a range appended to a list	5
+lists.txt	ranges returned by map	9
+lists.txt	a range inside a tuple	4
+lists.txt	reverse	5
+lists.txt	reverse empty	2
+lists.txt	is-empty list	2
+lists.txt	is-empty non-empty list	3
+lists.txt	is-empty string	1
+lists.txt	is-empty non-empty string	1
+lists.txt	is-empty tuple	2
+lists.txt	is-empty number	1
+lists.txt	is-nil empty list	2
+lists.txt	is-nil non-empty list	3
+lists.txt	is-nil tuple is not nil	2
+lists.txt	is-nil number	1
+lists.txt	composed pipeline	42
+literals.txt	integer	1
+literals.txt	negative integer	1
+literals.txt	float	1
+literals.txt	exponent	1
+literals.txt	leading dot	1
+literals.txt	trailing dot	1
+literals.txt	true	1
+literals.txt	false	1
+literals.txt	string	1
+literals.txt	empty string	1
+literals.txt	string escapes	1
+literals.txt	string escapes all	1
+literals.txt	utf8 passes through	1
+literals.txt	empty list	1
+literals.txt	list of mixed kinds	4
+literals.txt	nested list	6
+literals.txt	empty tuple	1
+literals.txt	tuple	3
+literals.txt	values is tuple	3
+literals.txt	line comment	1
+literals.txt	comment lines between expressions	6
+literals.txt	bom is stripped	1
+literals.txt	plus sign literal	1
+literals.txt	plus sign with leading dot	1
+literals.txt	exponent with sign	1
+literals.txt	uppercase exponent	1
+logic.txt	not true	1
+logic.txt	not false	1
+logic.txt	and true	3
+logic.txt	and false	3
+logic.txt	and empty is true	1
+logic.txt	and single	2
+logic.txt	and variadic	5
+logic.txt	and short-circuits past an error	2
+logic.txt	or true	3
+logic.txt	or false	3
+logic.txt	or empty is false	1
+logic.txt	or short-circuits past an error	2
+scope.txt	let local	3
+scope.txt	let two bindings	6
+scope.txt	let is sequential	6
+scope.txt	let shadowing	5
+scope.txt	let outer access	5
+scope.txt	let inner does not leak	6
+scope.txt	let body is a sequence	7
+scope.txt	let empty bindings	2
+scope.txt	letv destructures a tuple	7
+scope.txt	letv with values	7
+scope.txt	letv empty	3
+scope.txt	letv does not alias the tuple	9
+scope.txt	set local	6
+scope.txt	set returns the value	4
+scope.txt	set outer from inner scope	7
+scope.txt	set unbound creates a global	2
+scope.txt	set global then read	4
+scope.txt	def global	4
+scope.txt	def then set	6
+scope.txt	def inside a function is still global	6
+scope.txt	closure captures a local	8
+scope.txt	closure sees later mutation of its captured variable	9
+scope.txt	closure mutates its captured variable	19
+scope.txt	closure factory	14
+scope.txt	two closures keep separate captures	26
+scope.txt	recursion factorial	55
+scope.txt	recursion fibonacci	1771
+scope.txt	multiple top-level expressions, last wins	3
+scope.txt	multiple top-level expressions share globals	8
+scope.txt	special form name is free as a variable	3
+scope.txt	special form in head position is not shadowed	3
