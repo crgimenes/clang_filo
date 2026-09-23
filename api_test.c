@@ -254,6 +254,8 @@ static void test_bc_missing_builtin_fails_the_load(void) {
     filo_value v;
     CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
     CHECK(v.kind == FILO_NUMBER && v.u.num == 42);
+    CHECK(filo_bc_has(u, "e0"));
+    CHECK(!filo_bc_has(u, "nope"));
     CHECK(filo_bc_run(&CTX, u, "nope", NULL, &v) == FILO_ERR);
     CHECK(strstr(filo_error(&CTX), "no entry point") != NULL);
     start(); /* a context that never registered twice */

@@ -153,6 +153,19 @@ the wrong number of arguments, a `cond` clause that is not a clause — is a
 `TRAP` at the point where the IR would raise it, after everything the IR
 would have evaluated before it.
 
+## The device build
+
+A machine that only runs units compiles `filo.c` with `FILO_VM_ONLY` defined
+(the whole build, `filo.h` included). The parser, the IR, the tree-walking
+evaluator and the compiler are left out, and so are `filo_compile`,
+`filo_run` and `filo_bc_build`; what stays is the values, the globals, the
+builtins, the loader and the VM. Measured with the ESP32-S3's gcc at `-Os`:
+16,945 bytes of code and constants against 30,184 for the full runtime.
+
+`make device` holds it to the full build: the full build writes every corpus
+and oracle case as a unit, with what the run gave, and the device build,
+with the libc-free number host and no libm, must give the same for each.
+
 ## Loading is a trust boundary
 
 A unit may come from anywhere — a serial line, a card, a download — so the

@@ -55,15 +55,17 @@ static bool use_nolibc = false;
    unit, loaded back from the bytes and run by the VM. */
 static bool use_vm = false;
 static uint8_t unit_mem[1U << 20U];
-/* --write-units DIR: each case's unit is also written there, as a seed for
-   the bytecode fuzzer */
+/* --write-units DIR: each case's unit is also written there (NNNNN.fbc),
+   with the units of its given values (NNNNN.gK.fbc) and what its run gave
+   (NNNNN.expect): the bytecode fuzzer's seeds, and the corpus device_test
+   runs on a build that cannot compile. */
 static const char *units_dir = NULL;
-static unsigned units_written = 0;
+static unsigned case_no = 0;
+static bool unit_written = false;
 
-static void write_unit(const uint8_t *data, size_t len) {
+static void write_file(const char *suffix, const void *data, size_t len) {
     char path[512];
-    (void)snprintf(path, sizeof(path), "%s/%05u.fbc", units_dir, units_written);
-    units_written++;
+    (void)snprintf(path, sizeof(path), "%s/%05u%s", units_dir, case_no, suffix);
     FILE *f = fopen(path, "wb");
     if (f == NULL) {
         return;
@@ -72,20 +74,30 @@ static void write_unit(const uint8_t *data, size_t len) {
     (void)fclose(f);
 }
 
+/* Builds prog into unit_mem as a one-entry unit named "main"; 0 when it
+   does not build. */
+static size_t build_unit(filo_ctx *ctx, const filo_prog *prog) {
+    filo_bc_entry entry = {"main", prog};
+    size_t len = 0;
+    if (filo_bc_build(ctx, &entry, 1, unit_mem, sizeof(unit_mem), &len) != FILO_OK) {
+        return 0;
+    }
+    return len;
+}
+
 static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits,
                        filo_value *out) {
     if (!use_vm) {
         return filo_run(ctx, prog, limits, out);
     }
-    filo_bc_entry entry = {"main", prog};
-    size_t len = 0;
     const filo_unit *unit = NULL;
-    if (filo_bc_build(ctx, &entry, 1, unit_mem, sizeof(unit_mem), &len) != FILO_OK ||
-        filo_bc_load(ctx, unit_mem, len, &unit) != FILO_OK) {
+    size_t len = build_unit(ctx, prog);
+    if (len == 0 || filo_bc_load(ctx, unit_mem, len, &unit) != FILO_OK) {
         return FILO_ERR;
     }
     if (units_dir != NULL) {
-        write_unit(unit_mem, len);
+        write_file(".fbc", unit_mem, len);
+        unit_written = true;
     }
     return filo_bc_run(ctx, unit, "main", limits, out);
 }
@@ -147,8 +159,11 @@ static void show(filo_ctx *ctx, const filo_value *v, char *buf, size_t cap) {
 }
 
 /* Evaluates an expression on a fresh context; the value is copied into the
-   caller's context as a global so it survives the callee's memory. */
-static bool eval_into(filo_ctx *dst, const char *global, const char *expr, char *why, size_t cap) {
+   caller's context as a global so it survives the callee's memory. given is
+   the index of a given binding, whose unit is written with the case's; -1
+   for anything else. */
+static bool eval_into(filo_ctx *dst, const char *global, const char *expr, int given, char *why,
+                      size_t cap) {
     static uint8_t p2[1U << 20U];
     static uint8_t r2[1U << 20U];
     filo_ctx *tmp = malloc(sizeof(filo_ctx));
@@ -164,6 +179,12 @@ static bool eval_into(filo_ctx *dst, const char *global, const char *expr, char 
         filo_run(tmp, &prog, NULL, &v) == FILO_OK) {
         ok = true;
     }
+    if (ok && given >= 0 && units_dir != NULL) {
+        size_t len = build_unit(tmp, &prog);
+        char suffix[16];
+        (void)snprintf(suffix, sizeof(suffix), ".g%d.fbc", given);
+        write_file(suffix, unit_mem, len);
+    }
     if (!ok) {
         snprintf(why, cap, "\"%s\" does not evaluate: %s", expr, filo_error(tmp));
         free(tmp);
@@ -177,6 +198,39 @@ static bool eval_into(filo_ctx *dst, const char *global, const char *expr, char 
     return ok;
 }
 
+/* What the run gave, in the form device_test reads back: its limits, the
+   names of its given values in order, "result <repr>" or "error", and
+   "global <name> <repr>" for each global the case checks. */
+static void write_expect(filo_ctx *ctx, const corpus_case *c, const filo_value *got) {
+    static char text[TEXT_MAX];
+    static char repr[TEXT_MAX];
+    size_t n = 0;
+    size_t len = 0;
+    if (c->has_limits) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "limits %u %u\n", c->limits.step_limit,
+                              c->limits.recursion_limit);
+    }
+    for (int i = 0; i < c->ngiven && n < sizeof(text); i++) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "given %s\n", c->given[i].name);
+    }
+    if (got == NULL) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "error\n");
+    } else if (filo_value_repr(ctx, got, repr, sizeof(repr), &len) == FILO_OK && n < sizeof(text)) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "result %.*s\n", (int)len, repr);
+    }
+    for (int i = 0; i < c->nglobals && got != NULL && n < sizeof(text); i++) {
+        filo_value v;
+        if (filo_get_global(ctx, c->globals[i].name, &v) &&
+            filo_value_repr(ctx, &v, repr, sizeof(repr), &len) == FILO_OK) {
+            n += (size_t)snprintf(text + n, sizeof(text) - n, "global %s %.*s\n",
+                                  c->globals[i].name, (int)len, repr);
+        }
+    }
+    if (n < sizeof(text)) {
+        write_file(".expect", text, n);
+    }
+}
+
 static bool run_case(const corpus_case *c, char *why, size_t cap) {
     filo_ctx *ctx = malloc(sizeof(filo_ctx));
     if (ctx == NULL) {
@@ -185,7 +239,7 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
     }
     init_ctx(ctx, persistent_mem, sizeof(persistent_mem), run_mem, sizeof(run_mem));
     for (int i = 0; i < c->ngiven; i++) {
-        if (!eval_into(ctx, c->given[i].name, c->given[i].expr, why, cap)) {
+        if (!eval_into(ctx, c->given[i].name, c->given[i].expr, i, why, cap)) {
             free(ctx);
             return false;
         }
@@ -196,6 +250,9 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
     if (filo_compile(ctx, (const uint8_t *)c->script, strlen(c->script), &prog) == FILO_OK &&
         run_program(ctx, &prog, c->has_limits ? &c->limits : NULL, &got) == FILO_OK) {
         failed = false;
+    }
+    if (unit_written) {
+        write_expect(ctx, c, failed ? NULL : &got);
     }
     if (c->want_err) {
         bool ok = true;
@@ -214,7 +271,7 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
         return false;
     }
     /* the expectation is evaluated with its own memory, then compared */
-    if (!eval_into(ctx, "__want", c->want, why, cap)) {
+    if (!eval_into(ctx, "__want", c->want, -1, why, cap)) {
         free(ctx);
         return false;
     }
@@ -236,7 +293,7 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
             free(ctx);
             return false;
         }
-        if (!eval_into(ctx, "__want", c->globals[i].expr, why, cap)) {
+        if (!eval_into(ctx, "__want", c->globals[i].expr, -1, why, cap)) {
             free(ctx);
             return false;
         }
@@ -332,7 +389,12 @@ static void finish_case(const char *file, corpus_case *c) {
     rstrip(c->script);
     rstrip(c->want);
     char why[1024] = {0};
-    if (run_case(c, why, sizeof(why))) {
+    unit_written = false;
+    bool ok = run_case(c, why, sizeof(why));
+    if (unit_written) {
+        case_no++;
+    }
+    if (ok) {
         passed++;
     } else {
         failures++;

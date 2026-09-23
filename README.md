@@ -18,6 +18,11 @@ unit — and a unit is treated as untrusted input: checksummed, bounds-checked
 and fuzzed. Every corpus case and the Prolog oracle run through both the IR
 and the bytecode.
 
+Built with `-DFILO_VM_ONLY`, the runtime keeps only what runs a unit: no
+parser, no IR, no compiler. On an ESP32-S3 that is 17 KB of code instead of
+30 KB. `make device` runs the corpus and the oracle, compiled by the full
+build, on that build.
+
 ## Memory
 
 The host hands over two blocks and the runtime never asks for more:
@@ -107,6 +112,7 @@ sustain. Case mapping covers ASCII and the Latin-1 letters.
 | `make oracle-regen` | rewrites them; needs the Go checkout beside this one |
 | `make api` | host API behavior the corpus cannot express |
 | `make nolibc` | the libc-free number text against the libc one |
+| `make device` | the corpus and the oracle as units, on the `FILO_VM_ONLY` build |
 | `make fmt-check` / `make fmt` | clang-format |
 | `make tidy` / `make check` | clang-tidy and cppcheck, warnings as errors |
 | `make freestanding` | wasm32 objects, `-ffreestanding -nostdlib` |

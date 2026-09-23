@@ -10,7 +10,11 @@
    start of the next run. Globals written by a run are copied out into the
    persistent arena when the run ends, so they survive; the run's result value
    stays valid until the next run or compile. A script that exhausts either
-   arena fails with an error, never corrupts memory. */
+   arena fails with an error, never corrupts memory.
+
+   Built with FILO_VM_ONLY defined (for the whole build, this header
+   included), the runtime keeps only what runs a loaded unit: no parser, no
+   IR, no compiler. That is the device build of docs/bytecode.md. */
 #ifndef FILO_H
 #define FILO_H
 
@@ -100,11 +104,13 @@ typedef struct {
     filo_builtin fn;
 } filo_builtin_entry;
 
+#ifndef FILO_VM_ONLY
 /* A compiled script: IR in the persistent arena, bound to the context that
    compiled it. */
 typedef struct {
     const filo_instr *root;
 } filo_prog;
+#endif
 
 typedef struct {
     uint32_t step_limit;
@@ -161,12 +167,14 @@ int filo_init(filo_ctx *ctx, const filo_host *host, void *persistent, size_t per
    is already taken. */
 int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn);
 
+#ifndef FILO_VM_ONLY
 /* Parses and lowers src; the program lives in the persistent arena. */
 int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out);
 
 /* Runs prog. Resets the run arena first; copies surviving globals out at the
    end. result may be NULL. The default limits apply when limits is NULL. */
 int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, filo_value *result);
+#endif
 
 /* The message of the last failed call. */
 const char *filo_error(const filo_ctx *ctx);
@@ -241,6 +249,7 @@ void filo_set_pow(double (*fn)(double, double));
    in place from wherever their bytes live. */
 typedef struct filo_unit filo_unit;
 
+#ifndef FILO_VM_ONLY
 typedef struct {
     const char *name;      /* the entry point's name */
     const filo_prog *prog; /* compiled in the same context */
@@ -251,11 +260,15 @@ typedef struct {
    needed. Uses the run arena as scratch. */
 int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8_t *dst, size_t cap,
                   size_t *len);
+#endif
 
 /* Checks a unit and resolves its imports and globals by name against ctx.
    The bytes are used in place and must outlive ctx: on a microcontroller
    they stay in flash. */
 int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out);
+
+/* Whether a loaded unit has an entry point of that name. */
+bool filo_bc_has(const filo_unit *unit, const char *entry);
 
 /* Runs an entry point of a loaded unit as filo_run runs a program. */
 int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,

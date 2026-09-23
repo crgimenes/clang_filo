@@ -11,8 +11,9 @@ HDRS = filo.h filo_libc.h filo_math.h filo_strings.h filo_nolibc.h
 CORPUS = testdata/corpus/*.txt
 ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
+TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix
 
-.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: all corpus corpus-nolibc oracle oracle-regen api nolibc device fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -59,6 +60,17 @@ oracle: corpus
 	./build/corpus_runner_san --vm $(ORACLE)
 	./build/corpus_runner_san --nolibc --vm $(ORACLE)
 
+# The device build: the core without its front end (FILO_VM_ONLY: no parser,
+# no IR, no compiler), the libc-free number host, no libm. It runs the corpus
+# and the oracle as units the full build compiled, and must give what the
+# full build gave on every one.
+device: all device_test.c
+	@rm -rf build/units && mkdir -p build/units
+	@./build/corpus_runner --nolibc --vm --write-units build/units $(CORPUS) $(ORACLE) > /dev/null
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) -DFILO_VM_ONLY \
+		-o build/device_test $(CORE) $(PACKS) $(NOLIBC) device_test.c
+	./build/device_test build/units
+
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:
 	cd $(FILO_GO)/conformance && \
@@ -72,14 +84,17 @@ fmt-check:
 
 tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
-		--checks='bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix' \
+		--checks='$(TIDY_CHECKS)' \
 		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
 		nolibc_test.c -- -std=c11
+	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
+		--checks='$(TIDY_CHECKS)' \
+		$(CORE) device_test.c -- -std=c11 -DFILO_VM_ONLY
 
 check:
 	cppcheck --enable=warning,style,performance,portability --inline-suppr \
 		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c \
-		api_test.c nolibc_test.c
+		api_test.c nolibc_test.c device_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
 # strlen/strchr: the same freestanding wasm32 target the msh terminal uses.
@@ -91,6 +106,9 @@ freestanding: $(CORE) $(PACKS) $(NOLIBC) $(HDRS)
 			-o build/$${f%.c}_wasm.o $$f || exit 1; \
 		echo "freestanding wasm32 object: build/$${f%.c}_wasm.o"; \
 	done
+	$(LLVM)/clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -c -DFILO_VM_ONLY \
+		-std=c11 -O2 $(WARN) -Wno-unused-function -isystem freestanding/include \
+		-o build/filo_vm_wasm.o $(CORE)
 
 FUZZ_SECONDS ?= 15
 # Seconds one input may take. Every input runs in well under a millisecond
@@ -116,11 +134,13 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 
 # A unit is input from anywhere, so the loader and the machine are fuzzed
 # with units: the corpus compiled to bytecode as seeds, mutated from there.
+# The target is the device build, which is where units from anywhere run.
 fuzz-bc: all fuzz_bc.c
 	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
 	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
+	@rm -f build/fuzz_bc_seeds/*.expect
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
-		-o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fuzz_bc.c -lm
+		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fuzz_bc.c -lm
 	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \
 		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds \
 		> build/fuzz_bc.log 2>&1 || { tail -30 build/fuzz_bc.log; exit 1; }
@@ -131,7 +151,7 @@ bench: $(CORE) $(PACKS) $(HOST) bench.c $(HDRS)
 	$(CC) $(CFLAGS) -o build/bench $(CORE) $(PACKS) $(HOST) bench.c -lm
 	./build/bench 2000
 
-qa: all fmt-check corpus corpus-nolibc oracle api nolibc tidy check freestanding fuzz fuzz-bc
+qa: all fmt-check corpus corpus-nolibc oracle api nolibc device tidy check freestanding fuzz fuzz-bc
 
 clean:
 	rm -rf build

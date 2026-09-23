@@ -70,6 +70,7 @@ int filo_fail2(filo_ctx *ctx, const char *msg, const char *detail) {
     return FILO_ERR;
 }
 
+#ifndef FILO_VM_ONLY
 /* Prefixes the pending error with "in <ctx>: " — the context chain the Go
    engine builds by wrapping errors on the way out. */
 static int fail_in(filo_ctx *ctx, const char *where) {
@@ -81,6 +82,7 @@ static int fail_in(filo_ctx *ctx, const char *where) {
     (void)cstr_copy(ctx->error + n, sizeof(ctx->error) - n, inner);
     return FILO_ERR;
 }
+#endif
 
 /* Writes a decimal into a small buffer; used for argument indexes and
    arities in messages. */
@@ -439,6 +441,8 @@ bool filo_equal(const filo_value *a, const filo_value *b) {
 }
 
 /* --------------------------------------------------------------- parser */
+
+#ifndef FILO_VM_ONLY
 
 /* The parse tree is a temporary in the run arena: lowering reads it and
    only the IR survives, in the persistent arena. */
@@ -898,6 +902,8 @@ struct filo_instr {
     filo_builtin fn;
 };
 
+#endif
+
 typedef struct frame frame;
 struct frame {
     filo_value *slots;
@@ -929,14 +935,6 @@ static const char *pstr(filo_ctx *ctx, const uint8_t *ptr, uint32_t len) {
     }
     s[len] = '\0';
     return s;
-}
-
-static bool name_is(const filo_str *s, const char *lit) {
-    size_t n = strlen(lit);
-    if (s->len != n) {
-        return false;
-    }
-    return memcmp(s->ptr, lit, n) == 0;
 }
 
 static bool cname_eq(const char *name, const uint8_t *ptr, uint32_t len) {
@@ -987,6 +985,16 @@ static const filo_builtin_entry *builtin_by_name(const filo_ctx *ctx, const uint
         }
     }
     return NULL;
+}
+
+#ifndef FILO_VM_ONLY
+
+static bool name_is(const filo_str *s, const char *lit) {
+    size_t n = strlen(lit);
+    if (s->len != n) {
+        return false;
+    }
+    return memcmp(s->ptr, lit, n) == 0;
 }
 
 /* A lexical scope while lowering; lives in the run arena and dies with the
@@ -1500,7 +1508,12 @@ static const filo_instr *lower(lowerer *lw, const node *n) {
     }
 }
 
-/* ------------------------------------------------------------- evaluation */
+#endif
+
+/* ------------------------------------------------------------------ calls
+
+   What a call needs whichever code runs it: the IR evaluator below, or the
+   bytecode machine further down, which is all a device build keeps. */
 
 enum {
     SIG_NONE = 0,
@@ -1508,6 +1521,92 @@ enum {
     SIG_RETURN,
 };
 
+static int prefix_error(filo_ctx *ctx, const char *prefix) {
+    char inner[FILO_ERROR_MAX];
+    (void)cstr_copy(inner, sizeof(inner), ctx->error);
+    size_t n = cstr_copy(ctx->error, sizeof(ctx->error), prefix);
+    (void)cstr_copy(ctx->error + n, sizeof(ctx->error) - n, inner);
+    return FILO_ERR;
+}
+
+static int as_bool(filo_ctx *ctx, const filo_value *v, bool *out) {
+    if (v->kind != FILO_BOOL) {
+        return fail_expected(ctx, "bool", v);
+    }
+    *out = v->u.b;
+    return FILO_OK;
+}
+
+static int fail_arity(filo_ctx *ctx, uint32_t want, uint32_t got) {
+    char msg[64];
+    size_t n = cstr_copy(msg, sizeof(msg), "function expects ");
+    n += u32_text(msg + n, sizeof(msg) - n, want);
+    n += cstr_copy(msg + n, sizeof(msg) - n, " arguments, got ");
+    (void)u32_text(msg + n, sizeof(msg) - n, got);
+    return filo_fail(ctx, msg);
+}
+
+static int enter_call(filo_ctx *ctx) {
+    ctx->recursion++;
+    if (ctx->limits.recursion_limit > 0 && ctx->recursion > ctx->limits.recursion_limit) {
+        ctx->recursion--;
+        return filo_fail(ctx, "recursion limit exceeded");
+    }
+    return FILO_OK;
+}
+
+static int vm_run_func(filo_ctx *ctx, const filo_func *fn, const filo_value *slots, uint32_t n,
+                       filo_value *out);
+#ifndef FILO_VM_ONLY
+static int ir_run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
+                       filo_value *out);
+#endif
+
+/* The recursion counter was incremented by the caller; the callee releases
+   it. */
+static int run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
+                    filo_value *out) {
+#ifndef FILO_VM_ONLY
+    if (fn->bc == NULL) {
+        return ir_run_func(ctx, fn, slots, n, out);
+    }
+#endif
+    return vm_run_func(ctx, fn, slots, n, out);
+}
+
+int filo_call(filo_ctx *ctx, const filo_value *fnv, const filo_value *args, uint32_t n,
+              filo_value *out) {
+    if (fnv->kind != FILO_FUNC) {
+        return fail_expected(ctx, "func", fnv);
+    }
+    const filo_func *fn = fnv->u.fn;
+    if (fn->nparams != n) {
+        return fail_arity(ctx, fn->nparams, n);
+    }
+    if (enter_call(ctx) != FILO_OK) {
+        return FILO_ERR;
+    }
+    size_t mark = ctx->run.used;
+    uint64_t escapes = ctx->escapes;
+    filo_value *slots = NULL;
+    if (n > 0) {
+        slots = ralloc(ctx, sizeof(filo_value) * n);
+        if (slots == NULL) {
+            ctx->recursion--;
+            return FILO_ERR;
+        }
+        memcpy(slots, args, sizeof(filo_value) * n);
+    }
+    int rc = run_func(ctx, fn, slots, n, out);
+    if (rc == FILO_OK && ctx->escapes == escapes) {
+        region_release(ctx, mark, out);
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------- evaluation */
+
+#ifndef FILO_VM_ONLY
 static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out);
 
 /* Adds the "in <where>: " context unless a signal is unwinding: a signal is
@@ -1517,14 +1616,6 @@ static int wrap(filo_ctx *ctx, const char *where, int rc) {
         return rc;
     }
     return fail_in(ctx, where);
-}
-
-static int prefix_error(filo_ctx *ctx, const char *prefix) {
-    char inner[FILO_ERROR_MAX];
-    (void)cstr_copy(inner, sizeof(inner), ctx->error);
-    size_t n = cstr_copy(ctx->error, sizeof(ctx->error), prefix);
-    (void)cstr_copy(ctx->error + n, sizeof(ctx->error) - n, inner);
-    return FILO_ERR;
 }
 
 /* "argument <i>: " */
@@ -1569,14 +1660,6 @@ static int eval_body(filo_ctx *ctx, const filo_instr *const *body, uint32_t n, f
     return FILO_OK;
 }
 
-static int as_bool(filo_ctx *ctx, const filo_value *v, bool *out) {
-    if (v->kind != FILO_BOOL) {
-        return fail_expected(ctx, "bool", v);
-    }
-    *out = v->u.b;
-    return FILO_OK;
-}
-
 static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
                         const filo_instr *const *args, uint32_t n, filo_value *out) {
     size_t mark = ctx->run.used;
@@ -1611,14 +1694,8 @@ static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
 /* Runs fn's body in a frame of slots whose parent is the captured frame; the
    recursion counter was incremented by the caller. A return signal becomes
    the value. */
-static int vm_run_func(filo_ctx *ctx, const filo_func *fn, const filo_value *slots, uint32_t n,
-                       filo_value *out);
-
-static int run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
-                    filo_value *out) {
-    if (fn->bc != NULL) {
-        return vm_run_func(ctx, fn, slots, n, out);
-    }
+static int ir_run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
+                       filo_value *out) {
     frame *f = ralloc(ctx, sizeof(frame));
     if (f == NULL) {
         ctx->recursion--;
@@ -1636,54 +1713,6 @@ static int run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint3
         *out = ctx->signaled;
         ctx->signal = SIG_NONE;
         return FILO_OK;
-    }
-    return rc;
-}
-
-static int fail_arity(filo_ctx *ctx, uint32_t want, uint32_t got) {
-    char msg[64];
-    size_t n = cstr_copy(msg, sizeof(msg), "function expects ");
-    n += u32_text(msg + n, sizeof(msg) - n, want);
-    n += cstr_copy(msg + n, sizeof(msg) - n, " arguments, got ");
-    (void)u32_text(msg + n, sizeof(msg) - n, got);
-    return filo_fail(ctx, msg);
-}
-
-static int enter_call(filo_ctx *ctx) {
-    ctx->recursion++;
-    if (ctx->limits.recursion_limit > 0 && ctx->recursion > ctx->limits.recursion_limit) {
-        ctx->recursion--;
-        return filo_fail(ctx, "recursion limit exceeded");
-    }
-    return FILO_OK;
-}
-
-int filo_call(filo_ctx *ctx, const filo_value *fnv, const filo_value *args, uint32_t n,
-              filo_value *out) {
-    if (fnv->kind != FILO_FUNC) {
-        return fail_expected(ctx, "func", fnv);
-    }
-    const filo_func *fn = fnv->u.fn;
-    if (fn->nparams != n) {
-        return fail_arity(ctx, fn->nparams, n);
-    }
-    if (enter_call(ctx) != FILO_OK) {
-        return FILO_ERR;
-    }
-    size_t mark = ctx->run.used;
-    uint64_t escapes = ctx->escapes;
-    filo_value *slots = NULL;
-    if (n > 0) {
-        slots = ralloc(ctx, sizeof(filo_value) * n);
-        if (slots == NULL) {
-            ctx->recursion--;
-            return FILO_ERR;
-        }
-        memcpy(slots, args, sizeof(filo_value) * n);
-    }
-    int rc = run_func(ctx, fn, slots, n, out);
-    if (rc == FILO_OK && ctx->escapes == escapes) {
-        region_release(ctx, mark, out);
     }
     return rc;
 }
@@ -2000,11 +2029,12 @@ static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         rc = FILO_OK;
         break;
     case OP_LOCAL: {
+        /* lowering emits a local only inside the frames it counted */
         frame *f = ctx->frame;
         for (uint32_t i = 0; i < in->a; i++) {
-            f = f->parent;
+            f = f->parent; // NOLINT(clang-analyzer-core.NullDereference)
         }
-        *out = f->slots[in->b];
+        *out = f->slots[in->b]; // NOLINT(clang-analyzer-core.NullDereference)
         rc = FILO_OK;
         break;
     }
@@ -2095,6 +2125,8 @@ static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     ctx->depth--;
     return rc;
 }
+
+#endif
 
 /* ---------------------------------------------------------------- globals */
 
@@ -2410,6 +2442,8 @@ static uint32_t bc_checksum(const uint8_t *data, size_t len) {
 }
 
 /* ---- the compiler ---- */
+
+#ifndef FILO_VM_ONLY
 
 typedef struct {
     bool fn; /* a function's own frame, or a let inside it */
@@ -3212,6 +3246,8 @@ int filo_bc_build(filo_ctx *ctx, const filo_bc_entry *entries, uint32_t n, uint8
     }
     return FILO_OK;
 }
+
+#endif
 
 /* ---- the loader ---- */
 
@@ -4127,6 +4163,7 @@ int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn) {
     return FILO_OK;
 }
 
+#ifndef FILO_VM_ONLY
 int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) {
     /* the parse tree and the lowering scopes are run-arena temporaries */
     arena_reset(&ctx->run);
@@ -4146,6 +4183,7 @@ int filo_compile(filo_ctx *ctx, const uint8_t *src, size_t len, filo_prog *out) 
     out->root = root;
     return FILO_OK;
 }
+#endif
 
 /* What every run does first and last, whatever runs in between: the IR or
    a unit's bytecode. */
@@ -4195,6 +4233,7 @@ static int run_end(filo_ctx *ctx, int rc, filo_value v, const filo_limits *saved
     return FILO_OK;
 }
 
+#ifndef FILO_VM_ONLY
 int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, filo_value *result) {
     filo_limits saved;
     run_begin(ctx, limits, &saved);
@@ -4203,9 +4242,9 @@ int filo_run(filo_ctx *ctx, const filo_prog *prog, const filo_limits *limits, fi
     int rc = eval(ctx, prog->root, &v);
     return run_end(ctx, rc, v, &saved, result);
 }
+#endif
 
-int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,
-                filo_value *result) {
+static const bc_fn *bc_export(const filo_unit *unit, const char *entry) {
     const bc_fn *fn = NULL;
     size_t n = strlen(entry);
     for (uint32_t i = 0; i < unit->nexports; i++) {
@@ -4214,6 +4253,16 @@ int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const f
             fn = &unit->fns[unit->export_fns[i]];
         }
     }
+    return fn;
+}
+
+bool filo_bc_has(const filo_unit *unit, const char *entry) {
+    return bc_export(unit, entry) != NULL;
+}
+
+int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,
+                filo_value *result) {
+    const bc_fn *fn = bc_export(unit, entry);
     if (fn == NULL) {
         ctx->error[0] = '\0';
         return filo_fail2(ctx, "bytecode: no entry point named ", entry);
