@@ -276,7 +276,82 @@ static void test_bc_missing_builtin_fails_the_load(void) {
     CHECK(strstr(filo_error(&CTX), "no entry point") != NULL);
     start(); /* a context that never registered twice */
     CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
-    CHECK(strcmp(filo_error(&CTX), "missing builtin: twice") == 0);
+    CHECK(strcmp(filo_error(&CTX), "missing (1): twice") == 0);
+}
+
+static int thrice(filo_ctx *ctx, const filo_value *a, uint32_t n, filo_value *out) {
+    (void)ctx;
+    (void)n;
+    *out = filo_num(a[0].u.num * 3);
+    return FILO_OK;
+}
+
+/* Everything a unit needs and the context lacks is refused together: the
+   functions it calls and the globals it only reads. */
+static void test_bc_load_names_all_that_is_missing(void) {
+    start();
+    CHECK(filo_register_builtin(&CTX, "twice", twice) == FILO_OK);
+    CHECK(filo_register_builtin(&CTX, "thrice", thrice) == FILO_OK);
+    const char *src[] = {"(+ (twice W) (thrice 1))"};
+    size_t len = build(src, 1);
+    const filo_unit *u = NULL;
+    start();
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strcmp(filo_error(&CTX), "missing (3): twice thrice W") == 0);
+}
+
+/* A global the unit reads and never writes is the host's to provide: the
+   load refuses without it; the lazy load leaves it to fail when read, as
+   the interpreter does. One the unit writes is its own. */
+static void test_bc_globals_read_only_are_externs(void) {
+    start();
+    const char *src[] = {"(+ W 1)"};
+    size_t len = build(src, 1);
+    const filo_unit *u = NULL;
+    filo_value v;
+    start();
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_ERR);
+    CHECK(strcmp(filo_error(&CTX), "missing (1): W") == 0);
+    CHECK(filo_bc_load_lazy(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "undefined global: W") != NULL);
+    start();
+    CHECK(filo_set_global(&CTX, "W", filo_num(41)) == FILO_OK);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 42);
+
+    start();
+    const char *own[] = {"(def n 5)", "(+ n 1)"};
+    len = build(own, 2);
+    start();
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+}
+
+/* Where a function comes from is the VM's business: compiled against a
+   builtin, the unit runs where the name is a function in Filo, and the
+   other way round, the function a value there too. */
+static void test_bc_functions_resolve_whatever_their_origin(void) {
+    start();
+    CHECK(filo_register_builtin(&CTX, "twice", twice) == FILO_OK);
+    const char *calls[] = {"(twice 21)"};
+    size_t len = build(calls, 1);
+    const filo_unit *u = NULL;
+    filo_value v;
+    start();
+    CHECK(run("(def twice (fn (x) (* x 2)))", &v) == FILO_OK);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 42);
+
+    start();
+    CHECK(run("(def twice (fn (x) (* x 2)))", &v) == FILO_OK);
+    const char *uses[] = {"(twice 21)", "(fold (fn (a b) (+ a b)) 0 (map twice (list 1 2)))"};
+    len = build(uses, 2);
+    start();
+    CHECK(filo_register_builtin(&CTX, "twice", twice) == FILO_OK);
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 42);
+    CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK && v.u.num == 6);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 42);
 }
 
 /* Entry points of one unit share its globals, as a screen's hooks share
@@ -532,6 +607,9 @@ int main(void) {
     test_bc_short_buffer_says_the_size();
     test_bc_refuses_a_damaged_unit();
     test_bc_missing_builtin_fails_the_load();
+    test_bc_load_names_all_that_is_missing();
+    test_bc_globals_read_only_are_externs();
+    test_bc_functions_resolve_whatever_their_origin();
     test_bc_entries_share_globals();
     test_bc_and_ir_call_each_other();
     test_bc_sealed_context_refuses_unknown_globals();

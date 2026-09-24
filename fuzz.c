@@ -42,7 +42,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t len = 0;
     const filo_unit *u = NULL;
     if (filo_bc_build(&ctx, &entry, 1, unit, sizeof(unit), &len) == FILO_OK &&
-        filo_bc_load(&ctx, unit, len, &u) == FILO_OK) {
+        filo_bc_load_lazy(&ctx, unit, len, &u) == FILO_OK) {
         (void)filo_bc_run(&ctx, u, "main", &limits, &v);
     }
     if (filo_run(&ctx, &prog, &limits, &v) == FILO_OK) {

@@ -178,6 +178,26 @@ static bool read_exports(reader *r, fbc_unit *u) {
     return true;
 }
 
+/* Indices into the globals, rising; read after them, whatever the order of
+   the section table. */
+static bool read_externs(reader *r, fbc_unit *u) {
+    u->nexterns = rd_uleb(r);
+    if (u->nexterns > FBC_NAMES_MAX) {
+        return false;
+    }
+    for (uint32_t i = 0; i < u->nexterns; i++) {
+        uint32_t g = rd_uleb(r);
+        if (r->bad || g >= FBC_NAMES_MAX) {
+            return false;
+        }
+        u->externs[g] = true;
+    }
+    if (r->bad) {
+        return false;
+    }
+    return true;
+}
+
 static bool read_section(fbc_unit *u, uint32_t kind, uint32_t off, uint32_t len) {
     reader r = {u->data, off, (size_t)off + len, false};
     switch (kind) {
@@ -199,6 +219,8 @@ static bool read_section(fbc_unit *u, uint32_t kind, uint32_t off, uint32_t len)
         u->debug.off = off;
         u->debug.len = len;
         return true;
+    case 8:
+        return read_externs(&r, u);
     default:
         return true; /* a kind this reader does not know is skipped, as the spec says */
     }
@@ -610,9 +632,15 @@ void fbc_dump(const fbc_unit *u, fbc_out out, void *user) {
     say(out, user, "debug: %s",
         u->debug.len > 0 ? "line and column of each instruction" : "none (stripped)");
     say(out, user, "");
-    list_names(u, u->imports, u->nimports, "imports", ": what the loading context must provide",
+    list_names(u, u->imports, u->nimports, "imports", ": functions the loading VM must provide",
                out, user);
-    list_names(u, u->globals, u->nglobals, "globals", "", out, user);
+    say(out, user, "globals (%u)%s", u->nglobals,
+        u->nexterns > 0 ? ": the extern ones, read and never written, the VM provides" : "");
+    for (uint32_t i = 0; i < u->nglobals; i++) {
+        char name[128];
+        name_text(u, u->globals[i], name, sizeof(name));
+        say(out, user, "  %4u  %s%s", i, name, u->externs[i] ? "  extern" : "");
+    }
     say(out, user, "constants (%u)", u->nconsts);
     for (uint32_t i = 0; i < u->nconsts; i++) {
         char text[128];

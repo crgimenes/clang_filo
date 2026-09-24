@@ -55,7 +55,7 @@ static void init_ctx(filo_ctx *ctx, void *p, size_t pcap, void *r, size_t rcap) 
 static bool load_run(filo_ctx *ctx, const uint8_t *unit, size_t len, const filo_limits *limits,
                      filo_value *out) {
     const filo_unit *u = NULL;
-    if (filo_bc_load(ctx, unit, len, &u) != FILO_OK) {
+    if (filo_bc_load_lazy(ctx, unit, len, &u) != FILO_OK) {
         return false;
     }
     return filo_bc_run(ctx, u, "main", limits, out) == FILO_OK;

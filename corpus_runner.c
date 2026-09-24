@@ -160,7 +160,7 @@ static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *
     }
     const filo_unit *unit = NULL;
     size_t len = build_unit(ctx, prog);
-    if (len == 0 || filo_bc_load(ctx, unit_mem, len, &unit) != FILO_OK) {
+    if (len == 0 || filo_bc_load_lazy(ctx, unit_mem, len, &unit) != FILO_OK) {
         return FILO_ERR;
     }
     if (units_dir != NULL) {

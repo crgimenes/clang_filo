@@ -1,8 +1,8 @@
-unit: 260 bytes, format 1, checksum 7992bd69 ok
+unit: 273 bytes, format 1, checksum 83978d40 ok
 widest stack 4, widest frame 1
 debug: line and column of each instruction
 
-imports (3): what the loading context must provide
+imports (3): functions the loading VM must provide
      0  <
      1  -
      2  +

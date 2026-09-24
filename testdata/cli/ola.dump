@@ -1,8 +1,8 @@
-unit: 136 bytes, format 1, checksum bddcb726 ok
+unit: 149 bytes, format 1, checksum 6729269c ok
 widest stack 1, widest frame 0
 debug: line and column of each instruction
 
-imports (0): what the loading context must provide
+imports (0): functions the loading VM must provide
 globals (0)
 constants (1)
      0  "olá mundo"

@@ -1,15 +1,15 @@
-bundle: 380 bytes, format 1, checksum 9037c988 ok
+bundle: 409 bytes, format 1, checksum ead03356 ok
 widest stack 2, widest frame 1
 members (2)
-  ola                 136 bytes at 56
-  dobro               188 bytes at 192
+  ola                 149 bytes at 56
+  dobro               201 bytes at 208
 
 == ola
-unit: 136 bytes, format 1, checksum bddcb726 ok
+unit: 149 bytes, format 1, checksum 6729269c ok
 widest stack 1, widest frame 0
 debug: line and column of each instruction
 
-imports (0): what the loading context must provide
+imports (0): functions the loading VM must provide
 globals (0)
 constants (1)
      0  "olá mundo"
@@ -21,11 +21,11 @@ fn 0 (entry "ola"): params 0, slots 0, stack 1, 2 bytes
   0001  58                     RET      0         return
 
 == dobro
-unit: 188 bytes, format 1, checksum 00a7c8dd ok
+unit: 201 bytes, format 1, checksum e099c62d ok
 widest stack 2, widest frame 1
 debug: line and column of each instruction
 
-imports (1): what the loading context must provide
+imports (1): functions the loading VM must provide
      0  *
 globals (1)
      0  dobro

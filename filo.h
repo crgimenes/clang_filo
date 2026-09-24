@@ -345,10 +345,21 @@ int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t
 int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
                      const uint8_t **unit, size_t *unit_len);
 
-/* Checks a unit and resolves its imports and globals by name against ctx.
-   The bytes are used in place and must outlive ctx: on a microcontroller
-   they stay in flash. */
+/* Checks a unit and resolves by name, against ctx, everything it needs
+   from outside itself: the functions it calls (a builtin, or a global
+   holding a function in Filo) and the globals it reads but never writes (a
+   value the host set, a function in Filo, or a builtin, bound to the
+   global). A name ctx does not have refuses the unit, all of them in one
+   message, as many as it holds: "missing (3): fg bg fill". The bytes are
+   used in place and must outlive ctx: on a microcontroller they stay in
+   flash. */
 int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out);
+
+/* As filo_bc_load, but a global the unit reads and ctx does not hold is
+   left to fail when the code reads it, as the interpreter fails: for
+   running a unit the way the interpreter runs its source (the corpus, the
+   differential fuzzer), not for installing a program. */
+int filo_bc_load_lazy(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out);
 
 /* Whether a loaded unit has an entry point of that name. */
 bool filo_bc_has(const filo_unit *unit, const char *entry);

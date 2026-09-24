@@ -43,6 +43,8 @@ typedef struct {
     uint32_t nimports;
     fbc_span globals[FBC_NAMES_MAX];
     uint32_t nglobals;
+    bool externs[FBC_NAMES_MAX]; /* globals read and never written: the VM's to provide */
+    uint32_t nexterns;
     uint32_t consts[FBC_CONSTS_MAX]; /* where each entry starts */
     uint32_t nconsts;
     fbc_fn fns[FBC_FNS_MAX];

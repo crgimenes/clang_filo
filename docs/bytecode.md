@@ -43,15 +43,30 @@ points (exports) — each program compiled into it is one, with a name — and
 the functions they create.
 
 Everything a unit refers to outside itself is by name, resolved when it is
-loaded:
+loaded against whatever the loading VM has, wherever a function comes from
+— the core, a library in C, the host, or Filo the VM loaded itself:
 
-- **Imports** are builtins, the core ones included, so that adding a
-  builtin to the core never renumbers anything. A name the loading context
-  does not have fails the load: `missing builtin: <name>`. The imports of a
-  unit are therefore its capability list.
+- **Imports** are the functions the unit calls that were builtins where it
+  was compiled, the core ones included, so that adding a builtin to the
+  core never renumbers anything. Each resolves to a builtin of that name,
+  or else to a global holding a function (the loading VM has it in Filo);
+  `CALLB` calls either.
 - **Globals** are names, resolved to the loading context's symbol table
-  (created when the table is open; a sealed table without the name fails
-  the load: `undefined global: <name>`).
+  (created when the table is open).
+- **Externs** are the globals the unit reads and never writes: a value the
+  host sets (`W`, `KEY`), or a function the unit did not define. Each must
+  be held by the loading context, or be a builtin of that name, which the
+  load binds to the global as a function value (the unit was compiled where
+  the name was a function in Filo).
+
+What the loading context lacks — an import, an extern, or any global when
+its table is sealed — refuses the load, all of it in one message, as many
+names as it holds: `missing (3): fg bg W`. The imports and the externs are
+therefore the unit's requirements, listed by `filo dump`: a VM runs the
+unit when it provides them, whatever else it lacks. A lazy load
+(`filo_bc_load_lazy`) leaves an extern the context does not hold to fail
+when it is read, as the interpreter fails; the corpus and the fuzzers load
+that way, programs being installed do not.
 
 Inside the unit everything is an index: constants, globals, imports,
 functions.
@@ -90,6 +105,7 @@ Sections, each at most once; unknown kinds are skipped:
 | 5 | code | the instruction bytes of every function |
 | 6 | exports | count, then per export: name, function index |
 | 7 | debug | where each instruction came from in the source (below); optional |
+| 8 | externs | count, then indices into the globals, rising: the ones the unit reads and never writes; optional |
 
 Constant tags: 1 number (8 bytes, IEEE 754 double), 2 string (length,
 bytes), 3 true, 4 false, 5 empty list.

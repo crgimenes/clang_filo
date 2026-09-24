@@ -956,6 +956,9 @@ struct filo_func {
     uint32_t nbody;
     frame *frame;
     const bc_fn *bc; /* set when the body is bytecode instead of IR */
+    /* set when a unit's global resolved to a builtin at load: the program
+       was compiled where the name was a function in Filo */
+    const filo_builtin_entry *builtin;
 };
 
 /* --------------------------------------------------------------- lowering */
@@ -1755,10 +1758,40 @@ static int ir_run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, ui
                        filo_value *out);
 #endif
 
+/* A builtin called by entry, its failure prefixed with its name as the
+   interpreter prefixes it. */
+static int call_entry(filo_ctx *ctx, const filo_builtin_entry *e, const filo_value *args,
+                      uint32_t n, filo_value *out) {
+    if (e->fn(ctx, args, n, out) != FILO_OK) {
+        if (ctx->signal == SIG_NONE) {
+            char prefix[FILO_ERROR_MAX];
+            size_t k = cstr_copy(prefix, sizeof(prefix), "in builtin \"");
+            k += cstr_copy(prefix + k, sizeof(prefix) - k, e->name);
+            (void)cstr_copy(prefix + k, sizeof(prefix) - k, "\": ");
+            (void)prefix_error(ctx, prefix);
+        }
+        return FILO_ERR;
+    }
+    return FILO_OK;
+}
+
+/* A builtin behind a global takes what its own arity check takes. */
+static bool arity_ok(const filo_func *fn, uint32_t n) {
+    if (fn->builtin != NULL) {
+        return true;
+    }
+    return fn->nparams == n;
+}
+
 /* The recursion counter was incremented by the caller; the callee releases
    it. */
 static int run_func(filo_ctx *ctx, const filo_func *fn, filo_value *slots, uint32_t n,
                     filo_value *out) {
+    if (fn->builtin != NULL) {
+        int rc = call_entry(ctx, fn->builtin, slots, n, out);
+        ctx->recursion--;
+        return rc;
+    }
 #ifndef FILO_VM_ONLY
     if (fn->bc == NULL) {
         return ir_run_func(ctx, fn, slots, n, out);
@@ -1773,7 +1806,7 @@ int filo_call(filo_ctx *ctx, const filo_value *fnv, const filo_value *args, uint
         return fail_expected(ctx, "func", fnv);
     }
     const filo_func *fn = fnv->u.fn;
-    if (fn->nparams != n) {
+    if (!arity_ok(fn, n)) {
         return fail_arity(ctx, fn->nparams, n);
     }
     if (enter_call(ctx) != FILO_OK) {
@@ -1932,7 +1965,7 @@ static int eval_call(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     }
     const filo_func *fn = fnv.u.fn;
     uint32_t n = in->nargs - 1;
-    if (fn->nparams != n) {
+    if (!arity_ok(fn, n)) {
         (void)fail_arity(ctx, fn->nparams, n);
         return wrap(ctx, "function call", FILO_ERR);
     }
@@ -2167,6 +2200,7 @@ static int eval_fn(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     fn->nbody = in->nargs;
     fn->frame = ctx->frame;
     fn->bc = NULL;
+    fn->builtin = NULL;
     memset(out, 0, sizeof(*out));
     out->kind = FILO_FUNC;
     out->u.fn = fn;
@@ -2587,6 +2621,7 @@ enum {
     BC_SEC_CODE,
     BC_SEC_EXPORTS,
     BC_SEC_DEBUG,
+    BC_SEC_EXTERNS,
 };
 
 enum {
@@ -2600,7 +2635,7 @@ enum {
 enum {
     BC_HEADER = 20,
     BC_SECTION = 12,
-    BC_SECTIONS = 7,
+    BC_SECTIONS = 8,
     BC_VERSION = 1,
     BC_KIND_UNIT = 1,
     BC_KIND_BUNDLE = 2,
@@ -2628,6 +2663,14 @@ struct bc_fn {
     uint32_t maxstack;
 };
 
+/* What an import resolved to when the unit was loaded: a builtin, or the
+   global that holds a function of that name (the program was compiled
+   where the name was a builtin; this VM has it in Filo). */
+typedef struct {
+    const filo_builtin_entry *builtin;
+    uint32_t sym; /* when builtin is NULL */
+} bc_imported;
+
 struct filo_unit {
     const uint8_t *code;
     uint32_t code_len;
@@ -2635,7 +2678,7 @@ struct filo_unit {
     uint32_t nconsts;
     uint32_t *globals; /* unit index to symbol id in the loading context */
     uint32_t nglobals;
-    const filo_builtin_entry **imports;
+    bc_imported *imports;
     uint32_t nimports;
     bc_fn *fns;
     uint32_t nfns;
@@ -2704,6 +2747,7 @@ typedef struct {
     filo_value consts[BC_CONSTS_MAX];
     uint32_t nconsts;
     uint32_t globals[FILO_SYMBOLS_MAX];
+    uint8_t gused[FILO_SYMBOLS_MAX]; /* BC_G_READ, BC_G_WRITTEN */
     uint32_t nglobals;
     const filo_builtin_entry *imports[FILO_BUILTINS_MAX];
     uint32_t nimports;
@@ -2903,6 +2947,18 @@ static uint32_t bc_global(bcc *c, uint32_t id) {
     c->globals[c->nglobals] = id;
     c->nglobals++;
     return c->nglobals - 1;
+}
+
+enum { BC_G_READ = 1, BC_G_WRITTEN = 2 };
+
+/* The unit's index of global id, marked as read or written: a global the
+   unit reads and never writes is an extern, which the loading VM provides. */
+static uint32_t bc_global_use(bcc *c, uint32_t id, uint8_t use) {
+    uint32_t g = bc_global(c, id);
+    if (!c->failed) {
+        c->gused[g] |= use;
+    }
+    return g;
 }
 
 static uint32_t bc_import(bcc *c, const char *name) {
@@ -3169,7 +3225,7 @@ static void bc_set(bcc *c, const filo_instr *in) {
         return;
     }
     if (target->op == OP_GLOBAL) {
-        bc_op(c, BC_STORE_G, bc_global(c, target->a));
+        bc_op(c, BC_STORE_G, bc_global_use(c, target->a, BC_G_WRITTEN));
         return;
     }
     bc_op(c, BC_POP, 1);
@@ -3193,7 +3249,7 @@ static void bc_def(bcc *c, const filo_instr *in) {
         bc_trap(c, why);
         return;
     }
-    bc_op(c, BC_STORE_G, bc_global(c, (uint32_t)id));
+    bc_op(c, BC_STORE_G, bc_global_use(c, (uint32_t)id, BC_G_WRITTEN));
 }
 
 static void bc_signal(bcc *c, const filo_instr *in, uint32_t exit) {
@@ -3248,7 +3304,7 @@ static void bc_node(bcc *c, const filo_instr *in) {
         bc_stack(c, 1);
         return;
     case OP_GLOBAL:
-        bc_op(c, BC_PUSH_G, bc_global(c, in->a));
+        bc_op(c, BC_PUSH_G, bc_global_use(c, in->a, BC_G_READ));
         bc_stack(c, 1);
         return;
     case OP_DYNAMIC:
@@ -3473,6 +3529,17 @@ static void bc_write(bcc *c, const filo_bc_entry *entries, uint32_t n, bc_out *o
     }
     off[6] = (uint32_t)o->len;
     out_bytes(o, c->dbg, c->dlen);
+    off[7] = (uint32_t)o->len;
+    uint32_t nexterns = 0;
+    for (uint32_t i = 0; i < c->nglobals; i++) {
+        nexterns += c->gused[i] == BC_G_READ ? 1U : 0U;
+    }
+    out_uleb(o, nexterns);
+    for (uint32_t i = 0; i < c->nglobals; i++) {
+        if (c->gused[i] == BC_G_READ) {
+            out_uleb(o, i);
+        }
+    }
     for (int i = 0; i < BC_SECTIONS - 1; i++) {
         len[i] = off[i + 1] - off[i];
     }
@@ -3750,42 +3817,165 @@ static void *bc_palloc(filo_ctx *ctx, size_t each, uint32_t n) {
     return palloc(ctx, each * n);
 }
 
-static int bc_load_names(filo_ctx *ctx, bc_rd *r, filo_unit *u, bool imports) {
+/* The names a unit needs and this context does not have, gathered so the
+   load can refuse with all of them at once: "missing (3): fg bg fill", as
+   many as the message holds. */
+typedef struct {
+    char text[FILO_ERROR_MAX];
+    size_t len;
+    uint32_t n;
+    bool cut;
+} bc_missing;
+
+enum { BC_MISSING_HEAD = 24 }; /* room for "missing (4294967295):" */
+
+static void bc_miss(bc_missing *m, const uint8_t *name, uint32_t len) {
+    m->n++;
+    if (m->cut) {
+        return;
+    }
+    if (m->len + 1 + len > sizeof(m->text) - BC_MISSING_HEAD - sizeof(" ...")) {
+        m->cut = true;
+        return;
+    }
+    m->text[m->len++] = ' ';
+    memcpy(m->text + m->len, name, len);
+    m->len += len;
+    m->text[m->len] = '\0';
+}
+
+static int bc_refuse(filo_ctx *ctx, const bc_missing *m) {
+    char msg[FILO_ERROR_MAX];
+    char num[16];
+    size_t d = 0;
+    for (uint32_t v = m->n; v > 0 || d == 0; v /= 10U) {
+        num[d++] = (char)('0' + (v % 10U));
+    }
+    size_t k = cstr_copy(msg, sizeof(msg), "missing (");
+    while (d > 0) {
+        msg[k++] = num[--d];
+    }
+    msg[k] = '\0';
+    k += cstr_copy(msg + k, sizeof(msg) - k, "):");
+    k += cstr_copy(msg + k, sizeof(msg) - k, m->text);
+    if (m->cut) {
+        (void)cstr_copy(msg + k, sizeof(msg) - k, " ...");
+    }
+    return filo_fail(ctx, msg);
+}
+
+/* A symbol already in the context, without making one. */
+static int32_t symbol_find(const filo_ctx *ctx, const uint8_t *ptr, uint32_t len) {
+    for (uint32_t i = 0; i < ctx->nsymbols; i++) {
+        if (cname_eq(ctx->symbols[i], ptr, len)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+/* Imports: each a builtin, or else a global holding a function. */
+static int bc_load_imports(filo_ctx *ctx, bc_rd *r, filo_unit *u, bc_missing *m) {
     uint32_t n = rd_uleb(r);
-    uint32_t max = imports ? FILO_BUILTINS_MAX : FILO_SYMBOLS_MAX;
-    if (r->bad || n > max) {
-        return bc_bad(ctx, imports ? "imports" : "globals");
+    if (r->bad || n > FILO_BUILTINS_MAX) {
+        return bc_bad(ctx, "imports");
     }
-    if (imports) {
-        u->imports = (const filo_builtin_entry **)bc_palloc(ctx, sizeof(*u->imports), n);
-        u->nimports = n;
-    } else {
-        u->globals = bc_palloc(ctx, sizeof(*u->globals), n);
-        u->nglobals = n;
-    }
-    if (n > 0 && (imports ? (void *)u->imports : (void *)u->globals) == NULL) {
+    u->imports = bc_palloc(ctx, sizeof(*u->imports), n);
+    u->nimports = n;
+    if (n > 0 && u->imports == NULL) {
         return FILO_ERR;
     }
     for (uint32_t i = 0; i < n; i++) {
         filo_str name = rd_name(r);
         if (r->bad) {
-            return bc_bad(ctx, imports ? "imports" : "globals");
+            return bc_bad(ctx, "imports");
         }
-        char text[BC_NAME_MAX + 1];
-        memcpy(text, name.ptr, name.len);
-        text[name.len] = '\0';
-        if (imports) {
-            u->imports[i] = builtin_by_name(ctx, name.ptr, name.len);
-            if (u->imports[i] == NULL) {
-                return filo_fail2(ctx, "missing builtin: ", text);
-            }
+        u->imports[i].builtin = builtin_by_name(ctx, name.ptr, name.len);
+        u->imports[i].sym = 0;
+        if (u->imports[i].builtin != NULL) {
             continue;
         }
+        int32_t id = symbol_find(ctx, name.ptr, name.len);
+        if (id >= 0 && ctx->defined[id] && ctx->globals[id].kind == FILO_FUNC) {
+            u->imports[i].sym = (uint32_t)id;
+            continue;
+        }
+        bc_miss(m, name.ptr, name.len);
+    }
+    return FILO_OK;
+}
+
+static int bc_load_globals(filo_ctx *ctx, bc_rd *r, filo_unit *u, bc_missing *m) {
+    uint32_t n = rd_uleb(r);
+    if (r->bad || n > FILO_SYMBOLS_MAX) {
+        return bc_bad(ctx, "globals");
+    }
+    u->globals = bc_palloc(ctx, sizeof(*u->globals), n);
+    u->nglobals = n;
+    if (n > 0 && u->globals == NULL) {
+        return FILO_ERR;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        filo_str name = rd_name(r);
+        if (r->bad) {
+            return bc_bad(ctx, "globals");
+        }
         int32_t id = symbol_id(ctx, name.ptr, name.len);
+        if (id < 0 && ctx->sealed) {
+            clear_error(ctx);
+            bc_miss(m, name.ptr, name.len); /* a sealed context makes no new names */
+            u->globals[i] = UINT32_MAX;
+            continue;
+        }
         if (id < 0) {
-            return filo_fail2(ctx, "undefined global: ", text);
+            return FILO_ERR;
         }
         u->globals[i] = (uint32_t)id;
+    }
+    return FILO_OK;
+}
+
+/* Externs: the globals the unit reads and never writes, which the loading
+   context holds — a value the host set, a function in Filo, or a builtin of
+   that name, bound to the global here. Lazy, one it does not hold is left
+   to fail when read, as the interpreter fails. */
+static int bc_load_externs(filo_ctx *ctx, bc_rd *r, filo_unit *u, bool lazy, bc_missing *m) {
+    uint32_t n = rd_uleb(r);
+    if (r->bad || n > u->nglobals) {
+        return bc_bad(ctx, "externs");
+    }
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t g = rd_uleb(r);
+        if (r->bad || g >= u->nglobals || (i > 0 && g <= last)) {
+            return bc_bad(ctx, "externs");
+        }
+        last = g;
+        uint32_t id = u->globals[g];
+        if (id == UINT32_MAX || ctx->defined[id]) {
+            continue; /* held, or already missing */
+        }
+        const char *name = ctx->symbols[id];
+        const filo_builtin_entry *b =
+            builtin_by_name(ctx, (const uint8_t *)name, (uint32_t)strlen(name));
+        if (b != NULL) {
+            filo_func *fn = palloc(ctx, sizeof(filo_func));
+            if (fn == NULL) {
+                return FILO_ERR;
+            }
+            memset(fn, 0, sizeof(*fn));
+            fn->builtin = b;
+            filo_value v;
+            memset(&v, 0, sizeof(v));
+            v.kind = FILO_FUNC;
+            v.u.fn = fn;
+            ctx->globals[id] = v;
+            ctx->defined[id] = true;
+            continue;
+        }
+        if (!lazy) {
+            bc_miss(m, (const uint8_t *)name, (uint32_t)strlen(name));
+        }
     }
     return FILO_OK;
 }
@@ -3941,7 +4131,8 @@ int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char 
     return FILO_OK;
 }
 
-int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out) {
+static int bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, bool lazy,
+                   const filo_unit **out) {
     clear_error(ctx);
     *out = NULL;
     if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C') {
@@ -3995,15 +4186,33 @@ int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit
         u->debug = sec[BC_SEC_DEBUG].p;
         u->debug_len = (uint32_t)(sec[BC_SEC_DEBUG].end - sec[BC_SEC_DEBUG].p);
     }
-    if ((have[BC_SEC_IMPORTS] && bc_load_names(ctx, &sec[BC_SEC_IMPORTS], u, true) != FILO_OK) ||
-        (have[BC_SEC_GLOBALS] && bc_load_names(ctx, &sec[BC_SEC_GLOBALS], u, false) != FILO_OK) ||
+    bc_missing m;
+    m.len = 0;
+    m.n = 0;
+    m.cut = false;
+    m.text[0] = '\0';
+    if ((have[BC_SEC_IMPORTS] && bc_load_imports(ctx, &sec[BC_SEC_IMPORTS], u, &m) != FILO_OK) ||
+        (have[BC_SEC_GLOBALS] && bc_load_globals(ctx, &sec[BC_SEC_GLOBALS], u, &m) != FILO_OK) ||
+        (have[BC_SEC_EXTERNS] &&
+         bc_load_externs(ctx, &sec[BC_SEC_EXTERNS], u, lazy, &m) != FILO_OK) ||
         (have[BC_SEC_CONSTANTS] && bc_load_consts(ctx, &sec[BC_SEC_CONSTANTS], u) != FILO_OK) ||
         bc_load_fns(ctx, &sec[BC_SEC_FUNCTIONS], u) != FILO_OK ||
         bc_load_exports(ctx, &sec[BC_SEC_EXPORTS], u) != FILO_OK) {
         return FILO_ERR;
     }
+    if (m.n > 0) {
+        return bc_refuse(ctx, &m);
+    }
     *out = u;
     return FILO_OK;
+}
+
+int filo_bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out) {
+    return bc_load(ctx, data, len, false, out);
+}
+
+int filo_bc_load_lazy(filo_ctx *ctx, const uint8_t *data, size_t len, const filo_unit **out) {
+    return bc_load(ctx, data, len, true, out);
 }
 
 /* ---- the machine ---- */
@@ -4151,40 +4360,12 @@ static int vm_jump(filo_ctx *ctx, bc_act *a, uint32_t cond, uint32_t end) {
     return FILO_OK;
 }
 
-static int vm_callb(filo_ctx *ctx, bc_act *a, uint32_t argc, uint32_t end) {
-    const filo_unit *u = a->fn->unit;
-    uint32_t idx = 0;
-    if (!vm_uleb(u->code, end, &a->pc, &idx) || idx >= u->nimports) {
-        return filo_fail(ctx, "bytecode: a builtin outside the imports");
-    }
-    if (vm_need(ctx, a, argc) != FILO_OK) {
-        return FILO_ERR;
-    }
-    const filo_builtin_entry *e = u->imports[idx];
-    filo_value r;
-    memset(&r, 0, sizeof(r));
-    if (e->fn(ctx, &a->stack[a->sp - argc], argc, &r) != FILO_OK) {
-        if (ctx->signal == SIG_NONE) {
-            char prefix[FILO_ERROR_MAX];
-            size_t k = cstr_copy(prefix, sizeof(prefix), "in builtin \"");
-            k += cstr_copy(prefix + k, sizeof(prefix) - k, e->name);
-            (void)cstr_copy(prefix + k, sizeof(prefix) - k, "\": ");
-            (void)prefix_error(ctx, prefix);
-        }
-        return FILO_ERR;
-    }
-    a->sp -= argc;
-    return vm_push(ctx, a, r);
-}
-
-/* A call to a function value: bytecode gets a new activation and the
-   machine moves into it; an IR function runs through filo_call. */
-static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
+/* A call to a function value with argc arguments on top of the stack, and
+   drop values to take off when it returns (the arguments, and the function
+   itself when it was on the stack too): bytecode gets a new activation and
+   the machine moves into it; anything else runs through filo_call. */
+static int vm_invoke(filo_ctx *ctx, bc_act **ap, filo_value fnv, uint32_t argc, uint32_t drop) {
     bc_act *a = *ap;
-    if (vm_need(ctx, a, argc + 1) != FILO_OK) {
-        return FILO_ERR;
-    }
-    filo_value fnv = a->stack[a->sp - argc - 1];
     if (fnv.kind != FILO_FUNC) {
         char msg[64];
         size_t k = cstr_copy(msg, sizeof(msg), "attempt to call non-function (got ");
@@ -4200,7 +4381,7 @@ static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
         if (filo_call(ctx, &fnv, args, argc, &r) != FILO_OK) {
             return FILO_ERR;
         }
-        a->sp -= argc + 1;
+        a->sp -= drop;
         return vm_push(ctx, a, r);
     }
     if (fn->bc->nparams != argc) {
@@ -4216,12 +4397,47 @@ static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
         ctx->recursion--;
         return FILO_ERR;
     }
-    a->sp -= argc + 1;
+    a->sp -= drop;
     n->caller = a;
     n->mark = mark;
     n->escapes = escapes;
     *ap = n;
     return FILO_OK;
+}
+
+static int vm_callb(filo_ctx *ctx, bc_act **ap, uint32_t argc, uint32_t end) {
+    bc_act *a = *ap;
+    const filo_unit *u = a->fn->unit;
+    uint32_t idx = 0;
+    if (!vm_uleb(u->code, end, &a->pc, &idx) || idx >= u->nimports) {
+        return filo_fail(ctx, "bytecode: a builtin outside the imports");
+    }
+    if (vm_need(ctx, a, argc) != FILO_OK) {
+        return FILO_ERR;
+    }
+    const bc_imported *imp = &u->imports[idx];
+    if (imp->builtin == NULL) {
+        if (!ctx->defined[imp->sym]) {
+            return filo_fail2(ctx, "undefined global: ", ctx->symbols[imp->sym]);
+        }
+        return vm_invoke(ctx, ap, ctx->globals[imp->sym], argc, argc);
+    }
+    filo_value r;
+    memset(&r, 0, sizeof(r));
+    if (call_entry(ctx, imp->builtin, &a->stack[a->sp - argc], argc, &r) != FILO_OK) {
+        return FILO_ERR;
+    }
+    a->sp -= argc;
+    return vm_push(ctx, a, r);
+}
+
+/* A call to a function value below its arguments on the stack. */
+static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
+    const bc_act *a = *ap;
+    if (vm_need(ctx, a, argc + 1) != FILO_OK) {
+        return FILO_ERR;
+    }
+    return vm_invoke(ctx, ap, a->stack[a->sp - argc - 1], argc, argc + 1);
 }
 
 static int vm_closure(filo_ctx *ctx, bc_act *a, uint32_t idx) {
@@ -4440,7 +4656,8 @@ static int vm_loop(filo_ctx *ctx, const bc_act *base, bc_act **cur, bool pausabl
             *cur = a;
             break;
         case BC_CALLB:
-            rc = vm_callb(ctx, a, x, end);
+            rc = vm_callb(ctx, &a, x, end);
+            *cur = a;
             break;
         case BC_RET: {
             if (vm_need(ctx, a, 1) != FILO_OK) {

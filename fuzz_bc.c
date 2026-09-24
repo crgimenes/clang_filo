@@ -83,7 +83,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         fbc_dump(&listing, discard, NULL);
     }
     const filo_unit *u = NULL;
-    if (filo_bc_load(&ctx, code, code_len, &u) != FILO_OK) {
+    (void)filo_bc_load(&ctx, code, code_len, &u); /* the refusal, and its list of names */
+    if (filo_bc_load_lazy(&ctx, code, code_len, &u) != FILO_OK) {
         return 0;
     }
     filo_limits limits = {20000U, 64U};
@@ -108,7 +109,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
               sizeof(run_mem));
     (void)filo_math_register(&ctx, &filo_libc_math);
     (void)filo_strings_register(&ctx, &filo_libc_strings);
-    if (filo_bc_load(&ctx, code, code_len, &u) != FILO_OK) {
+    if (filo_bc_load_lazy(&ctx, code, code_len, &u) != FILO_OK) {
         __builtin_trap(); /* it loaded a moment ago */
     }
     uint32_t budget = 1U + (uint32_t)(size % 5U);

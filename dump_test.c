@@ -108,7 +108,8 @@ static void test_units_list_and_agree_with_the_loader(const char *dir) {
         (void)filo_math_register(&ctx, &filo_libc_math);
         (void)filo_strings_register(&ctx, &filo_libc_strings);
         const filo_unit *u = NULL;
-        CHECK(filo_bc_load(&ctx, data, len, &u) == FILO_OK);
+        CHECK(filo_bc_load_lazy(&ctx, data, len, &u) ==
+              FILO_OK); /* corpus units: as the interpreter */
         for (uint32_t i = 0; i < unit.nexports; i++) {
             char name[256];
             fbc_span s = unit.export_names[i];
