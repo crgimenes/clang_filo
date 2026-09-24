@@ -345,6 +345,12 @@ int filo_bundle_build(filo_ctx *ctx, const filo_bundle_member *members, uint32_t
 int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
                      const uint8_t **unit, size_t *unit_len);
 
+/* The same, by position: member index of the bundle, its name (bytes in
+   data) and its unit; *count says how many there are. For listing a
+   bundle, or taking the only member of one renamed on its way here. */
+int filo_bundle_at(filo_ctx *ctx, const uint8_t *data, size_t len, uint32_t index, uint32_t *count,
+                   filo_str *name, const uint8_t **unit, size_t *unit_len);
+
 /* Checks a unit and resolves by name, against ctx, everything it needs
    from outside itself: the functions it calls (a builtin, or a global
    holding a function in Filo) and the globals it reads but never writes (a

@@ -369,6 +369,41 @@ static void test_bc_declares_without_loading(void) {
     CHECK(!filo_bc_declares(unit_buf, len, "e0"));
 }
 
+/* A full arena says which one and how big it is: what a board refusing a
+   program would need to tell. */
+static void test_out_of_memory_names_the_arena(void) {
+    static uint8_t small_run[4096];
+    filo_init(&CTX, &filo_libc_host, persistent_mem, sizeof(persistent_mem), small_run,
+              sizeof(small_run));
+    filo_value v;
+    CHECK(run("(map (fn (i) (list i i i i)) (range 10000))", &v) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "out of memory: the run arena (4 KB) is full") != NULL);
+}
+
+/* A bundle's members by position: a listing, or the only member of a
+   bundle renamed on its way somewhere. */
+static void test_bundle_members_by_position(void) {
+    start();
+    const char *one[] = {"1"};
+    size_t len = build(one, 1);
+    static uint8_t first[4096];
+    memcpy(first, unit_buf, len);
+    const char *two[] = {"2"};
+    size_t len2 = build(two, 1);
+    filo_bundle_member m[2] = {{"alpha", first, len}, {"beta", unit_buf, len2}};
+    static uint8_t bundle[16384];
+    size_t blen = 0;
+    CHECK(filo_bundle_build(&CTX, m, 2, bundle, sizeof(bundle), &blen) == FILO_OK);
+    uint32_t count = 0;
+    filo_str name = {NULL, 0};
+    const uint8_t *unit = NULL;
+    size_t ulen = 0;
+    CHECK(filo_bundle_at(&CTX, bundle, blen, 1, &count, &name, &unit, &ulen) == FILO_OK);
+    CHECK(count == 2 && name.len == 4 && memcmp(name.ptr, "beta", 4) == 0 && ulen == len2);
+    CHECK(filo_bundle_at(&CTX, bundle, blen, 2, &count, &name, &unit, &ulen) == FILO_ERR);
+    CHECK(count == 2);
+}
+
 /* Entry points of one unit share its globals, as a screen's hooks share
    what its init defined. */
 static void test_bc_entries_share_globals(void) {
@@ -624,6 +659,8 @@ int main(void) {
     test_bc_missing_builtin_fails_the_load();
     test_bc_load_names_all_that_is_missing();
     test_bc_declares_without_loading();
+    test_bundle_members_by_position();
+    test_out_of_memory_names_the_arena();
     test_bc_globals_read_only_are_externs();
     test_bc_functions_resolve_whatever_their_origin();
     test_bc_entries_share_globals();

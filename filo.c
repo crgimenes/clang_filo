@@ -29,10 +29,45 @@ static void arena_reset(filo_arena *a) {
 
 /* Every allocation that fails ends the current operation with this
    message; callers check for NULL and return FILO_ERR. */
+/* Which arena is full and how big it is, so a board that refuses a program
+   says what it would take: "out of memory: the run arena (64 KB) is full". */
+static void fail_memory(filo_ctx *ctx, const char *which, size_t cap) {
+    char msg[96];
+    char num[24];
+    size_t k = 0;
+    const char *unit = " bytes";
+    if (cap >= 1024 && cap % 1024 == 0) {
+        cap /= 1024;
+        unit = " KB";
+    }
+    size_t d = 0;
+    do {
+        num[d++] = (char)('0' + (cap % 10));
+        cap /= 10;
+    } while (cap > 0 && d < sizeof(num));
+    const char *parts[] = {"out of memory: the ", which, " arena ("};
+    for (size_t i = 0; i < 3; i++) {
+        for (const char *c = parts[i]; *c != '\0'; c++) {
+            msg[k++] = *c;
+        }
+    }
+    while (d > 0) {
+        msg[k++] = num[--d];
+    }
+    for (const char *c = unit; *c != '\0'; c++) {
+        msg[k++] = *c;
+    }
+    for (const char *c = ") is full"; *c != '\0'; c++) {
+        msg[k++] = *c;
+    }
+    msg[k] = '\0';
+    (void)filo_fail(ctx, msg);
+}
+
 static void *ralloc(filo_ctx *ctx, size_t n) {
     void *p = arena_alloc(&ctx->run, n);
     if (p == NULL) {
-        (void)filo_fail(ctx, "out of memory");
+        fail_memory(ctx, "run", ctx->run.cap);
     }
     return p;
 }
@@ -40,7 +75,7 @@ static void *ralloc(filo_ctx *ctx, size_t n) {
 static void *palloc(filo_ctx *ctx, size_t n) {
     void *p = arena_alloc(&ctx->persistent, n);
     if (p == NULL) {
-        (void)filo_fail(ctx, "out of memory");
+        fail_memory(ctx, "persistent", ctx->persistent.cap);
     }
     return p;
 }
@@ -4082,10 +4117,11 @@ static int bc_load_exports(filo_ctx *ctx, bc_rd *r, filo_unit *u) {
 }
 
 /* Checks a whole bundle — its checksum, its table, every member inside the
-   file on its alignment — and finds one member by name. The member is
-   still a unit to load: filo_bc_load checks it again, as any unit. */
-int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
-                     const uint8_t **unit, size_t *unit_len) {
+   file on its alignment — and picks the member named name, or when name is
+   NULL the one at index. */
+static int bundle_scan(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
+                       uint32_t index, uint32_t *count, filo_str *name_out, const uint8_t **unit,
+                       size_t *unit_len) {
     clear_error(ctx);
     *unit = NULL;
     *unit_len = 0;
@@ -4105,7 +4141,7 @@ int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char 
     if (bc_checksum(data, len) != get_u32(data + 8)) {
         return filo_fail(ctx, "bytecode: the checksum does not match (a damaged bundle)");
     }
-    size_t want = strlen(name);
+    size_t want = name != NULL ? strlen(name) : 0;
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *e = data + BC_HEADER + ((size_t)i * BC_MEMBER);
         uint32_t off = get_u32(e);
@@ -4120,15 +4156,39 @@ int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char 
         if (r.bad || s.len == 0) {
             return bc_bad(ctx, "bundle table");
         }
-        if (*unit == NULL && s.len == want && memcmp(s.ptr, name, want) == 0) {
+        bool pick = i == index;
+        if (name != NULL) {
+            pick = false;
+            if (s.len == want) {
+                pick = memcmp(s.ptr, name, want) == 0;
+            }
+        }
+        if (*unit == NULL && pick) {
             *unit = data + off;
             *unit_len = mlen;
+            if (name_out != NULL) {
+                *name_out = s;
+            }
         }
     }
+    if (count != NULL) {
+        *count = n;
+    }
     if (*unit == NULL) {
-        return filo_fail2(ctx, "bytecode: no bundle member named ", name);
+        return name != NULL ? filo_fail2(ctx, "bytecode: no bundle member named ", name)
+                            : filo_fail(ctx, "bytecode: no bundle member at that index");
     }
     return FILO_OK;
+}
+
+int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char *name,
+                     const uint8_t **unit, size_t *unit_len) {
+    return bundle_scan(ctx, data, len, name, 0, NULL, NULL, unit, unit_len);
+}
+
+int filo_bundle_at(filo_ctx *ctx, const uint8_t *data, size_t len, uint32_t index, uint32_t *count,
+                   filo_str *name, const uint8_t **unit, size_t *unit_len) {
+    return bundle_scan(ctx, data, len, NULL, index, count, name, unit, unit_len);
 }
 
 /* The header and the section table of a unit, checked: where each section
