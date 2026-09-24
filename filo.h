@@ -30,7 +30,6 @@ enum {
 
 enum {
     FILO_ERROR_MAX = 256,
-    FILO_BUILTINS_MAX = 96,
     FILO_STEP_LIMIT_DEFAULT = 100000,
     FILO_RECURSION_LIMIT_DEFAULT = 128,
     FILO_RANGE_MAX = 1048576,   /* 2^20 elements; same ceiling as the Go runtime */
@@ -38,6 +37,14 @@ enum {
                                    configuration, not part of the language */
     FILO_EVAL_DEPTH_MAX = 512,  /* nesting of eval() calls: bounds the C stack */
 };
+
+/* Builtins a context can hold: the core's 31, the packs', and a host's.
+   Each costs 16 bytes in every context on a 64-bit machine (8 on 32).
+   Registering past it fails, so a host that ignores the result loses the
+   builtin without a word — size it to what the host registers. */
+#ifndef FILO_BUILTINS_MAX
+#define FILO_BUILTINS_MAX 128
+#endif
 
 /* Globals a context can name. Each costs about 40 bytes on a 32-bit target
    in every context (the value, its saved copy, the name, three flags), so a
