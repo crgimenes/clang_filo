@@ -4131,41 +4131,47 @@ int filo_bundle_find(filo_ctx *ctx, const uint8_t *data, size_t len, const char 
     return FILO_OK;
 }
 
-static int bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, bool lazy,
-                   const filo_unit **out) {
-    clear_error(ctx);
-    *out = NULL;
+/* The header and the section table of a unit, checked: where each section
+   is, or what is wrong with them. */
+typedef enum {
+    BC_TABLE_OK,
+    BC_TABLE_NOT_UNIT,
+    BC_TABLE_VERSION,
+    BC_TABLE_HEADER,
+    BC_TABLE_CHECKSUM,
+    BC_TABLE_SECTIONS,
+} bc_table_result;
+
+static bc_table_result bc_table(const uint8_t *data, size_t len, bc_rd *sec, bool *have) {
     if (len < BC_HEADER || data[0] != 0x7F || data[1] != 'F' || data[2] != 'B' || data[3] != 'C') {
-        return filo_fail(ctx, "bytecode: not a Filo unit");
+        return BC_TABLE_NOT_UNIT;
     }
     if (data[4] != BC_KIND_UNIT || data[5] != BC_VERSION) {
-        return filo_fail(ctx, "bytecode: a kind or version this runtime does not read");
+        return BC_TABLE_VERSION;
     }
     uint32_t hsize = get_u16(data + 6);
     uint32_t nsec = get_u16(data + 16);
     if (hsize < BC_HEADER || hsize > len || nsec > 64 ||
         (size_t)BC_HEADER + ((size_t)nsec * BC_SECTION) > hsize) {
-        return bc_bad(ctx, "header");
+        return BC_TABLE_HEADER;
     }
     if (bc_checksum(data, len) != get_u32(data + 8)) {
-        return filo_fail(ctx, "bytecode: the checksum does not match (a damaged unit)");
+        return BC_TABLE_CHECKSUM;
     }
-    bc_rd sec[BC_SECTIONS + 1];
-    bool have[BC_SECTIONS + 1];
-    memset(have, 0, sizeof(have));
+    memset(have, 0, sizeof(bool) * (BC_SECTIONS + 1));
     for (uint32_t i = 0; i < nsec; i++) {
         const uint8_t *e = data + BC_HEADER + ((size_t)i * BC_SECTION);
         uint32_t kind = get_u16(e);
         uint32_t off = get_u32(e + 4);
         uint32_t n = get_u32(e + 8);
         if (off < hsize || off > len || n > len - off) {
-            return bc_bad(ctx, "section table");
+            return BC_TABLE_SECTIONS;
         }
         if (kind < 1 || kind > BC_SECTIONS) {
             continue; /* a kind from a later version: skipped */
         }
         if (have[kind]) {
-            return bc_bad(ctx, "section table");
+            return BC_TABLE_SECTIONS;
         }
         have[kind] = true;
         sec[kind].p = data + off;
@@ -4173,6 +4179,47 @@ static int bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, bool lazy,
         sec[kind].bad = false;
     }
     if (!have[BC_SEC_CODE] || !have[BC_SEC_FUNCTIONS] || !have[BC_SEC_EXPORTS]) {
+        return BC_TABLE_SECTIONS;
+    }
+    return BC_TABLE_OK;
+}
+
+bool filo_bc_declares(const uint8_t *data, size_t len, const char *entry) {
+    bc_rd sec[BC_SECTIONS + 1];
+    bool have[BC_SECTIONS + 1];
+    if (bc_table(data, len, sec, have) != BC_TABLE_OK) {
+        return false;
+    }
+    bc_rd *r = &sec[BC_SEC_EXPORTS];
+    uint32_t n = rd_uleb(r);
+    for (uint32_t i = 0; i < n && !r->bad; i++) {
+        filo_str name = rd_name(r);
+        (void)rd_uleb(r);
+        if (!r->bad && name.ptr != NULL && cname_eq(entry, name.ptr, name.len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, bool lazy,
+                   const filo_unit **out) {
+    clear_error(ctx);
+    *out = NULL;
+    bc_rd sec[BC_SECTIONS + 1];
+    bool have[BC_SECTIONS + 1];
+    switch (bc_table(data, len, sec, have)) {
+    case BC_TABLE_OK:
+        break;
+    case BC_TABLE_NOT_UNIT:
+        return filo_fail(ctx, "bytecode: not a Filo unit");
+    case BC_TABLE_VERSION:
+        return filo_fail(ctx, "bytecode: a kind or version this runtime does not read");
+    case BC_TABLE_HEADER:
+        return bc_bad(ctx, "header");
+    case BC_TABLE_CHECKSUM:
+        return filo_fail(ctx, "bytecode: the checksum does not match (a damaged unit)");
+    case BC_TABLE_SECTIONS:
         return bc_bad(ctx, "section table");
     }
     filo_unit *u = palloc(ctx, sizeof(filo_unit));

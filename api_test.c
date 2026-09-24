@@ -354,6 +354,21 @@ static void test_bc_functions_resolve_whatever_their_origin(void) {
     CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.u.num == 42);
 }
 
+/* What a unit declares is read without loading it: a context lacking what
+   it imports can still tell a command from an app. */
+static void test_bc_declares_without_loading(void) {
+    start();
+    CHECK(filo_register_builtin(&CTX, "twice", twice) == FILO_OK);
+    const char *src[] = {"(twice 1)", "2"};
+    size_t len = build(src, 2);
+    start(); /* no twice here: the load would refuse */
+    CHECK(filo_bc_declares(unit_buf, len, "e0"));
+    CHECK(filo_bc_declares(unit_buf, len, "e1"));
+    CHECK(!filo_bc_declares(unit_buf, len, "main"));
+    unit_buf[len - 1] ^= 1U; /* damaged: nothing is declared */
+    CHECK(!filo_bc_declares(unit_buf, len, "e0"));
+}
+
 /* Entry points of one unit share its globals, as a screen's hooks share
    what its init defined. */
 static void test_bc_entries_share_globals(void) {
@@ -608,6 +623,7 @@ int main(void) {
     test_bc_refuses_a_damaged_unit();
     test_bc_missing_builtin_fails_the_load();
     test_bc_load_names_all_that_is_missing();
+    test_bc_declares_without_loading();
     test_bc_globals_read_only_are_externs();
     test_bc_functions_resolve_whatever_their_origin();
     test_bc_entries_share_globals();

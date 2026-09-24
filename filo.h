@@ -364,6 +364,12 @@ int filo_bc_load_lazy(filo_ctx *ctx, const uint8_t *data, size_t len, const filo
 /* Whether a loaded unit has an entry point of that name. */
 bool filo_bc_has(const filo_unit *unit, const char *entry);
 
+/* Whether the unit in data declares an entry point of that name, read from
+   its exports without loading it: nothing is resolved, so it answers for a
+   unit this context could not run (which kind of program it is). False for
+   a damaged unit too. */
+bool filo_bc_declares(const uint8_t *data, size_t len, const char *entry);
+
 /* Runs an entry point for at most budget instructions (0: no budget). When
    they run out it returns FILO_PAUSED with the run held in ctx, calls and
    all, and filo_bc_resume goes on from there with another budget; the end
