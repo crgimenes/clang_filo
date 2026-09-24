@@ -142,6 +142,14 @@ errors.txt	error not raised on the happy path	11
 functions.txt	identity	4
 functions.txt	no parameters	3
 functions.txt	body is a sequence	8
+functions.txt	builtin is a function value	2
+functions.txt	builtin passed as an argument	6
+functions.txt	builtin mapped over a list	5
+functions.txt	builtin as a value is the same value every time	3
+functions.txt	builtin as a value differs from another builtin	3
+functions.txt	builtin stored in a global and called	7
+functions.txt	builtin chosen by an expression and called	1
+functions.txt	builtin as a value keeps each call's arguments apart	5
 functions.txt	function is a value	2
 functions.txt	function stored in a global	9
 functions.txt	function stored in a local	8

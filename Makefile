@@ -13,7 +13,7 @@ ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
 TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix
 
-.PHONY: steps-regen all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -113,6 +113,12 @@ cli-regen: build/filo build/cli/demo.fbb
 # Needs the Go checkout beside this one, as oracle-regen does.
 steps-regen:
 	cd tools/gosteps && GOFLAGS=-mod=mod go run . $(addprefix ../../,$(CORPUS)) > ../../testdata/steps.txt
+
+# The units the device build runs, run again on the Go engine's machine: the
+# same result, error and place on every one. Needs the Go checkout beside
+# this one, as steps-regen does, so it is not part of qa.
+govm: device
+	cd tools/govm && GOFLAGS=-mod=mod go run . ../../build/units
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:

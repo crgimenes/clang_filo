@@ -291,7 +291,8 @@ static bool eval_into(filo_ctx *dst, const char *global, const char *expr, int g
 }
 
 /* What the run gave, in the form device_test reads back: its limits, the
-   names of its given values in order, "result <repr>" or "error", and
+   names of its given values in order, "result <repr>" or "error" (with
+   "at L:C" when the error says where), and
    "global <name> <repr>" for each global the case checks. */
 static void write_expect(filo_ctx *ctx, const corpus_case *c, const filo_value *got) {
     static char text[TEXT_MAX];
@@ -305,7 +306,11 @@ static void write_expect(filo_ctx *ctx, const corpus_case *c, const filo_value *
     for (int i = 0; i < c->ngiven && n < sizeof(text); i++) {
         n += (size_t)snprintf(text + n, sizeof(text) - n, "given %s\n", c->given[i].name);
     }
-    if (got == NULL) {
+    uint32_t line = 0;
+    uint32_t col = 0;
+    if (got == NULL && filo_error_at(ctx, &line, &col)) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "error at %u:%u\n", line, col);
+    } else if (got == NULL) {
         n += (size_t)snprintf(text + n, sizeof(text) - n, "error\n");
     } else if (filo_value_repr(ctx, got, repr, sizeof(repr), &len) == FILO_OK && n < sizeof(text) &&
                len < sizeof(repr)) {

@@ -131,6 +131,7 @@ typedef struct {
 typedef struct {
     const char *name;
     filo_builtin fn;
+    filo_func *value; /* the builtin as a value, made the first time a script asks */
 } filo_builtin_entry;
 
 #ifndef FILO_VM_ONLY

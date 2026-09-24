@@ -94,9 +94,19 @@ static bool same_repr(filo_ctx *ctx, const filo_value *v, const char *want) {
 
 static bool check(filo_ctx *ctx, char *line, bool ok, const filo_value *got, char *why,
                   size_t cap) {
-    if (strcmp(line, "error") == 0) {
+    if (strncmp(line, "error", 5) == 0) {
         if (ok) {
             snprintf(why, cap, "expected an error");
+            return false;
+        }
+        uint32_t at_line = 0;
+        uint32_t at_col = 0;
+        char at[32] = "error";
+        if (filo_error_at(ctx, &at_line, &at_col)) {
+            snprintf(at, sizeof(at), "error at %u:%u", at_line, at_col);
+        }
+        if (strcmp(line, at) != 0) {
+            snprintf(why, cap, "%s, want %s (%s)", at, line, filo_error(ctx));
             return false;
         }
         return true;

@@ -392,7 +392,11 @@ static void region_release(filo_ctx *ctx, size_t mark, filo_value *out) {
         size_t top = ctx->run.used;
         filo_value copy = {0};
         if (!region_copy(ctx, out, &copy, 0)) {
-            ctx->run.used = top; /* could not: the region stays as it was */
+            /* could not: the region stays as it was, and the run goes on as
+               if nothing was tried — the failed allocation's message must not
+               outlive it (this runs only where nothing has failed) */
+            ctx->run.used = top;
+            clear_error(ctx);
             return;
         }
         size_t size = ctx->run.used - top;
@@ -1059,6 +1063,26 @@ static const filo_builtin_entry *builtin_by_name(const filo_ctx *ctx, const uint
         }
     }
     return NULL;
+}
+
+/* The builtin e as a function value: one per builtin, made the first time a
+   script names it outside a call and kept with the builtins, so every use of
+   it is the same function: (= floor floor) is true. */
+static int builtin_value(filo_ctx *ctx, const filo_builtin_entry *e, filo_value *out) {
+    filo_builtin_entry *m = &ctx->builtins[e - ctx->builtins];
+    if (m->value == NULL) {
+        filo_func *fn = palloc(ctx, sizeof(filo_func));
+        if (fn == NULL) {
+            return FILO_ERR;
+        }
+        memset(fn, 0, sizeof(*fn));
+        fn->builtin = m;
+        m->value = fn;
+    }
+    memset(out, 0, sizeof(*out));
+    out->kind = FILO_FUNC;
+    out->u.fn = m->value;
+    return FILO_OK;
 }
 
 #ifndef FILO_VM_ONLY
@@ -2328,9 +2352,13 @@ static int eval(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
             }
         }
         break;
-    case OP_BUILTIN:
-        rc = filo_fail2(ctx, "builtin cannot be used as value: ", in->name);
+    case OP_BUILTIN: {
+        const filo_builtin_entry *e =
+            builtin_by_name(ctx, (const uint8_t *)in->name, (uint32_t)strlen(in->name));
+        rc = e != NULL ? builtin_value(ctx, e, out)
+                       : filo_fail2(ctx, "undefined global: ", in->name);
         break;
+    }
     case OP_EMPTY:
         rc = filo_fail(ctx, "empty list expression");
         break;
@@ -2638,6 +2666,7 @@ enum {
     BC_TUPLE,
     BC_UNPACK,
     BC_TRAP,
+    BC_PUSH_B,
 };
 
 enum {
@@ -3346,7 +3375,8 @@ static void bc_node(bcc *c, const filo_instr *in) {
         bc_trap(c, bc_text(c, "undefined symbol: ", in->name, ""));
         return;
     case OP_BUILTIN:
-        bc_trap(c, bc_text(c, "builtin cannot be used as value: ", in->name, ""));
+        bc_op(c, BC_PUSH_B, bc_import(c, in->name));
+        bc_stack(c, 1);
         return;
     case OP_EMPTY:
         bc_trap(c, "empty list expression");
@@ -3842,6 +3872,13 @@ static filo_str rd_name(bc_rd *r) {
     }
     s.ptr = rd_bytes(r, n);
     s.len = n;
+    /* names live as C strings in the context: one with a zero byte in it
+       would never find itself, and could match another */
+    for (uint32_t i = 0; s.ptr != NULL && i < n; i++) {
+        if (s.ptr[i] == 0) {
+            r->bad = true;
+        }
+    }
     return s;
 }
 
@@ -3994,17 +4031,9 @@ static int bc_load_externs(filo_ctx *ctx, bc_rd *r, filo_unit *u, bool lazy, bc_
         const filo_builtin_entry *b =
             builtin_by_name(ctx, (const uint8_t *)name, (uint32_t)strlen(name));
         if (b != NULL) {
-            filo_func *fn = palloc(ctx, sizeof(filo_func));
-            if (fn == NULL) {
+            if (builtin_value(ctx, b, &ctx->globals[id]) != FILO_OK) {
                 return FILO_ERR;
             }
-            memset(fn, 0, sizeof(*fn));
-            fn->builtin = b;
-            filo_value v;
-            memset(&v, 0, sizeof(v));
-            v.kind = FILO_FUNC;
-            v.u.fn = fn;
-            ctx->globals[id] = v;
             ctx->defined[id] = true;
             continue;
         }
@@ -4547,6 +4576,27 @@ static int vm_call(filo_ctx *ctx, bc_act **ap, uint32_t argc) {
     return vm_invoke(ctx, ap, a->stack[a->sp - argc - 1], argc, argc + 1);
 }
 
+/* A builtin as a value: the import resolved to one, or to the global that
+   holds the function in Filo this VM has for that name. */
+static int vm_push_b(filo_ctx *ctx, bc_act *a, uint32_t idx) {
+    const filo_unit *u = a->fn->unit;
+    if (idx >= u->nimports) {
+        return filo_fail(ctx, "bytecode: a builtin outside the imports");
+    }
+    const bc_imported *imp = &u->imports[idx];
+    filo_value v;
+    if (imp->builtin == NULL) {
+        if (!ctx->defined[imp->sym]) {
+            return filo_fail2(ctx, "undefined global: ", ctx->symbols[imp->sym]);
+        }
+        return vm_push(ctx, a, ctx->globals[imp->sym]);
+    }
+    if (builtin_value(ctx, imp->builtin, &v) != FILO_OK) {
+        return FILO_ERR;
+    }
+    return vm_push(ctx, a, v);
+}
+
 static int vm_closure(filo_ctx *ctx, bc_act *a, uint32_t idx) {
     const filo_unit *u = a->fn->unit;
     if (idx >= u->nfns) {
@@ -4817,6 +4867,9 @@ static int vm_loop(filo_ctx *ctx, const bc_act *base, bc_act **cur, bool pausabl
                 return filo_fail(ctx, "bytecode: a constant outside the unit");
             }
             return vm_trap(ctx, &u->consts[x]);
+        case BC_PUSH_B:
+            rc = vm_push_b(ctx, a, x);
+            break;
         default:
             return filo_fail(ctx, "bytecode: unknown instruction");
         }
@@ -5044,6 +5097,7 @@ int filo_register_builtin(filo_ctx *ctx, const char *name, filo_builtin fn) {
     }
     ctx->builtins[ctx->nbuiltins].name = name;
     ctx->builtins[ctx->nbuiltins].fn = fn;
+    ctx->builtins[ctx->nbuiltins].value = NULL;
     ctx->nbuiltins++;
     return FILO_OK;
 }
@@ -6124,7 +6178,10 @@ static int b_error(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value
 }
 
 static void register_core(filo_ctx *ctx) {
-    static const filo_builtin_entry core[] = {
+    static const struct {
+        const char *name;
+        filo_builtin fn;
+    } core[] = {
         {"+", b_add},
         {"-", b_sub},
         {"*", b_mul},

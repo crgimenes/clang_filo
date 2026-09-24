@@ -369,6 +369,29 @@ static void test_bc_declares_without_loading(void) {
     CHECK(!filo_bc_declares(unit_buf, len, "e0"));
 }
 
+/* A builtin named outside a call is a function value, the same one every
+   time — through the tree, through the bytecode, and bound to an extern. */
+static void test_builtins_are_values(void) {
+    start();
+    filo_value v;
+    CHECK(run("(= + +)", &v) == FILO_OK && v.kind == FILO_BOOL && v.u.b);
+    CHECK(run("(fold + 0 (list 1 2 3))", &v) == FILO_OK && v.u.num == 6);
+    CHECK(run("(type-of +)", &v) == FILO_OK && v.kind == FILO_STRING && v.u.str.len == 4 &&
+          memcmp(v.u.str.ptr, "func", 4) == 0);
+    const char *srcs[] = {"(map - (list 1 2))", "(= + +)", "(nth (map list (list 7 8)) 1)"};
+    size_t len = build(srcs, 3);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK && v.kind == FILO_LIST &&
+          v.u.seq.len == 2 && v.u.seq.items[1].u.num == -2);
+    CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK && v.u.b);
+    CHECK(filo_bc_run(&CTX, u, "e2", NULL, &v) == FILO_OK && v.kind == FILO_LIST &&
+          v.u.seq.len == 1 && v.u.seq.items[0].u.num == 8);
+    /* a global holding the builtin is the same value as the builtin */
+    CHECK(run("(def add +)", &v) == FILO_OK);
+    CHECK(run("(= add +)", &v) == FILO_OK && v.u.b);
+}
+
 /* A full arena says which one and how big it is: what a board refusing a
    program would need to tell. */
 static void test_out_of_memory_names_the_arena(void) {
@@ -661,6 +684,7 @@ int main(void) {
     test_bc_declares_without_loading();
     test_bundle_members_by_position();
     test_out_of_memory_names_the_arena();
+    test_builtins_are_values();
     test_bc_globals_read_only_are_externs();
     test_bc_functions_resolve_whatever_their_origin();
     test_bc_entries_share_globals();

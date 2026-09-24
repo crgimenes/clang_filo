@@ -9,11 +9,14 @@ machine, and a VM runs the stream in place, from wherever it is stored
 (flash, a file, a browser's storage). The machine that runs a program needs
 the VM and the builtins the program imports; it never needs the parser.
 
-The bytecode is a C runtime feature. The Go engine does not read or write
-it (yet), and the language does not change: a program compiled here gives
-the same value, the same error or success and the same globals as the IR
-evaluated by either runtime. The corpus and the Prolog oracle run through
-the VM to hold it to that.
+Only the C runtime compiles to bytecode; both runtimes run it. The Go
+engine loads a unit (`Engine.LoadUnit`, `Engine.LoadBundle`) and runs its
+entries (`Unit.Run`) on a machine of its own, and the language does not
+change: a program compiled here gives the same value, the same error or
+success and the same globals as the IR evaluated by either runtime. The
+corpus and the Prolog oracle run through the VM to hold it to that, and
+the units they compile to run again on the Go machine (`make govm` in the
+C repository), held to the same result, error and place.
 
 ## What differs from the IR
 
@@ -50,7 +53,7 @@ loaded against whatever the loading VM has, wherever a function comes from
   was compiled, the core ones included, so that adding a builtin to the
   core never renumbers anything. Each resolves to a builtin of that name,
   or else to a global holding a function (the loading VM has it in Filo);
-  `CALLB` calls either.
+  `CALLB` calls either, and `PUSH_B` pushes either as a value.
 - **Globals** are names, resolved to the loading context's symbol table
   (created when the table is open).
 - **Externs** are the globals the unit reads and never writes: a value the
@@ -66,7 +69,10 @@ therefore the unit's requirements, listed by `filo dump`: a VM runs the
 unit when it provides them, whatever else it lacks. A lazy load
 (`filo_bc_load_lazy`) leaves an extern the context does not hold to fail
 when it is read, as the interpreter fails; the corpus and the fuzzers load
-that way, programs being installed do not.
+that way, programs being installed do not. The Go engine is handed its
+globals when it runs, not when it loads: `Unit.Run` refuses a missing
+import as a load does and leaves a missing extern to fail when read, and
+`Unit.Missing` lists both for a host that refuses on either.
 
 Inside the unit everything is an index: constants, globals, imports,
 functions.
@@ -192,6 +198,7 @@ the jump instruction.
 | 13 | `TUPLE` | count | | a… → t | a tuple of the values |
 | 14 | `UNPACK` | count | | t → a… | the elements of a tuple of exactly *count*; `letv expects tuple expression` / `letv arity mismatch` |
 | 15 | `TRAP` | constant | | | error with the string constant as message |
+| 16 | `PUSH_B` | import | | → f | the import as a function value: a builtin (the same value every time it is pushed), or the global holding the function the loading VM has in Filo |
 
 `JMP` conditions — every conditional one requires a bool
 (`expected bool, got <kind>`):

@@ -27,12 +27,13 @@ enum {
     OP_TUPLE,
     OP_UNPACK,
     OP_TRAP,
+    OP_PUSH_B,
     OP_COUNT,
 };
 
 static const char *const mnemonic[OP_COUNT] = {
-    "PUSH_K", "PUSH_G", "STORE_G", "PUSH_L", "STORE_L", "PUSH_UP", "STORE_UP", "POP",
-    "JMP",    "CALL",   "CALLB",   "RET",    "CLOSURE", "TUPLE",   "UNPACK",   "TRAP",
+    "PUSH_K", "PUSH_G", "STORE_G", "PUSH_L",  "STORE_L", "PUSH_UP", "STORE_UP", "POP",    "JMP",
+    "CALL",   "CALLB",  "RET",     "CLOSURE", "TUPLE",   "UNPACK",  "TRAP",     "PUSH_B",
 };
 
 static const char *const condition[] = {"always", "if false", "and", "or", "check"};
@@ -498,6 +499,11 @@ uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap) {
         }
         break;
     }
+    case OP_PUSH_B:
+        if (x < u->nimports) {
+            name_text(u, u->imports[x], note, sizeof(note));
+        }
+        break;
     case OP_RET:
         (void)snprintf(note, sizeof(note), "%s", x == 0 ? "return" : "exit");
         break;
