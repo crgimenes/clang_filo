@@ -115,9 +115,10 @@ steps-regen:
 	cd tools/gosteps && GOFLAGS=-mod=mod go run . $(addprefix ../../,$(CORPUS)) > ../../testdata/steps.txt
 
 # The units the device build runs, run again on the Go engine's machine: the
-# same result, error and place on every one. Needs the Go checkout beside
+# same result, error and place on every one, and each listing the Go
+# package fbc writes the one dump_test kept. Needs the Go checkout beside
 # this one, as steps-regen does, so it is not part of qa.
-govm: device
+govm: cli
 	cd tools/govm && GOFLAGS=-mod=mod go run . ../../build/units
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.

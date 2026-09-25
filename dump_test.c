@@ -33,9 +33,15 @@ static size_t lines = 0;
 
 static size_t broken = 0;
 
-/* A listing of a unit the compiler wrote reads every instruction whole. */
+/* A listing of a unit the compiler wrote reads every instruction whole.
+   It is also kept beside the unit (NNNNN.dump), for the Go engine's
+   listing to be held to it (make govm). */
 static void count(void *user, const char *line) {
-    (void)user;
+    FILE *keep = user;
+    if (keep != NULL) {
+        (void)fputs(line, keep);
+        (void)fputc('\n', keep);
+    }
     lines++;
     if (strstr(line, "(an instruction cut short)") != NULL || strstr(line, "(unknown") != NULL ||
         strstr(line, "runs past the function") != NULL) {
@@ -100,7 +106,12 @@ static void test_units_list_and_agree_with_the_loader(const char *dir) {
         }
         CHECK(unit.checksum_ok);
         lines = 0;
-        fbc_dump(&unit, count, NULL);
+        (void)snprintf(path, sizeof(path), "%s/%05u.dump", dir, no);
+        FILE *keep = fopen(path, "w");
+        fbc_dump(&unit, count, keep);
+        if (keep != NULL) {
+            (void)fclose(keep);
+        }
         CHECK(lines > unit.nfns);
         CHECK(broken == 0);
         filo_init(&ctx, &filo_libc_host, persistent_mem, sizeof(persistent_mem), run_mem,

@@ -2,12 +2,15 @@
 // engine's machine. Each must give what it gave on the C one — the result,
 // or the error and where it happened, and the globals the case checks — as
 // device_test holds the C build without a compiler to it. A unit is the
-// same program on either.
+// same program on either. Where dump_test kept a unit's listing
+// (NNNNN.dump), the Go listing (package fbc) must be the same, byte for
+// byte: two readers of the format written apart.
 //
 // usage: go run . DIR   (make govm)
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/crgimenes/filo"
+	"github.com/crgimenes/filo/fbc"
 	"github.com/crgimenes/filo/filomath"
 	"github.com/crgimenes/filo/filostrings"
 )
@@ -38,6 +42,9 @@ func main() {
 		}
 		why := runCase(dir, no, string(expect))
 		if why == "" {
+			why = sameListing(dir, no)
+		}
+		if why == "" {
 			passed++
 			continue
 		}
@@ -56,6 +63,42 @@ func load(e *filo.Engine, dir string, no int, suffix string) (*filo.Unit, error)
 		return nil, err
 	}
 	return e.LoadUnit(data)
+}
+
+// sameListing is "" when the unit lists in Go as it did in C, or when
+// there is no C listing kept for it.
+func sameListing(dir string, no int) string {
+	want, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%05d.dump", no))) // #nosec G304 G703 -- a listing in the directory the command was given
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%05d.fbc", no))) // #nosec G304 G703 -- a unit in the directory the command was given
+	if err != nil {
+		return err.Error()
+	}
+	u, err := fbc.Read(data)
+	if err != nil {
+		return "listing: " + err.Error()
+	}
+	var got bytes.Buffer
+	err = u.Dump(&got)
+	if err != nil {
+		return "listing: " + err.Error()
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		return "the Go listing differs from the C one: " + firstDifference(got.String(), string(want))
+	}
+	return ""
+}
+
+func firstDifference(got, want string) string {
+	g, w := strings.Split(got, "\n"), strings.Split(want, "\n")
+	for i := 0; i < len(g) && i < len(w); i++ {
+		if g[i] != w[i] {
+			return fmt.Sprintf("line %d: %q, want %q", i+1, g[i], w[i])
+		}
+	}
+	return fmt.Sprintf("%d lines, want %d", len(g), len(w))
 }
 
 // newEngine has what the C runner registers: the core and the math and

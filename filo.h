@@ -265,11 +265,17 @@ filo_value filo_cstring(const char *s);
 int filo_list(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *out);
 int filo_tuple(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *out);
 
-/* Deep, exact equality: NaN is not equal to NaN, kinds must match. */
+/* Deep, exact equality: NaN is not equal to NaN, kinds must match. It
+   walks both values whole and checks nothing: a value a script built may be
+   far larger to walk than it is in memory (lists that hold the same value
+   twice). (= a b) refuses one past the walk ceilings, as the renderers do;
+   a host comparing what a script returned should compare with (=). */
 bool filo_equal(const filo_value *a, const filo_value *b);
 
 /* Renders v the way (string v) does: strings verbatim, everything else in
-   source form. Needs the num_to_str hook for numbers. */
+   source form. Needs the num_to_str hook for numbers. Refuses a value past
+   the walk ceilings (4194304 parts, 512 levels), the Go engine's, since a
+   list may hold the same value many times and grow past memory as text. */
 int filo_value_text(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len);
 
 /* ---- for builtins ---- */
@@ -292,7 +298,8 @@ int filo_arg_list(filo_ctx *ctx, const filo_value *v, filo_seq *out);
    (with the error set) when the arena is exhausted. */
 void *filo_alloc(filo_ctx *ctx, size_t n);
 
-/* Renders v in source form: strings quoted, lists as (list ...). */
+/* Renders v in source form: strings quoted, lists as (list ...); refuses a
+   value past the walk ceilings, as filo_value_text does. */
 int filo_value_repr(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len);
 
 const char *filo_kind_name(uint8_t kind);

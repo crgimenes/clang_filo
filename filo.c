@@ -5016,6 +5016,43 @@ static void sink_quoted(sink *s, filo_str str) {
     sink_puts(s, "\"");
 }
 
+/* A list or a tuple may hold the same value more than once, so a value
+   made in a few steps, (fold (fn (a x) (tuple a a)) 0 (range 60)), is small
+   in memory and 2^60 parts to walk. Whatever walks a value (writing it,
+   comparing it) first checks it is walkable: at most WALK_PARTS_MAX parts
+   and WALK_LEVELS_MAX levels, the Go engine's ceilings, checked in its
+   order, so both fail on the same value. The levels also bound the C stack
+   the walk takes. */
+enum {
+    WALK_PARTS_MAX = 1U << 22U,
+    WALK_LEVELS_MAX = FILO_EVAL_DEPTH_MAX,
+};
+
+static int walk_check(filo_ctx *ctx, const filo_value *v, uint32_t level, uint32_t *parts) {
+    (*parts)++;
+    if (*parts > WALK_PARTS_MAX) {
+        return filo_fail(ctx, "value too large: more than 4194304 parts");
+    }
+    if (v->kind != FILO_LIST && v->kind != FILO_TUPLE) {
+        return FILO_OK;
+    }
+    if (level > WALK_LEVELS_MAX) {
+        return filo_fail(ctx, "value too deep: more than 512 levels");
+    }
+    for (uint32_t i = 0; i < v->u.seq.len; i++) {
+        filo_value item = seq_at(&v->u.seq, i);
+        if (walk_check(ctx, &item, level + 1U, parts) != FILO_OK) {
+            return FILO_ERR;
+        }
+    }
+    return FILO_OK;
+}
+
+static int walkable(filo_ctx *ctx, const filo_value *v) {
+    uint32_t parts = 0;
+    return walk_check(ctx, v, 1, &parts);
+}
+
 static int render(filo_ctx *ctx, const filo_value *v, sink *s, bool quote) {
     switch (v->kind) {
     case FILO_NUMBER: {
@@ -5061,7 +5098,7 @@ static int render(filo_ctx *ctx, const filo_value *v, sink *s, bool quote) {
 
 int filo_value_text(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len) {
     sink s = {dst, cap, 0};
-    if (render(ctx, v, &s, false) != FILO_OK) {
+    if (walkable(ctx, v) != FILO_OK || render(ctx, v, &s, false) != FILO_OK) {
         return FILO_ERR;
     }
     *len = s.pos;
@@ -5073,7 +5110,7 @@ int filo_value_text(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, s
 
 int filo_value_repr(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len) {
     sink s = {dst, cap, 0};
-    if (render(ctx, v, &s, true) != FILO_OK) {
+    if (walkable(ctx, v) != FILO_OK || render(ctx, v, &s, true) != FILO_OK) {
         return FILO_ERR;
     }
     *len = s.pos;
@@ -5086,7 +5123,7 @@ int filo_value_repr(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, s
 /* Renders into a fresh run-arena string value — what (string v) yields. */
 static int render_to_value(filo_ctx *ctx, const filo_value *v, filo_value *out) {
     sink count = {NULL, 0, 0};
-    if (render(ctx, v, &count, false) != FILO_OK) {
+    if (walkable(ctx, v) != FILO_OK || render(ctx, v, &count, false) != FILO_OK) {
         return FILO_ERR;
     }
     char *buf = NULL;
@@ -5753,6 +5790,11 @@ static int b_eq(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *o
     for (uint32_t i = 1; i < n; i++) {
         if (args[i].kind != args[0].kind) {
             return filo_fail(ctx, "expected values of the same kind");
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (walkable(ctx, &args[i]) != FILO_OK) {
+            return FILO_ERR;
         }
     }
     for (uint32_t i = 1; i < n; i++) {
