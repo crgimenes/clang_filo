@@ -268,8 +268,9 @@ int filo_tuple(filo_ctx *ctx, const filo_value *items, uint32_t n, filo_value *o
 /* Deep, exact equality: NaN is not equal to NaN, kinds must match. It
    walks both values whole and checks nothing: a value a script built may be
    far larger to walk than it is in memory (lists that hold the same value
-   twice). (= a b) refuses one past the walk ceilings, as the renderers do;
-   a host comparing what a script returned should compare with (=). */
+   twice). (= a b) stops at the walk ceilings on the parts it compares, as
+   the renderers do; a host comparing what a script returned should compare
+   with (=). */
 bool filo_equal(const filo_value *a, const filo_value *b);
 
 /* Renders v the way (string v) does: strings verbatim, everything else in

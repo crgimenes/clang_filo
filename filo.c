@@ -5023,11 +5023,11 @@ static void sink_quoted(sink *s, filo_str str) {
 
 /* A list or a tuple may hold the same value more than once, so a value
    made in a few steps, (fold (fn (a x) (tuple a a)) 0 (range 60)), is small
-   in memory and 2^60 parts to walk. Whatever walks a value (writing it,
-   comparing it) first checks it is walkable: at most WALK_PARTS_MAX parts
-   and WALK_LEVELS_MAX levels, the Go engine's ceilings, checked in its
-   order, so both fail on the same value. The levels also bound the C stack
-   the walk takes. */
+   in memory and 2^60 parts to walk. Whatever walks a value stops at
+   WALK_PARTS_MAX parts and WALK_LEVELS_MAX levels, the Go engine's
+   ceilings, checked in its order, so both fail on the same value: writing
+   it checks first (walkable), comparing it counts as it goes (equal_walk).
+   The levels also bound the C stack the walk takes. */
 enum {
     WALK_PARTS_MAX = 1U << 22U,
     WALK_LEVELS_MAX = FILO_EVAL_DEPTH_MAX,
@@ -5790,6 +5790,17 @@ static double frexp_bits(double x, int32_t *e) {
     return bits_double((bits & ~((uint64_t)0x7FFU << 52U)) | ((uint64_t)1022U << 52U));
 }
 
+/* a*b rounded, and what the rounding lost, exactly: by an fma where the
+   machine has one, by Dekker's splitting where not, the same two doubles
+   either way. The operands are mantissas, near 1: nothing overflows or
+   underflows. */
+#ifdef __FP_FAST_FMA
+static double two_prod(double a, double b, double *e) {
+    double p = rmul(a, b);
+    *e = __builtin_fma(a, b, -p);
+    return p;
+}
+#else
 /* a as two halves of 26 bits, whose products are exact */
 static void dd_split(double a, double *h, double *l) {
     double c = rmul(134217729.0, a); /* 2^27 + 1 */
@@ -5797,8 +5808,6 @@ static void dd_split(double a, double *h, double *l) {
     *l = a - *h;
 }
 
-/* a*b rounded, and what the rounding lost (Dekker's, without an fma); the
-   operands are mantissas, near 1, so nothing overflows */
 static double two_prod(double a, double b, double *e) {
     double p = rmul(a, b);
     double ah = 0;
@@ -5810,6 +5819,7 @@ static double two_prod(double a, double b, double *e) {
     *e = (((rmul(ah, bh) - p) + rmul(ah, bl)) + rmul(al, bh)) + rmul(al, bl);
     return p;
 }
+#endif
 
 /* a+b rounded, and what the rounding lost */
 static double two_sum(double a, double b, double *e) {
@@ -5835,13 +5845,15 @@ static double dd_recip(double h, double l, double *out_l) {
     return two_sum(q, rem / h, out_l);
 }
 
-/* h into [0.5, 1), l with it, and *e by as much */
+/* h into [0.5, 1), l with it, and *e by as much. h is a product or a
+   quotient of mantissas, never subnormal: frexp_bits without that case.
+   Scaling l by a power of two is exact, fused or not. */
 static double dd_norm(double h, double *l, int32_t *e) {
-    int32_t k = 0;
-    double f = frexp_bits(h, &k);
-    *l = rmul(*l, pow2(-k));
+    uint64_t bits = double_bits(h);
+    int32_t k = (int32_t)((bits >> 52U) & 0x7FFU) - 1022;
+    *l = *l * pow2(-k);
     *e += k;
-    return f;
+    return bits_double((bits & ~((uint64_t)0x7FFU << 52U)) | ((uint64_t)1022U << 52U));
 }
 
 /* s·2^e for s in [0.5, 1], rounded once: a power of two within the normal
@@ -5982,6 +5994,44 @@ void filo_set_pow(double (*fn)(double, double)) {
     pow_hook = fn != NULL ? fn : core_pow;
 }
 
+/* filo_equal, walking both values together and stopping at the walk
+   ceilings on the parts it compares: a comparison settled early costs what
+   it walked, whatever the size of the rest. The Go engine (equalWalk)
+   counts the same parts in the same order. */
+static int equal_walk(filo_ctx *ctx, const filo_value *a, const filo_value *b, uint32_t level,
+                      uint32_t *parts, bool *eq) {
+    *eq = false;
+    (*parts)++;
+    if (*parts > WALK_PARTS_MAX) {
+        return filo_fail(ctx, "value too large: more than 4194304 parts");
+    }
+    if (a->kind != b->kind) {
+        return FILO_OK;
+    }
+    if (a->kind != FILO_LIST && a->kind != FILO_TUPLE) {
+        *eq = filo_equal(a, b);
+        return FILO_OK;
+    }
+    if (a->u.seq.len != b->u.seq.len) {
+        return FILO_OK;
+    }
+    if (level > WALK_LEVELS_MAX) {
+        return filo_fail(ctx, "value too deep: more than 512 levels");
+    }
+    for (uint32_t i = 0; i < a->u.seq.len; i++) {
+        filo_value av = seq_at(&a->u.seq, i);
+        filo_value bv = seq_at(&b->u.seq, i);
+        if (equal_walk(ctx, &av, &bv, level + 1U, parts, eq) != FILO_OK) {
+            return FILO_ERR;
+        }
+        if (!*eq) {
+            return FILO_OK;
+        }
+    }
+    *eq = true;
+    return FILO_OK;
+}
+
 static int b_eq(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
     if (n < 2) {
         return filo_fail(ctx, "= expects at least 2 arguments");
@@ -5991,13 +6041,13 @@ static int b_eq(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *o
             return filo_fail(ctx, "expected values of the same kind");
         }
     }
-    for (uint32_t i = 0; i < n; i++) {
-        if (walkable(ctx, &args[i]) != FILO_OK) {
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t parts = 0;
+        bool eq = false;
+        if (equal_walk(ctx, &args[0], &args[i], 1, &parts, &eq) != FILO_OK) {
             return FILO_ERR;
         }
-    }
-    for (uint32_t i = 1; i < n; i++) {
-        if (!filo_equal(&args[0], &args[i])) {
+        if (!eq) {
             *out = filo_bool(false);
             return FILO_OK;
         }
