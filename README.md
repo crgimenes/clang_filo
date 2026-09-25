@@ -22,7 +22,7 @@ that travels as one.
 Built with `-DFILO_VM_ONLY`, the runtime keeps only what runs a unit: no
 parser, no IR, no compiler. On an ESP32-S3 that is 17 KB of code instead of
 30 KB. `make device` runs the corpus and the oracle, compiled by the full
-build, on that build. `FILO_SYMBOLS_MAX` (512 by default, about 40 bytes a
+build, on that build. `FILO_SYMBOLS_MAX` (512 by default, about 22 bytes a
 name in every context) is a build setting too; the device check runs with
 128.
 
@@ -41,7 +41,8 @@ The host hands over two blocks and the runtime never asks for more:
 Globals a run writes are copied into the persistent arena when the run ends, so
 they survive; the result value stays valid until the next run or compile. A
 script that exhausts either arena fails with an error and never corrupts
-anything. Steps, recursion and parse depth are bounded (`filo_limits`), and the
+anything: when the globals a run wrote do not fit, the run fails whole and
+they keep what they held before it. Steps, recursion and parse depth are bounded (`filo_limits`), and the
 `should_stop` hook lets the host end a run at any step — a runaway script cannot
 take the host with it.
 

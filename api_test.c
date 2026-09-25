@@ -404,6 +404,25 @@ static void test_out_of_memory_names_the_arena(void) {
     CHECK(strstr(filo_error(&CTX), "out of memory: the run arena (4 KB) is full") != NULL);
 }
 
+/* A run whose globals do not fit the persistent arena fails whole: none
+   of them is left pointing into the run arena, which the next run reuses. */
+static void test_globals_that_do_not_fit_leave_no_trace(void) {
+    static uint8_t small_persistent[6000];
+    filo_init(&CTX, &filo_libc_host, small_persistent, sizeof(small_persistent), run_mem,
+              sizeof(run_mem));
+    filo_value v = {0};
+    CHECK(run("(def a 0) (def b 0)", &v) == FILO_OK);
+    CHECK(run("(def b (list 1 2 3)) (def a (map (fn (i) (* i 2)) (range 2000))) (def c 1)", &v) ==
+          FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "the persistent arena") != NULL);
+    CHECK(run("(map (fn (i) (list i i)) (range 300))", &v) == FILO_OK); /* the run arena, reused */
+    CHECK(run("(list a b)", &v) == FILO_OK);
+    CHECK(v.kind == FILO_LIST && v.u.seq.len == 2 && v.u.seq.items[0].kind == FILO_NUMBER &&
+          v.u.seq.items[1].kind == FILO_NUMBER && v.u.seq.items[1].u.num == 0);
+    CHECK(run("c", &v) == FILO_ERR);
+    CHECK(run("(def d (list 4 5))", &v) == FILO_OK); /* and the room it took is back */
+}
+
 /* A bundle's members by position: a listing, or the only member of a
    bundle renamed on its way somewhere. */
 static void test_bundle_members_by_position(void) {
@@ -719,6 +738,7 @@ int main(void) {
     filo_libc_install();
     test_pow_is_the_same_everywhere();
     test_globals_cross_both_ways();
+    test_globals_that_do_not_fit_leave_no_trace();
     test_seal_refuses_new_globals();
     test_seal_is_off_until_asked();
     test_symbol_table_is_bounded();

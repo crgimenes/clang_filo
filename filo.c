@@ -2240,7 +2240,7 @@ static int eval_letv(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     return rc;
 }
 
-static void set_global_id(filo_ctx *ctx, uint32_t id, filo_value v);
+static int set_global_id(filo_ctx *ctx, uint32_t id, filo_value v);
 
 static int eval_set(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     if (in->nargs != 2) {
@@ -2265,17 +2265,15 @@ static int eval_set(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
         return FILO_OK;
     }
     case OP_GLOBAL:
-        set_global_id(ctx, target->a, v);
         *out = v;
-        return FILO_OK;
+        return set_global_id(ctx, target->a, v);
     case OP_DYNAMIC: {
         int32_t id = symbol_id(ctx, (const uint8_t *)target->name, (uint32_t)strlen(target->name));
         if (id < 0) {
             return FILO_ERR;
         }
-        set_global_id(ctx, (uint32_t)id, v);
         *out = v;
-        return FILO_OK;
+        return set_global_id(ctx, (uint32_t)id, v);
     }
     default:
         return filo_fail(ctx, "set name must be symbol");
@@ -2315,9 +2313,8 @@ static int eval_def(filo_ctx *ctx, const filo_instr *in, filo_value *out) {
     if (id < 0) {
         return FILO_ERR;
     }
-    set_global_id(ctx, (uint32_t)id, v);
     *out = v;
-    return FILO_OK;
+    return set_global_id(ctx, (uint32_t)id, v);
 }
 
 static int eval_signal(filo_ctx *ctx, const filo_instr *in, uint8_t sig) {
@@ -2585,50 +2582,69 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
     }
 }
 
+/* What a global held before the run first wrote it, for a failed run to
+   put back: one for each global written, in the run arena, instead of a copy
+   of every global in every context. */
+typedef struct saved_global {
+    struct saved_global *next;
+    filo_value value;
+    uint32_t id;
+    bool defined;
+} saved_global;
+
 /* During a run a global holds run-arena data and is marked dirty; the run
-   end copies dirty globals out (or restores them when the run failed). */
-static void set_global_id(filo_ctx *ctx, uint32_t id, filo_value v) {
+   end copies dirty globals out (or restores them when the run failed). The
+   escape comes first: no scope then gives back the memory the journal
+   entry takes. */
+static int set_global_id(filo_ctx *ctx, uint32_t id, filo_value v) {
     ctx->escapes++; /* the value outlives whatever scope is running */
     if (!ctx->dirty[id]) {
+        saved_global *s = ralloc(ctx, sizeof(saved_global));
+        if (s == NULL) {
+            return FILO_ERR;
+        }
+        s->next = ctx->journal;
+        s->value = ctx->globals[id];
+        s->id = id;
+        s->defined = ctx->defined[id];
+        ctx->journal = s;
         ctx->dirty[id] = true;
-        ctx->saved[id] = ctx->globals[id];
-        ctx->saved_defined[id] = ctx->defined[id];
     }
     ctx->globals[id] = v;
     ctx->defined[id] = true;
-}
-
-static int commit_globals(filo_ctx *ctx) {
-    copy_memo memo;
-    memo.n = 0;
-    int rc = FILO_OK;
-    for (uint32_t i = 0; i < ctx->nsymbols; i++) {
-        if (!ctx->dirty[i]) {
-            continue;
-        }
-        ctx->dirty[i] = false;
-        if (rc != FILO_OK) {
-            continue;
-        }
-        filo_value persisted = {0};
-        if (copy_value(ctx, &ctx->globals[i], &persisted, &memo) != FILO_OK) {
-            rc = FILO_ERR;
-            continue;
-        }
-        ctx->globals[i] = persisted;
-    }
-    return rc;
+    return FILO_OK;
 }
 
 static void rollback_globals(filo_ctx *ctx) {
-    for (uint32_t i = 0; i < ctx->nsymbols; i++) {
-        if (!ctx->dirty[i]) {
-            continue;
-        }
-        ctx->dirty[i] = false;
-        ctx->globals[i] = ctx->saved[i];
-        ctx->defined[i] = ctx->saved_defined[i];
+    for (const saved_global *s = ctx->journal; s != NULL; s = s->next) {
+        ctx->dirty[s->id] = false;
+        ctx->globals[s->id] = s->value;
+        ctx->defined[s->id] = s->defined;
     }
+    ctx->journal = NULL;
+}
+
+/* All or nothing: a global left pointing into the run arena would outlive
+   it, so when the persistent arena fills halfway every written global goes
+   back, and the persistent arena to where it was. */
+static int commit_globals(filo_ctx *ctx) {
+    copy_memo memo;
+    memo.n = 0;
+    size_t mark = ctx->persistent.used;
+    for (const saved_global *s = ctx->journal; s != NULL; s = s->next) {
+        filo_value persisted = {0};
+        if (copy_value(ctx, &ctx->globals[s->id], &persisted, &memo) != FILO_OK) {
+            rollback_globals(ctx);
+            ctx->persistent.used = mark;
+            return FILO_ERR;
+        }
+        ctx->globals[s->id] = persisted;
+    }
+    for (const saved_global *s = ctx->journal; s != NULL; s = s->next) {
+        ctx->dirty[s->id] = false;
+    }
+    ctx->journal = NULL;
+    return FILO_OK;
 }
 
 /* A paused run lives in the run arena, so whatever resets it ends the run
@@ -4810,7 +4826,9 @@ static int vm_loop(filo_ctx *ctx, const bc_act *base, bc_act **cur, bool pausabl
             if (vm_need(ctx, a, 1) != FILO_OK) {
                 return FILO_ERR;
             }
-            set_global_id(ctx, u->globals[x], a->stack[a->sp - 1]);
+            if (set_global_id(ctx, u->globals[x], a->stack[a->sp - 1]) != FILO_OK) {
+                return FILO_ERR;
+            }
             break;
         case BC_PUSH_L:
         case BC_STORE_L:

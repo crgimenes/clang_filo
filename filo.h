@@ -46,8 +46,8 @@ enum {
 #define FILO_BUILTINS_MAX 128
 #endif
 
-/* Globals a context can name. Each costs about 40 bytes on a 32-bit target
-   in every context (the value, its saved copy, the name, three flags), so a
+/* Globals a context can name. Each costs about 22 bytes on a 32-bit target
+   in every context (the value, the name, two flags), so a
    board with little RAM sizes it to what its programs use. It shapes
    filo_ctx: the whole build must agree on it, as on FILO_VM_ONLY. */
 #ifndef FILO_SYMBOLS_MAX
@@ -163,10 +163,10 @@ struct filo_ctx {
     filo_value globals[FILO_SYMBOLS_MAX];
     bool defined[FILO_SYMBOLS_MAX];
     /* a run writes globals in place and marks them; the run end copies the
-       marked ones out, or puts the saved ones back when the run failed */
+       marked ones out, or puts back what they held when the run failed —
+       kept in the run arena, in journal (internal), for the ones written */
     bool dirty[FILO_SYMBOLS_MAX];
-    filo_value saved[FILO_SYMBOLS_MAX];
-    bool saved_defined[FILO_SYMBOLS_MAX];
+    void *journal;
 
     filo_limits limits;
     bool sealed; /* no new globals: only what the host created may be used */
