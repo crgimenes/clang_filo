@@ -538,10 +538,10 @@ static void test_errors_say_where(void) {
     uint32_t line = 0;
     uint32_t col = 0;
     filo_prog prog;
-    const char *bad = "(list 1\n  2";
+    const char *bad = "(def x 1)\n  (list 1\n  2"; /* a list that never closes: where it opens */
     CHECK(filo_compile(&CTX, (const uint8_t *)bad, strlen(bad), &prog) == FILO_ERR);
-    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 4);
-    CHECK(strstr(filo_error(&CTX), "line 2, col 4") != NULL);
+    CHECK(filo_error_at(&CTX, &line, &col) && line == 2 && col == 3);
+    CHECK(strstr(filo_error(&CTX), "line 2, col 3") != NULL);
 
     const char *src = "(let ((x 1))\n  (+ x \"a\"))";
     filo_value v;

@@ -39,6 +39,7 @@ typedef struct {
     char script[TEXT_MAX];
     char want[TEXT_MAX];
     bool want_err;
+    char at[32]; /* "line:col" the error must say, from '--- at'; "" when not checked */
 } corpus_case;
 
 static uint8_t persistent_mem[MEM_PERSISTENT];
@@ -329,6 +330,26 @@ static void write_expect(filo_ctx *ctx, const corpus_case *c, const filo_value *
     }
 }
 
+/* The error says it happened at want ("line:col"), or want is "". On the
+   VM a step limit is the one error whose place may differ from the IR's:
+   the two count steps differently. */
+static bool error_at_matches(const filo_ctx *ctx, const char *want) {
+    if (want[0] == '\0') {
+        return true;
+    }
+    if (use_vm && strstr(filo_error(ctx), "step limit exceeded") != NULL) {
+        return true;
+    }
+    uint32_t line = 0;
+    uint32_t col = 0;
+    if (!filo_error_at(ctx, &line, &col)) {
+        return false;
+    }
+    char at[32];
+    snprintf(at, sizeof(at), "%u:%u", line, col);
+    return strcmp(at, want) == 0;
+}
+
 static bool run_case(const corpus_case *c, char *why, size_t cap) {
     filo_ctx *ctx = malloc(sizeof(filo_ctx));
     if (ctx == NULL) {
@@ -361,6 +382,14 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
             char buf[512];
             show(ctx, &got, buf, sizeof(buf));
             snprintf(why, cap, "expected an error, got %s", buf);
+            ok = false;
+        }
+        if (ok && !error_at_matches(ctx, c->at)) {
+            uint32_t line = 0;
+            uint32_t col = 0;
+            (void)filo_error_at(ctx, &line, &col);
+            snprintf(why, cap, "the error is at %u:%u, want %s (%s)", line, col, c->at,
+                     filo_error(ctx));
             ok = false;
         }
         free(ctx);
@@ -557,6 +586,9 @@ static bool run_file(const char *path) {
                 sec = SEC_NONE;
             } else if (strcmp(s, "globals") == 0) {
                 sec = SEC_GLOBALS;
+            } else if (strncmp(s, "at ", 3) == 0) {
+                snprintf(c->at, sizeof(c->at), "%s", s + 3);
+                sec = SEC_NONE;
             }
             continue;
         }

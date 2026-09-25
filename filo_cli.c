@@ -104,6 +104,9 @@ static size_t read_file(const char *path, void *dst, size_t cap) {
         (void)complain2(path, "too large");
         return 0;
     }
+    if (n == 0) {
+        (void)complain2(path, "is empty");
+    }
     return n;
 }
 

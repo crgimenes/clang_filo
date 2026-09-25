@@ -580,10 +580,13 @@ static node *new_node(parser *p, uint8_t kind) {
     return n;
 }
 
-static int parse_fail(parser *p, const char *what) {
+/* A parse error at the byte at off: where a list or a string that never
+   closes was opened, as the Go engine says it, or else where reading
+   stopped. */
+static int parse_fail_at(parser *p, size_t off, const char *what) {
     uint32_t line = 1;
     uint32_t col = 1;
-    for (size_t k = 0; k < p->i && k < p->len; k++) {
+    for (size_t k = 0; k < off && k < p->len; k++) {
         if (p->src[k] == '\n') {
             line++;
             col = 1;
@@ -603,12 +606,17 @@ static int parse_fail(parser *p, const char *what) {
     return FILO_ERR;
 }
 
+static int parse_fail(parser *p, const char *what) {
+    return parse_fail_at(p, p->i, what);
+}
+
 static node *read_node(parser *p);
 
 static node *read_list(parser *p) {
+    size_t open = p->start; /* the '(' */
     p->depth++;
     if (p->depth > FILO_PARSE_DEPTH_MAX) {
-        (void)parse_fail(p, "nesting too deep");
+        (void)parse_fail_at(p, open, "nesting too deep");
         return NULL;
     }
     node *list = new_node(p, N_LIST);
@@ -621,7 +629,7 @@ static node *read_list(parser *p) {
     for (;;) {
         skip_ws(p);
         if (p->i >= p->len) {
-            (void)parse_fail(p, "unterminated list");
+            (void)parse_fail_at(p, open, "unterminated list");
             return NULL;
         }
         if (p->src[p->i] == ')') {
@@ -651,7 +659,27 @@ static node *read_list(parser *p) {
     return list;
 }
 
+/* The escapes a string may hold, the letter after the backslash. */
+static bool escape_known(uint8_t c) {
+    switch (c) {
+    case '"':
+    case 'n':
+    case 't':
+    case 'r':
+    case '\\':
+    case '0':
+    case 'a':
+    case 'b':
+    case 'f':
+    case 'v':
+        return true;
+    default:
+        return false;
+    }
+}
+
 static node *read_string(parser *p) {
+    size_t open = p->i;
     p->i++; /* opening quote */
     /* decoded bytes go to a run-arena buffer no longer than the source span */
     size_t start = p->i;
@@ -659,15 +687,21 @@ static node *read_string(parser *p) {
     while (scan < p->len && p->src[scan] != '"') {
         if (p->src[scan] == '\\') {
             scan++;
+            /* checked in reading order, as the Go engine checks it: an
+               unknown escape fails before a missing closing quote does */
+            if (scan < p->len && !escape_known(p->src[scan])) {
+                (void)parse_fail_at(p, scan, "unsupported escape");
+                return NULL;
+            }
         }
         scan++;
     }
     if (scan > p->len) {
-        (void)parse_fail(p, "unterminated escape sequence");
+        (void)parse_fail_at(p, open, "unterminated escape sequence");
         return NULL;
     }
     if (scan >= p->len) {
-        (void)parse_fail(p, "unterminated string literal");
+        (void)parse_fail_at(p, open, "unterminated string literal");
         return NULL;
     }
     uint8_t *buf = ralloc(p->ctx, scan - start + 1);
@@ -861,10 +895,13 @@ static node *read_node(parser *p) {
 /* Parses the whole source. Several top-level expressions are wrapped in an
    implicit (let () ...), exactly as the Go parser does. */
 static node *parse_all(filo_ctx *ctx, const uint8_t *src, size_t len) {
-    parser p = {ctx, src, len, 0, 0, 0, 0, 1, 1};
+    /* a BOM is not part of the text: nor of the first token, nor of the
+       columns, which count from after it as the Go engine counts them */
     if (len >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF) {
-        p.i = 3; /* a BOM is not part of the first token */
+        src += 3;
+        len -= 3;
     }
+    parser p = {ctx, src, len, 0, 0, 0, 0, 1, 1};
     node *first = NULL;
     node *wrapper = NULL;
     uint32_t cap = 0;
@@ -915,7 +952,7 @@ static node *parse_all(filo_ctx *ctx, const uint8_t *src, size_t len) {
         wrapper->nelems++;
     }
     if (first == NULL) {
-        (void)parse_fail(&p, "empty script");
+        (void)parse_fail_at(&p, 0, "empty script"); /* as the Go engine places it */
         return NULL;
     }
     return wrapper != NULL ? wrapper : first;

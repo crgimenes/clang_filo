@@ -2,8 +2,7 @@
 // engine's machine. Each must give what it gave on the C one — the result,
 // or the error and where it happened, and the globals the case checks — as
 // device_test holds the C build without a compiler to it. A unit is the
-// same program on either. One that needs builtins this engine lacks (the C
-// runtime's packs) is refused here, and counted apart.
+// same program on either.
 //
 // usage: go run . DIR   (make govm)
 package main
@@ -18,6 +17,8 @@ import (
 	"strings"
 
 	"github.com/crgimenes/filo"
+	"github.com/crgimenes/filo/filomath"
+	"github.com/crgimenes/filo/filostrings"
 )
 
 func main() {
@@ -29,17 +30,13 @@ func main() {
 		os.Exit(2)
 	}
 	dir := os.Args[1]
-	passed, failed, skipped := 0, 0, 0
+	passed, failed := 0, 0
 	for no := 0; ; no++ {
 		expect, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%05d.expect", no))) // #nosec G304 G703 -- a unit in the directory the command was given
 		if err != nil {
 			break
 		}
 		why := runCase(dir, no, string(expect))
-		if why == errSkipped {
-			skipped++
-			continue
-		}
 		if why == "" {
 			passed++
 			continue
@@ -47,13 +44,11 @@ func main() {
 		failed++
 		fmt.Printf("FAIL %s/%05d: %s\n", dir, no, why)
 	}
-	fmt.Printf("go vm: %d passed, %d failed, %d need builtins it lacks\n", passed, failed, skipped)
+	fmt.Printf("go vm: %d passed, %d failed\n", passed, failed)
 	if passed == 0 || failed > 0 {
 		os.Exit(1)
 	}
 }
-
-const errSkipped = "skipped"
 
 func load(e *filo.Engine, dir string, no int, suffix string) (*filo.Unit, error) {
 	data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%05d%s", no, suffix))) // #nosec G304 G703 -- a unit in the directory the command was given
@@ -63,8 +58,17 @@ func load(e *filo.Engine, dir string, no int, suffix string) (*filo.Unit, error)
 	return e.LoadUnit(data)
 }
 
-func runCase(dir string, no int, expect string) string {
+// newEngine has what the C runner registers: the core and the math and
+// strings packs, which are packages of their own on the Go side.
+func newEngine() *filo.Engine {
 	e := filo.NewEngine()
+	filomath.RegisterBuiltins(e)
+	filostrings.RegisterBuiltins(e)
+	return e
+}
+
+func runCase(dir string, no int, expect string) string {
+	e := newEngine()
 	var cfg filo.EvalConfig
 	globals := map[string]filo.Value{}
 	lines := strings.Split(strings.TrimRight(expect, "\n"), "\n")
@@ -100,9 +104,6 @@ func runCase(dir string, no int, expect string) string {
 	var got filo.Value
 	var after map[string]filo.Value
 	if err == nil {
-		if len(u.Missing(globals)) > 0 {
-			return errSkipped
-		}
 		got, after, err = u.Run(context.Background(), "main", globals, cfg)
 	}
 	if i == len(lines) {
