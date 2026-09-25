@@ -109,7 +109,7 @@ static int vm_run(filo_ctx *ctx, const filo_unit *unit, const filo_limits *limit
     return rc;
 }
 
-/* --steps FILE: the steps each case takes on the Go engine (tools/gosteps),
+/* --steps FILE: the steps each case takes on the Go engine (make steps-regen),
    "file<TAB>case<TAB>steps" a line. The IR counts a step per node as the
    Go engine does, and folds constants as it does, so the counts are the
    same — a step limit is behavior a script can see. */

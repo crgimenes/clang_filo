@@ -110,16 +110,18 @@ cli-regen: build/filo build/cli/demo.fbb
 
 # The steps of every corpus case on the Go engine, which the IR run above
 # must match (the Go engine folds constants, so the C must fold the same).
-# Needs the Go checkout beside this one, as oracle-regen does.
+# This repository is C only: the Go side of these checks is a test of the Go
+# checkout beside this one (filo/conformance), as oracle-regen's is.
 steps-regen:
-	cd tools/gosteps && GOFLAGS=-mod=mod go run . $(addprefix ../../,$(CORPUS)) > ../../testdata/steps.txt
+	cd $(FILO_GO)/conformance && FILO_STEPS_OUT=$(CURDIR)/testdata/steps.txt go test -run TestExportSteps -count=1 .
 
 # The units the device build runs, run again on the Go engine's machine: the
-# same result, error and place on every one, and each listing the Go
-# package fbc writes the one dump_test kept. Needs the Go checkout beside
-# this one, as steps-regen does, so it is not part of qa.
+# same result, error and place on every one, whole and stepped one
+# instruction at a time, and each listing the Go package fbc writes the one
+# dump_test kept (TestCUnits in filo/conformance). Not part of qa: it needs
+# the Go checkout, as steps-regen does.
 govm: cli
-	cd tools/govm && GOFLAGS=-mod=mod go run . ../../build/units
+	cd $(FILO_GO)/conformance && FILO_C_UNITS=$(CURDIR)/build/units go test -run TestCUnits -count=1 -v .
 
 # Rewrites the oracle files from the spec; needs the Go checkout beside this one.
 oracle-regen:
