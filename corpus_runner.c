@@ -78,6 +78,20 @@ static void write_file(const char *suffix, const void *data, size_t len) {
     (void)fclose(f);
 }
 
+/* The source a unit was compiled from (NNNNN.filo), and the packs it was
+   compiled with (NNNNN.packs, when any): the Go engine's compiler must
+   write the same unit from them (TestCUnits in filo/conformance). */
+static void write_source(const char *script) {
+    write_file(".filo", script, strlen(script));
+    const char *packs = want_math && want_strings ? "math strings"
+                        : want_math               ? "math"
+                        : want_strings            ? "strings"
+                                                  : NULL;
+    if (packs != NULL) {
+        write_file(".packs", packs, strlen(packs));
+    }
+}
+
 /* Builds prog into unit_mem as a one-entry unit named "main"; 0 when it
    does not build. */
 static size_t build_unit(filo_ctx *ctx, const filo_prog *prog) {
@@ -277,6 +291,8 @@ static bool eval_into(filo_ctx *dst, const char *global, const char *expr, int g
         char suffix[16];
         (void)snprintf(suffix, sizeof(suffix), ".g%d.fbc", given);
         write_file(suffix, unit_mem, len);
+        (void)snprintf(suffix, sizeof(suffix), ".g%d.filo", given);
+        write_file(suffix, expr, strlen(expr));
     }
     if (!ok) {
         snprintf(why, cap, "\"%s\" does not evaluate: %s", expr, filo_error(tmp));
@@ -375,6 +391,7 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
     }
     if (unit_written) {
         write_expect(ctx, c, failed ? NULL : &got);
+        write_source(c->script);
     }
     if (c->want_err) {
         bool ok = true;

@@ -100,40 +100,55 @@ size_t filo_libc_num_to_str(void *user, double x, char *dst, size_t cap) {
 /* Go's ParseFloat: decimal only (no hex), underscores allowed only between
    digits, inf/infinity/nan accepted case-insensitively, the whole string
    must be consumed. */
+/* s as strtod reads it, the separators between digits taken out; any
+   length, as the Go engine reads it (a literal of a hundred digits is a
+   number, not a name). */
 bool filo_libc_str_to_num(void *user, const uint8_t *s, size_t len, double *out) {
     (void)user;
-    if (len == 0 || len > 63) {
+    if (len == 0) {
         return false;
     }
-    char buf[64];
-    size_t n = 0;
-    for (size_t i = 0; i < len; i++) {
-        char c = (char)s[i];
-        if (c == 'x' || c == 'X') {
+    char small[64];
+    char *buf = small;
+    if (len >= sizeof(small)) {
+        buf = malloc(len + 1);
+        if (buf == NULL) {
             return false;
         }
-        if (c == '_') {
-            bool between = false;
-            if (i > 0 && i + 1 < len && s[i - 1] >= '0' && s[i - 1] <= '9' && s[i + 1] >= '0' &&
-                s[i + 1] <= '9') {
-                between = true;
+    }
+    size_t n = 0;
+    bool ok = true;
+    for (size_t i = 0; i < len && ok; i++) {
+        char c = (char)s[i];
+        if (c == 'x' || c == 'X') {
+            ok = false;
+        } else if (c == '_') {
+            /* a separator only between digits, as Go allows it */
+            if (i == 0 || i + 1 >= len || s[i - 1] < '0' || s[i - 1] > '9' || s[i + 1] < '0' ||
+                s[i + 1] > '9') {
+                ok = false;
             }
-            if (!between) {
-                return false;
-            }
-            continue;
+        } else {
+            buf[n] = c;
+            n++;
         }
-        buf[n] = c;
-        n++;
     }
     buf[n] = '\0';
     char *end = NULL;
-    double x = strtod(buf, &end);
-    if (end == buf || *end != '\0') {
-        return false;
+    double x = 0;
+    if (ok) {
+        x = strtod(buf, &end);
+        if (end == buf || *end != '\0') {
+            ok = false;
+        }
     }
-    *out = x;
-    return true;
+    if (buf != small) {
+        free(buf);
+    }
+    if (ok) {
+        *out = x;
+    }
+    return ok;
 }
 
 /* Installs libm's pow for fractional exponents. */

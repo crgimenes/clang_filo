@@ -3010,6 +3010,11 @@ static bool same_const(const filo_value *a, const filo_value *b) {
 }
 
 static uint32_t bc_const(bcc *c, filo_value v) {
+    if (v.kind == FILO_NUMBER && v.u.num != v.u.num) {
+        /* one NaN, the same bytes on every machine and from either compiler */
+        uint64_t bits = 0x7FF8000000000000ULL;
+        memcpy(&v.u.num, &bits, sizeof(bits));
+    }
     bool ok = false;
     if (v.kind == FILO_NUMBER || v.kind == FILO_BOOL || v.kind == FILO_STRING) {
         ok = true;
@@ -5736,32 +5741,226 @@ static int b_mod(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     return FILO_OK;
 }
 
-/* pow is a host concern in a freestanding build; the core keeps an exact
-   path for integral exponents and asks the host (through num hooks being
-   present) only implicitly. Fractional exponents use the identity below via
-   exp/log approximations would drift from Go, so this runtime declares pow
-   for integral exponents and NaN-free bases; the libc host overrides it. */
-static double core_pow(double a, double b) {
+/* pow with an integral exponent: the same double on every machine and in
+   the Go engine, which computes it step for step the same way (powInt in
+   pow.go). The C library's pow differs between machines and Go's is not
+   correctly rounded; a program is the same bytes everywhere only if its
+   folded constants are, and the same result only if pow is.
+
+   The mantissa is raised in double-double (a pair of doubles, about 106
+   bits) by squaring, with the exponent kept apart in an integer, so no step
+   leaves the range of the doubles; the power of two is put back once, at
+   the end, with one rounding. Every product goes through rmul, which rounds
+   it where it is written: a compiler may fuse a multiply and an add, which
+   rounds once where these steps round twice. */
+static double rmul(double a, double b) {
+    volatile double p = a * b;
+    return p;
+}
+
+static double bits_double(uint64_t bits) {
+    double x = 0;
+    memcpy(&x, &bits, sizeof(x));
+    return x;
+}
+
+static uint64_t double_bits(double x) {
+    uint64_t bits = 0;
+    memcpy(&bits, &x, sizeof(bits));
+    return bits;
+}
+
+/* 2^k, for k from -1022 to 1023 */
+static double pow2(int32_t k) {
+    return bits_double((uint64_t)(k + 1023) << 52U);
+}
+
+/* x = f·2^e with f in [0.5, 1), for a finite x other than 0 */
+static double frexp_bits(double x, int32_t *e) {
+    uint64_t bits = double_bits(x);
+    int32_t exp = (int32_t)((bits >> 52U) & 0x7FFU);
+    int32_t adjust = 0;
+    if (exp == 0) { /* subnormal: made normal first, exactly */
+        x = rmul(x, pow2(54));
+        bits = double_bits(x);
+        exp = (int32_t)((bits >> 52U) & 0x7FFU);
+        adjust = -54;
+    }
+    *e = exp - 1022 + adjust;
+    return bits_double((bits & ~((uint64_t)0x7FFU << 52U)) | ((uint64_t)1022U << 52U));
+}
+
+/* a as two halves of 26 bits, whose products are exact */
+static void dd_split(double a, double *h, double *l) {
+    double c = rmul(134217729.0, a); /* 2^27 + 1 */
+    *h = c - (c - a);
+    *l = a - *h;
+}
+
+/* a*b rounded, and what the rounding lost (Dekker's, without an fma); the
+   operands are mantissas, near 1, so nothing overflows */
+static double two_prod(double a, double b, double *e) {
+    double p = rmul(a, b);
+    double ah = 0;
+    double al = 0;
+    double bh = 0;
+    double bl = 0;
+    dd_split(a, &ah, &al);
+    dd_split(b, &bh, &bl);
+    *e = (((rmul(ah, bh) - p) + rmul(ah, bl)) + rmul(al, bh)) + rmul(al, bl);
+    return p;
+}
+
+/* a+b rounded, and what the rounding lost */
+static double two_sum(double a, double b, double *e) {
+    double s = a + b;
+    double bb = s - a;
+    *e = (a - (s - bb)) + (b - bb);
+    return s;
+}
+
+static double dd_mul(double xh, double xl, double yh, double yl, double *l) {
+    double e = 0;
+    double p = two_prod(xh, yh, &e);
+    e = e + (rmul(xh, yl) + rmul(xl, yh));
+    return two_sum(p, e, l);
+}
+
+/* 1/(h+l): the quotient of the high part, corrected by its remainder */
+static double dd_recip(double h, double l, double *out_l) {
+    double q = 1 / h;
+    double pe = 0;
+    double p = two_prod(q, h, &pe);
+    double rem = ((1 - p) - pe) - rmul(q, l);
+    return two_sum(q, rem / h, out_l);
+}
+
+/* h into [0.5, 1), l with it, and *e by as much */
+static double dd_norm(double h, double *l, int32_t *e) {
+    int32_t k = 0;
+    double f = frexp_bits(h, &k);
+    *l = rmul(*l, pow2(-k));
+    *e += k;
+    return f;
+}
+
+/* s·2^e for s in [0.5, 1], rounded once: a power of two within the normal
+   doubles scales exactly, and only the last step can round */
+static double scale2(double s, int32_t e) {
+    if (e > 2046) {
+        return bits_double(0x7FF0000000000000ULL);
+    }
+    if (e > 1023) {
+        return rmul(rmul(s, pow2(1023)), pow2(e - 1023));
+    }
+    if (e >= -1022) {
+        return rmul(s, pow2(e));
+    }
+    if (e >= -2022) {
+        return rmul(rmul(s, pow2(-1000)), pow2(e + 1000));
+    }
+    return 0;
+}
+
+/* ±0 or ±Inf raised to an integral power, as IEEE 754's pow */
+static double pow_edge(double a, bool neg, bool odd) {
+    bool zero = false;
+    if (a == 0) {
+        zero = true;
+    }
+    if (neg) { /* 0 to a negative power is infinite, and infinity's is 0 */
+        if (zero) {
+            zero = false;
+        } else {
+            zero = true;
+        }
+    }
+    double r = zero ? 0 : bits_double(0x7FF0000000000000ULL);
+    if (odd && (double_bits(a) >> 63U) != 0) {
+        return -r;
+    }
+    return r;
+}
+
+/* b is a whole number (every double past 2^52 is) */
+static bool is_whole(double b) {
+    if (b - b != 0) { /* NaN or ±Inf */
+        return false;
+    }
+    double m = b < 0 ? -b : b;
+    if (m >= 4503599627370496.0 || b == (double)(int64_t)b) {
+        return true;
+    }
+    return false;
+}
+
+static double pow_int(double a, double b) {
     if (b == 0) {
         return 1;
     }
-    /* the range first: casting 1e300 or NaN to int64 is undefined */
-    if (b > -1e6 && b < 1e6 && b == (double)(int64_t)b) {
-        int64_t se = (int64_t)b;
-        bool neg = se < 0;
-        uint64_t e = (uint64_t)(neg ? -se : se);
-        double r = 1;
-        double base = a;
-        while (e > 0) {
-            if ((e & 1U) != 0) {
-                r *= base;
-            }
-            base *= base;
-            e >>= 1U;
-        }
-        return neg ? 1 / r : r;
+    if (a != a) {
+        return a;
     }
-    return __builtin_nan(""); /* not representable without libm; the libc host installs pow */
+    bool neg = b < 0;
+    double n = neg ? -b : b;
+    bool odd = false; /* past 2^53 every double is even */
+    if (n < 9007199254740992.0 && ((uint64_t)n & 1U) != 0) {
+        odd = true;
+    }
+    if (n > 4611686018427387904.0) {
+        n = 4611686018427387904.0; /* 2^62: as large and even, the result is 0, 1 or +Inf all the
+                                      same */
+    }
+    if (a == 0 || a - a != 0) {
+        return pow_edge(a, neg, odd);
+    }
+    int32_t k = 0;
+    double m = frexp_bits(a < 0 ? -a : a, &k);
+    double rh = 1;
+    double rl = 0;
+    int32_t re = 0;
+    double bh = m;
+    double bl = 0;
+    int32_t be = k;
+    for (uint64_t e = (uint64_t)n;;) {
+        if ((e & 1U) != 0) {
+            rh = dd_mul(rh, rl, bh, bl, &rl);
+            re += be;
+            rh = dd_norm(rh, &rl, &re);
+        }
+        e >>= 1U;
+        if (e == 0) {
+            break;
+        }
+        if (be > 4096 || be < -4096) {
+            /* every factor is a power of |a|, all above 1 or all below: one
+               this far out decides the result, past any double */
+            re = be;
+            break;
+        }
+        bh = dd_mul(bh, bl, bh, bl, &bl);
+        be *= 2;
+        bh = dd_norm(bh, &bl, &be);
+    }
+    if (neg) {
+        rh = dd_recip(rh, rl, &rl);
+        re = -re;
+        rh = dd_norm(rh, &rl, &re);
+    }
+    double r = scale2(rh + rl, re);
+    if (a < 0 && odd) {
+        return -r;
+    }
+    return r;
+}
+
+/* pow with a fractional exponent is the host's: without a C library it is
+   NaN (the libc host installs pow, which differs from Go's in the last
+   bits there, as the corpus's host-pow cases allow) */
+static double core_pow(double a, double b) {
+    (void)a;
+    (void)b;
+    return __builtin_nan("");
 }
 
 static double (*pow_hook)(double, double) = core_pow;
@@ -5775,7 +5974,7 @@ static int b_pow(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     if (as_num(ctx, &args[0], &a) != FILO_OK || as_num(ctx, &args[1], &b) != FILO_OK) {
         return FILO_ERR;
     }
-    *out = filo_num(pow_hook(a, b));
+    *out = filo_num(is_whole(b) ? pow_int(a, b) : pow_hook(a, b)); /* the same double everywhere */
     return FILO_OK;
 }
 

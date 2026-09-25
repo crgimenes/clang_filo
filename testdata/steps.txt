@@ -31,6 +31,14 @@ arithmetic.txt	nested arithmetic	1
 arithmetic.txt	large integers stay exact	1
 arithmetic.txt	unary division is the reciprocal	1
 arithmetic.txt	unary division of one	1
+arithmetic.txt	pow with an integral exponent is the nearest double	1
+arithmetic.txt	pow with a negative exponent is the nearest double	1
+arithmetic.txt	pow of a negative base keeps the odd power's sign past the doubles	1
+arithmetic.txt	the floored modulo of a huge power is exact	1
+arithmetic.txt	a literal past the doubles is infinite	1
+arithmetic.txt	a negative literal past the doubles is minus infinity	1
+arithmetic.txt	number of a string past the doubles is infinite	1
+arithmetic.txt	a literal below the doubles is zero	1
 casts.txt	string of integer	1
 casts.txt	string of float	1
 casts.txt	string of small float	1
@@ -237,6 +245,7 @@ literals.txt	plus sign literal	1
 literals.txt	plus sign with leading dot	1
 literals.txt	exponent with sign	1
 literals.txt	uppercase exponent	1
+literals.txt	a literal of a hundred digits is a number	1
 logic.txt	not true	1
 logic.txt	not false	1
 logic.txt	and true	3

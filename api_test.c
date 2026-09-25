@@ -2,6 +2,7 @@
    crossing in and out, and calling a script function from C. Exit status is
    the number of failures. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "filo.h"
@@ -663,8 +664,60 @@ static void test_runs_pause_and_resume(void) {
     CHECK(strstr(filo_error(&CTX), "no run is paused") != NULL);
 }
 
+/* testdata/pow.txt pins pow with an integral exponent to the double nearest
+   the exact power, bit for bit, on every machine: the Go engine reads the
+   same file. The libc host installs the C library's pow, which is only for
+   fractional exponents. */
+static void test_pow_is_the_same_everywhere(void) {
+    FILE *f = fopen("testdata/pow.txt", "r");
+    CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    char line[128];
+    int n = 0;
+    int wrong = 0;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (line[0] == '#') {
+            continue;
+        }
+        char *rest = NULL;
+        uint64_t ab = strtoull(line, &rest, 16);
+        long long e = strtoll(rest, &rest, 10);
+        uint64_t want = strtoull(rest, NULL, 16);
+        double a = 0;
+        memcpy(&a, &ab, sizeof(a));
+        start();
+        char src[64];
+        (void)snprintf(src, sizeof(src), "(pow a %lld)", e);
+        filo_value v;
+        memset(&v, 0, sizeof(v));
+        uint64_t got = 0;
+        if (filo_set_global(&CTX, "a", filo_num(a)) == FILO_OK && run(src, &v) == FILO_OK) {
+            memcpy(&got, &v.u.num, sizeof(got));
+        }
+        bool nan_both = false;
+        if (v.u.num != v.u.num && (want & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL &&
+            (want & 0xFFFFFFFFFFFFFULL) != 0) {
+            nan_both = true;
+        }
+        if (got != want && !nan_both) {
+            if (wrong < 3) {
+                printf("  pow(%a, %lld): %016llx, want %016llx\n", a, e, (unsigned long long)got,
+                       (unsigned long long)want);
+            }
+            wrong++;
+        }
+        n++;
+    }
+    fclose(f);
+    CHECK(n > 1000);
+    CHECK(wrong == 0);
+}
+
 int main(void) {
     filo_libc_install();
+    test_pow_is_the_same_everywhere();
     test_globals_cross_both_ways();
     test_seal_refuses_new_globals();
     test_seal_is_off_until_asked();
