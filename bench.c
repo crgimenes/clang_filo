@@ -1,5 +1,10 @@
 /* The Go engine's BenchmarkRecursiveCall, on the C runtime: fib 15 per run,
    reported as ns/op so the two numbers compare directly. */
+/* clock_gettime and CLOCK_MONOTONIC are POSIX: glibc hides them under a
+   strict -std unless asked; macOS and the BSDs ignore the macro. */
+/* NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp): POSIX names it */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

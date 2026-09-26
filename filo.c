@@ -198,7 +198,9 @@ filo_value filo_string(const uint8_t *ptr, uint32_t len) {
     filo_value v = {0};
     memset(&v, 0, sizeof(v));
     v.kind = FILO_STRING;
-    v.u.str.ptr = ptr;
+    /* never NULL, even empty: it reaches memcpy, which may not take NULL
+       whatever the length (glibc says so, and UBSan holds it) */
+    v.u.str.ptr = ptr != NULL ? ptr : (const uint8_t *)"";
     v.u.str.len = len;
     return v;
 }
@@ -5000,6 +5002,9 @@ typedef struct {
 } sink;
 
 static void sink_put(sink *s, const char *bytes, size_t n) {
+    if (n == 0) {
+        return; /* bytes may be NULL then, as a host's own empty string is */
+    }
     if (s->dst != NULL && s->pos < s->cap) {
         size_t room = s->cap - s->pos;
         memcpy(s->dst + s->pos, bytes, n < room ? n : room);
