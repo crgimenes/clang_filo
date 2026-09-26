@@ -1,0 +1,9 @@
+2:1     let
+2:1       def double
+2:13        fn  names x
+2:21          callb *
+2:24            local x  (frame 0 out, slot 0)
+2:26            const 2
+3:1       call
+3:2         global double
+3:9         const 21

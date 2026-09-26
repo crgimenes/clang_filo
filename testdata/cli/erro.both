@@ -1,2 +1,0 @@
-ir  error at 2:20: in let: in function call: in builtin "*": expected number, got string  (9 steps, one a node)
-vm  error at 2:20: in builtin "*": expected number, got string  (9 steps, one an instruction)

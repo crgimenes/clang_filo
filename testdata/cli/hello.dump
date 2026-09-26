@@ -1,14 +1,14 @@
-unit: 149 bytes, format 1, checksum 6729269c ok
+unit: 152 bytes, format 1, checksum 645fdda9 ok
 widest stack 1, widest frame 0
 debug: line and column of each instruction
 
 imports (0): functions the loading VM must provide
 globals (0)
 constants (1)
-     0  "olá mundo"
+     0  "hello world"
 exports (1)
-  ola -> fn 0
+  hello -> fn 0
 
-fn 0 (entry "ola"): params 0, slots 0, stack 1, 2 bytes
-  0000  00              2:1    PUSH_K   0         "olá mundo"
+fn 0 (entry "hello"): params 0, slots 0, stack 1, 2 bytes
+  0000  00              2:1    PUSH_K   0         "hello world"
   0001  58                     RET      0         return

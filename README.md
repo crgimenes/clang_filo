@@ -27,7 +27,11 @@ name in every context) is a build setting too; the device check runs with
 128.
 
 `filo show`, `filo run` (`--both`, `--trace`), `filo build`, `filo bundle` and `filo dump` show the road
-from source to the machine: `examples/` starts at "olá mundo".
+from source to the machine: `examples/` starts at "hello world" and goes,
+a lesson a file, through lists, functions as values, strings, closures,
+tuples and early return. Each file says what it gives on its last line
+(`; Output:` or `; Error:`), and `make cli` holds `filo run` to it; the Go
+repository keeps the same files and holds its `filo` to the same lines.
 
 ## Memory
 

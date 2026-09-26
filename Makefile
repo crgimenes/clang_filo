@@ -80,8 +80,8 @@ device: all device_test.c
 # to the runtime on how numbers are written. What the examples show is kept
 # in testdata/cli: a change to the compiler is a change to what a lesson
 # shows, and it shows up here (make cli-regen rewrites them).
-CLI_CASES = ola.run ola.dump fib.run fib.dump dobro.dump dobro.trace demo.run demo.dump \
-	constantes.tree constantes.folded dobro.ir dobro.both erro.both
+CLI_CASES = hello.run hello.dump fib.run fib.dump double.dump double.trace demo.run demo.dump \
+	constants.tree constants.folded double.ir double.both mistake.both
 CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c
 
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
@@ -90,11 +90,11 @@ build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
 		-o build/filo $(CLI_SRC) filo_cli.c -lm
 
 # the demo bundle: two examples, built and bundled as a lesson would
-build/cli/demo.fbb: build/filo examples/ola.filo examples/dobro.filo
+build/cli/demo.fbb: build/filo examples/hello.filo examples/double.filo
 	@mkdir -p build/cli
-	./build/filo build -o build/cli/ola.fbc examples/ola.filo
-	./build/filo build -o build/cli/dobro.fbc examples/dobro.filo
-	./build/filo bundle -o $@ build/cli/ola.fbc build/cli/dobro.fbc
+	./build/filo build -o build/cli/hello.fbc examples/hello.filo
+	./build/filo build -o build/cli/double.fbc examples/double.filo
+	./build/filo bundle -o $@ build/cli/hello.fbc build/cli/double.fbc
 
 cli: device build/filo build/cli/demo.fbb dump_test.c
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
@@ -104,6 +104,22 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 		./build/filo $$(sh testdata/cli/args.sh $$c) > build/cli.out 2>&1; \
 		diff -u testdata/cli/$$c build/cli.out || exit 1; \
 	done; echo "cli: $(words $(CLI_CASES)) outputs as kept"
+	@# each example says what it gives on its last line, as in the Go
+	@# repository, which keeps the same files: "; Output: VALUE" on the tree
+	@# and as bytecode, or "; Error: LINE:COL: MESSAGE"
+	@for f in examples/*.filo; do \
+		want=$$(sed -n 's/^; Output: //p' $$f); \
+		if [ -n "$$want" ]; then \
+			for m in "" --vm; do \
+				got=$$(./build/filo run $$m $$f 2>&1); \
+				[ "$$got" = "$$want" ] || { echo "$$f $$m: $$got, want $$want"; exit 1; }; \
+			done; \
+		else \
+			want=$$(sed -n 's/^; Error: //p' $$f); \
+			got=$$(./build/filo run $$f 2>&1 >/dev/null); \
+			[ -n "$$want" ] && [ "$$got" = "filo: $$f:$$want" ] || { echo "$$f: $$got, want $$want"; exit 1; }; \
+		fi; \
+	done; echo "examples: $(words $(wildcard examples/*.filo)) as they say"
 
 cli-regen: build/filo build/cli/demo.fbb
 	@for c in $(CLI_CASES); do ./build/filo $$(sh testdata/cli/args.sh $$c) > testdata/cli/$$c 2>&1; done

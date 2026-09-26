@@ -1,3 +1,4 @@
 ; A function and a call: the smallest program with a frame of its own.
-(def dobro (fn (x) (* x 2)))
-(dobro 21)
+(def double (fn (x) (* x 2)))
+(double 21)
+; Output: 42

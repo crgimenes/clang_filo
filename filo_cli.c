@@ -54,8 +54,8 @@ static const char usage[] =
     "            (default: main, or the unit's first entry)\n"
     "\n"
     "Example:\n"
-    "  echo '(str-upper \"ola mundo\")' > ola.filo\n"
-    "  filo run ola.filo && filo build -o ola.fbc ola.filo && filo dump ola.fbc\n";
+    "  echo '(str-upper \"hello world\")' > hello.filo\n"
+    "  filo run hello.filo && filo build -o hello.fbc hello.filo && filo dump hello.fbc\n";
 
 /* A diagnostic, on stderr, where it does not mix with the value. */
 static int complain(const char *text) {
@@ -114,7 +114,7 @@ static bool is_bytecode(const uint8_t *p, size_t n) {
     return fbc_kind(p, n) != 0;
 }
 
-/* "lib/ola.filo" is the entry "ola", and "lib/ola.fbc" the member "ola" */
+/* "lib/hello.filo" is the entry "hello", and "lib/hello.fbc" the member "hello" */
 static void entry_name(const char *path, const char *ext, char *dst, size_t cap) {
     const char *base = strrchr(path, '/');
     base = base != NULL ? base + 1 : path;

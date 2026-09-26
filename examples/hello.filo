@@ -1,2 +1,3 @@
 ; The smallest program: its value is what it says.
-"olá mundo"
+"hello world"
+; Output: hello world
