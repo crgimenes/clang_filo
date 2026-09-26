@@ -104,12 +104,22 @@ uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap);
    false without one. */
 bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col);
 
+/* The debug section in one pass, entry by entry, until out says to stop:
+   from pc on, the instructions came from line:col (0:0 when the section
+   says no line). A pc that entries share takes the last one's. */
+typedef bool (*fbc_place)(void *user, uint32_t pc, uint32_t line, uint32_t col);
+void fbc_positions(const fbc_unit *u, fbc_place out, void *user);
+
 /* A number as Filo writes it (Go's strconv, 'g', shortest). It takes the C
    library's printf and strtod; a host without them defines FBC_HOST_NUMBERS
    and supplies this function with its own number text (msh's wasm build,
    filo_nolibc_num_to_str). The rest of this file and fbc_decompile.c take
    only snprintf and vsnprintf for integers and strings. */
 void fbc_number(double x, char *dst, size_t cap);
+
+/* A section's name as the spec gives it ("code"), or "kind N" for one it
+   does not define. */
+void fbc_section_name(uint32_t kind, char *dst, size_t cap);
 
 /* The whole listing, a line at a time. */
 typedef void (*fbc_out)(void *user, const char *line);

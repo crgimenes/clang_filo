@@ -5570,8 +5570,9 @@ static int bc_go_on(filo_ctx *ctx, bc_act *base, bc_act *start, uint32_t budget,
     return run_end(ctx, rc, v, &saved, result);
 }
 
-int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
-                  const filo_limits *limits, uint32_t budget, filo_value *result) {
+/* filo_bc_start, or with hold filo_bc_begin: paused before anything runs. */
+static int bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                    const filo_limits *limits, bool hold, uint32_t budget, filo_value *result) {
     const bc_fn *fn = bc_export(unit, entry);
     if (fn == NULL) {
         cancel_paused(ctx);
@@ -5591,7 +5592,39 @@ int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
         filo_value v = {0};
         return run_end(ctx, FILO_ERR, v, &saved, result);
     }
+    if (hold) {
+        ctx->paused = a;
+        ctx->paused_base = a;
+        return FILO_PAUSED;
+    }
     return bc_go_on(ctx, a, a, budget, result);
+}
+
+int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                  const filo_limits *limits, uint32_t budget, filo_value *result) {
+    return bc_start(ctx, unit, entry, limits, false, budget, result);
+}
+
+int filo_bc_begin(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                  const filo_limits *limits) {
+    return bc_start(ctx, unit, entry, limits, true, 0, NULL);
+}
+
+uint32_t filo_bc_frames(const filo_ctx *ctx, filo_bc_frame *out, uint32_t cap) {
+    uint32_t n = 0;
+    for (const bc_act *a = ctx->paused; a != NULL; a = a->caller) {
+        if (n < cap) {
+            filo_bc_frame *f = &out[n];
+            f->fn = (uint32_t)(a->fn - a->fn->unit->fns);
+            f->pc = a->pc;
+            f->slots = a->f->slots;
+            f->nslots = a->fn->nslots;
+            f->operands = a->stack;
+            f->noperands = a->sp;
+        }
+        n++;
+    }
+    return n;
 }
 
 int filo_bc_resume(filo_ctx *ctx, uint32_t budget, filo_value *result) {

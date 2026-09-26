@@ -689,6 +689,44 @@ static void test_runs_pause_and_resume(void) {
     CHECK(strstr(filo_error(&CTX), "no run is paused") != NULL);
 }
 
+/* A debugger's view of a run: held before its first instruction, then its
+   calls at every instruction, innermost first, numbered as a listing
+   numbers the unit's functions. */
+static void test_paused_runs_show_their_calls(void) {
+    start();
+    const char *sq[] = {"(def sq (fn (x) (* x x))) (+ 1 (sq 7))"};
+    size_t len = build(sq, 1);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    filo_bc_frame fr[4];
+    CHECK(filo_bc_frames(&CTX, fr, 4) == 0);
+    CHECK(filo_bc_begin(&CTX, u, "e0", NULL) == FILO_PAUSED);
+    CHECK(CTX.steps == 0);
+    CHECK(filo_bc_frames(&CTX, fr, 4) == 1);
+    uint32_t entry = fr[0].fn;
+    CHECK(fr[0].noperands == 0);
+    uint32_t deepest = 0;
+    bool saw_seven = false;
+    filo_value v = {0};
+    int rc = FILO_PAUSED;
+    while (rc == FILO_PAUSED) {
+        uint32_t n = filo_bc_frames(&CTX, fr, 4);
+        CHECK(n >= 1 && n <= 2 && fr[n - 1].fn == entry);
+        deepest = n > deepest ? n : deepest;
+        if (n == 2) {
+            CHECK(fr[0].fn != entry && fr[0].nslots == 1);
+            if (fr[0].slots[0].u.num == 7) {
+                saw_seven = true;
+            }
+            CHECK(filo_bc_frames(&CTX, fr, 1) == 2); /* the count, past cap */
+        }
+        rc = filo_bc_resume(&CTX, 1, &v);
+    }
+    CHECK(rc == FILO_OK && v.u.num == 50);
+    CHECK(deepest == 2 && saw_seven);
+    CHECK(filo_bc_frames(&CTX, fr, 4) == 0);
+}
+
 /* testdata/pow.txt pins pow with an integral exponent to the double nearest
    the exact power, bit for bit, on every machine: the Go engine reads the
    same file. The libc host installs the C library's pow, which is only for
@@ -752,6 +790,7 @@ int main(void) {
     test_errors_say_where();
     test_constants_fold_as_on_go();
     test_runs_pause_and_resume();
+    test_paused_runs_show_their_calls();
     test_host_calls_a_script_function();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();

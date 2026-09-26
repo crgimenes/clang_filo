@@ -605,32 +605,57 @@ uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap) {
     return (uint32_t)(r.at - u->code.off - pc);
 }
 
-bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col) {
+void fbc_positions(const fbc_unit *u, fbc_place out, void *user) {
     reader r = {u->data, u->debug.off, (size_t)u->debug.off + u->debug.len, false};
     uint32_t at = 0;
     int64_t l = 0;
-    uint32_t c = 0;
-    bool found = false;
     while (r.at < r.end) {
         uint32_t d = rd_uleb(&r);
         uint32_t z = rd_uleb(&r);
-        uint32_t cc = rd_uleb(&r);
+        uint32_t c = rd_uleb(&r);
         if (r.bad || d > UINT32_MAX - at) {
-            break;
+            return;
         }
         at += d;
-        if (at > pc) {
-            break;
-        }
         l += (z & 1U) != 0 ? -(int64_t)((z + 1U) / 2U) : (int64_t)(z / 2U);
-        c = cc;
-        found = l >= 1;
+        bool more = false;
+        if (l >= 1 && l <= UINT32_MAX) {
+            more = out(user, at, (uint32_t)l, c);
+        } else {
+            more = out(user, at, 0, 0);
+        }
+        if (!more) {
+            return;
+        }
     }
-    if (found) {
-        *line = (uint32_t)l;
-        *col = c;
+}
+
+typedef struct {
+    uint32_t pc;
+    uint32_t line;
+    uint32_t col;
+    bool found;
+} position_at;
+
+static bool keep_position(void *user, uint32_t at, uint32_t line, uint32_t col) {
+    position_at *p = user;
+    if (at > p->pc) {
+        return false;
     }
-    return found;
+    p->line = line;
+    p->col = col;
+    p->found = line > 0;
+    return true;
+}
+
+bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col) {
+    position_at p = {pc, 0, 0, false};
+    fbc_positions(u, keep_position, &p);
+    if (p.found) {
+        *line = p.line;
+        *col = p.col;
+    }
+    return p.found;
 }
 
 /* ---- the listing ---- */
@@ -864,6 +889,14 @@ static const char *const section_names[] = {
     "", "imports", "globals", "constants", "functions", "code", "exports", "debug", "externs",
 };
 
+void fbc_section_name(uint32_t kind, char *dst, size_t cap) {
+    if (kind > 0 && kind < 9) {
+        (void)snprintf(dst, cap, "%s", section_names[kind]);
+        return;
+    }
+    (void)snprintf(dst, cap, "kind %u", kind);
+}
+
 bool fbc_size(const uint8_t *data, size_t len, const char *label, fbc_out out, void *user,
               char *why, size_t cap) {
     size_t table = 0;
@@ -892,11 +925,7 @@ bool fbc_size(const uint8_t *data, size_t len, const char *label, fbc_out out, v
         for (uint32_t j = 0; j < u->nsections; j++) {
             const fbc_section *sec = &u->sections[j];
             char name[24];
-            if (sec->kind > 0 && sec->kind < 9) {
-                (void)snprintf(name, sizeof(name), "%s", section_names[sec->kind]);
-            } else {
-                (void)snprintf(name, sizeof(name), "kind %u", sec->kind);
-            }
+            fbc_section_name(sec->kind, name, sizeof(name));
             (void)snprintf(line, sizeof(line), "  %-10s %7u", name, sec->span.len);
             out(user, line);
             rest -= (long)sec->span.len;

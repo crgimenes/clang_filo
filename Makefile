@@ -19,9 +19,9 @@ TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magi
 
 all: build/corpus_runner
 
-build/corpus_runner: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c $(HDRS)
+build/corpus_runner: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c $(HDRS)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c -lm
+	$(CC) $(CFLAGS) -o $@ $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c -lm
 
 # The libc-free number host against the libc one, on a machine with both.
 nolibc: $(CORE) $(PACKS) $(HOST) $(NOLIBC) nolibc_test.c $(HDRS)
@@ -39,10 +39,10 @@ api: $(CORE) $(PACKS) $(HOST) api_test.c $(HDRS)
 
 # The corpus under sanitizers: the C runtime must agree with the Go engine
 # on every case, and must do it without a single memory fault.
-corpus: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c $(HDRS)
+corpus: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
-		-o build/corpus_runner_san $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c -lm
+		-o build/corpus_runner_san $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c -lm
 	./build/corpus_runner_san --steps testdata/steps.txt $(CORPUS)
 	./build/corpus_runner_san --vm $(CORPUS)
 	./build/corpus_runner_san --vm --pause 1 $(CORPUS)

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fbc_dump.h"
 #include "filo.h"
 #include "filo_libc.h"
 #include "filo_nolibc.h"
@@ -156,14 +157,98 @@ static int misplaced = 0; /* errors the VM and the IR place differently */
 static uint32_t pause_budget = 0;
 static unsigned long pauses = 0;
 
-static int vm_run(filo_ctx *ctx, const filo_unit *unit, const filo_limits *limits,
+/* A paused run's calls, as filo_bc_frames tells a debugger, read against
+   the unit as fbc_dump.c reads it, which shares no code with the VM: the
+   running call is at an instruction of its function, its slots and operands
+   within what the listing says the function holds, and a caller waits just
+   past a CALL. */
+static fbc_unit listing;
+static uint8_t insn_at[1U << 20U];    /* an instruction starts at this pc */
+static uint8_t after_call[1U << 20U]; /* a CALL ends at this pc */
+static int misframed = 0;
+
+static void read_listing(size_t len) {
+    char why[128];
+    if (!fbc_read(&listing, unit_mem, len, why, sizeof(why))) {
+        listing.nfns = 0;
+        return;
+    }
+    memset(insn_at, 0, listing.code.len);
+    memset(after_call, 0, listing.code.len + 1U);
+    for (uint32_t i = 0; i < listing.nfns; i++) {
+        const fbc_fn *f = &listing.fns[i];
+        uint32_t pc = f->off;
+        char text[256];
+        uint32_t n = fbc_insn(&listing, pc, text, sizeof(text));
+        while (pc < f->off + f->len && n > 0) {
+            insn_at[pc] = 1;
+            if (strncmp(text, "CALL ", 5) == 0) {
+                after_call[pc + n] = 1;
+            }
+            pc += n;
+            n = fbc_insn(&listing, pc, text, sizeof(text));
+        }
+    }
+}
+
+static bool frame_ok(const filo_bc_frame *f, bool running) {
+    if (f->fn >= listing.nfns) {
+        return false;
+    }
+    const fbc_fn *fn = &listing.fns[f->fn];
+    if (f->pc < fn->off || f->pc > fn->off + fn->len || f->nslots != fn->slots ||
+        f->noperands > fn->stack) {
+        return false;
+    }
+    if (!running) {
+        return after_call[f->pc] != 0U;
+    }
+    if (f->pc >= fn->off + fn->len) {
+        return false;
+    }
+    return insn_at[f->pc] != 0U;
+}
+
+/* The n calls of a pause, the first two in fr, after a pause depth deep. */
+static bool frames_ok(const filo_bc_frame *fr, uint32_t n, uint32_t depth) {
+    if (n == 0 || n > depth + 1 || (depth > 0 && n + 1 < depth)) {
+        return false; /* a step makes or ends one call at most */
+    }
+    if (!frame_ok(&fr[0], true)) {
+        return false;
+    }
+    if (n == 1) {
+        return true;
+    }
+    return frame_ok(&fr[1], false);
+}
+
+static void check_frames(const filo_ctx *ctx, uint32_t *depth) {
+    filo_bc_frame fr[2];
+    memset(fr, 0, sizeof(fr));
+    uint32_t n = filo_bc_frames(ctx, fr, 2);
+    bool ok = frames_ok(fr, n, *depth);
+    *depth = n;
+    if (!ok && listing.nfns > 0) {
+        if (misframed < 5) {
+            printf("case %u: paused calls do not read against the listing (%u deep, fn %u pc %u)\n",
+                   case_no, n, fr[0].fn, fr[0].pc);
+        }
+        misframed++;
+    }
+}
+
+static int vm_run(filo_ctx *ctx, const filo_unit *unit, size_t len, const filo_limits *limits,
                   filo_value *out) {
     if (pause_budget == 0) {
         return filo_bc_run(ctx, unit, "main", limits, out);
     }
-    int rc = filo_bc_start(ctx, unit, "main", limits, pause_budget, out);
+    read_listing(len);
+    uint32_t depth = 0;
+    int rc = filo_bc_begin(ctx, unit, "main", limits);
     while (rc == FILO_PAUSED) {
         pauses++;
+        check_frames(ctx, &depth);
         rc = filo_bc_resume(ctx, pause_budget, out);
     }
     return rc;
@@ -228,7 +313,7 @@ static int run_program(filo_ctx *ctx, const filo_prog *prog, const filo_limits *
         write_file(".fbc", unit_mem, len);
         unit_written = true;
     }
-    if (vm_run(ctx, unit, limits, out) == FILO_OK) {
+    if (vm_run(ctx, unit, len, limits, out) == FILO_OK) {
         return FILO_OK;
     }
     char vm_error[FILO_ERROR_MAX];
@@ -766,6 +851,10 @@ int main(int argc, char **argv) {
     if (misplaced > 0) {
         printf("%d error(s) placed differently by the VM and the IR\n", misplaced);
         failures += misplaced;
+    }
+    if (misframed > 0) {
+        printf("%d pause(s) whose calls do not read against the listing\n", misframed);
+        failures += misframed;
     }
     if (miscounted > 0) {
         printf("%d case(s) take other steps than on the Go engine\n", miscounted);

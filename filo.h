@@ -402,6 +402,26 @@ int filo_bc_start(filo_ctx *ctx, const filo_unit *unit, const char *entry,
                   const filo_limits *limits, uint32_t budget, filo_value *result);
 int filo_bc_resume(filo_ctx *ctx, uint32_t budget, filo_value *result);
 
+/* As filo_bc_start, but nothing runs: the run is paused before its first
+   instruction, where a debugger shows it beginning. */
+int filo_bc_begin(filo_ctx *ctx, const filo_unit *unit, const char *entry,
+                  const filo_limits *limits);
+
+/* A call of a paused run, as a debugger shows it. The values are the
+   machine's own: read them, and not after the run goes on. */
+typedef struct {
+    const filo_value *slots;    /* its locals, the parameters first */
+    const filo_value *operands; /* its operand stack, the bottom first */
+    uint32_t fn;                /* the unit's function, numbered as a listing numbers them */
+    uint32_t pc;                /* its next instruction, in the code section */
+    uint32_t nslots;
+    uint32_t noperands;
+} filo_bc_frame;
+
+/* The calls of the paused run, innermost first, the first cap of them in
+   out; how many there are, 0 when no run is paused. */
+uint32_t filo_bc_frames(const filo_ctx *ctx, filo_bc_frame *out, uint32_t cap);
+
 /* Runs an entry point of a loaded unit as filo_run runs a program. */
 int filo_bc_run(filo_ctx *ctx, const filo_unit *unit, const char *entry, const filo_limits *limits,
                 filo_value *result);
