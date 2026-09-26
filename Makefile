@@ -82,11 +82,11 @@ device: all device_test.c
 # to the runtime on how numbers are written. What the examples show is kept
 # in testdata/cli: a change to the compiler is a change to what a lesson
 # shows, and it shows up here (make cli-regen rewrites them).
-CLI_CASES = hello.run hello.dump fib.run fib.dump double.dump double.trace demo.run demo.dump \
+CLI_CASES = hello.run hello.dump fib.run fib.dump double.dump double.trace demo.run demo.dump demo.check demo.size \
 	constants.tree constants.folded double.ir double.both mistake.both
-CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c
+CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c
 
-build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h $(HDRS)
+build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/filo $(CLI_SRC) filo_cli.c -lm
@@ -106,6 +106,11 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 		./build/filo $$(sh testdata/cli/args.sh $$c) > build/cli.out 2>&1; \
 		diff -u testdata/cli/$$c build/cli.out || exit 1; \
 	done; echo "cli: $(words $(CLI_CASES)) outputs as kept"
+	@# asking a command for help is using it: its own, on stdout, exit 0
+	@for c in run build bundle dump show check size; do \
+		./build/filo $$c x -h > build/cli.out 2>&1 || { echo "$$c -h: exit $$?"; exit 1; }; \
+		head -1 build/cli.out | grep -q "^usage: filo $$c " || { echo "$$c -h: $$(head -1 build/cli.out)"; exit 1; }; \
+	done; echo "cli: every command's -h"
 	@# each example says what it gives on its last line, as in the Go
 	@# repository, which keeps the same files: "; Output: VALUE" on the tree
 	@# and as bytecode, or "; Error: LINE:COL: MESSAGE"
@@ -156,7 +161,7 @@ tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
-		nolibc_test.c fbc_dump.c filo_cli.c dump_test.c -- -std=c11
+		nolibc_test.c fbc_dump.c fbc_decompile.c filo_cli.c dump_test.c -- -std=c11
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) device_test.c -- -std=c11 -DFILO_VM_ONLY
@@ -164,7 +169,7 @@ tidy:
 check:
 	cppcheck --enable=warning,style,performance,portability --inline-suppr \
 		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c \
-		api_test.c nolibc_test.c device_test.c fbc_dump.c filo_cli.c dump_test.c
+		api_test.c nolibc_test.c device_test.c fbc_dump.c fbc_decompile.c filo_cli.c dump_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
 # strlen/strchr: the same freestanding wasm32 target the msh terminal uses.
@@ -208,7 +213,7 @@ fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
 # Each unit also runs a few instructions at a time, paused and resumed, and
 # must end as it ended in one go; testdata/fuzz-bc keeps the inputs that
 # once went wrong.
-fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h
+fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h fbc_decompile.c fbc_decompile.h
 	@mkdir -p build/fuzz_bc_seeds build/fuzz_bc_corpus
 	@./build/corpus_runner --vm --write-units build/fuzz_bc_seeds $(CORPUS) > /dev/null
 	@rm -f build/fuzz_bc_seeds/*.expect
@@ -216,7 +221,7 @@ fuzz-bc: all build/filo fuzz_bc.c fbc_dump.c fbc_dump.h
 		build/fuzz_bc_seeds/00002.fbc build/fuzz_bc_seeds/00003.fbc
 	@./build/filo bundle -o build/fuzz_bc_seeds/b2.fbb build/fuzz_bc_seeds/00100.fbc
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
-		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fbc_dump.c fuzz_bc.c -lm
+		-DFILO_VM_ONLY -o build/fuzz_bc $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c fuzz_bc.c -lm
 	@./build/fuzz_bc -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=65536 \
 		-artifact_prefix=build/fuzz_bc_crash_ build/fuzz_bc_corpus build/fuzz_bc_seeds testdata/fuzz-bc \
 		> build/fuzz_bc.log 2>&1 || { tail -30 build/fuzz_bc.log; exit 1; }

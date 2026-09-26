@@ -1,0 +1,21 @@
+demo.fbb  419 bytes: 2 members, 64 of header and table
+hello  152 bytes
+  header         116
+  imports          1
+  globals          1
+  constants       14
+  functions        6
+  code             2
+  exports          8
+  debug            3
+  externs          1
+double  203 bytes
+  header         116
+  imports          3
+  globals          8
+  constants       19
+  functions       11
+  code            12
+  exports          9
+  debug           24
+  externs          1

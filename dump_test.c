@@ -5,9 +5,11 @@
    the runtime writes it, for any double.
 
    usage: dump_test DIR */
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "fbc_decompile.h"
 #include "fbc_dump.h"
 #include "filo.h"
 #include "filo_libc.h"
@@ -82,7 +84,23 @@ static void test_numbers_read_as_the_runtime_writes_them(void) {
             diff++;
         }
     }
-    printf("numbers: 200000 doubles, %d written differently\n", diff);
+    /* every power of two too, where the shortest digits may lie on the far
+       side of x: a random double almost never is one */
+    for (int e = -1074; e <= 1023; e++) {
+        double x = ldexp(1.0, e);
+        char want[64];
+        char got[64];
+        size_t n = filo_libc_num_to_str(NULL, x, want, sizeof(want) - 1);
+        want[n] = '\0';
+        fbc_number(x, got, sizeof(got));
+        if (strcmp(want, got) != 0) {
+            if (diff < 5) {
+                printf("  2^%d: runtime %s, listing %s\n", e, want, got);
+            }
+            diff++;
+        }
+    }
+    printf("numbers: 200000 doubles and 2098 powers of two, %d written differently\n", diff);
     CHECK(diff == 0);
 }
 
@@ -133,6 +151,145 @@ static void test_units_list_and_agree_with_the_loader(const char *dir) {
     CHECK(read > 1000);
 }
 
+/* ---- decompiled, and compiled back ---- */
+
+static uint8_t dmem[64U << 20U];
+static uint8_t again[1U << 20U];
+static uint8_t stripped[2][1U << 20U];
+static char texts[64][1U << 16U];
+static size_t text_len[64];
+static char names[64][256];
+static uint32_t nsources;
+
+static void first_line(void *user, const char *line) {
+    char *keep = user;
+    if (keep[0] == '\0') {
+        (void)snprintf(keep, 128, "%s", line);
+    }
+}
+
+/* The folder's answer, as filo decompile's: the folded call is a literal. */
+static bool folds(void *user, const char *call, size_t len) {
+    filo_ctx *c = user;
+    char root[128] = "";
+    if (filo_show(c, (const uint8_t *)call, len, "folded", first_line, root) != FILO_OK) {
+        return false;
+    }
+    const char *what = strchr(root, ' ');
+    while (what != NULL && *what == ' ') {
+        what++;
+    }
+    if (what == NULL) {
+        return false;
+    }
+    if (strncmp(what, "number ", 7) == 0 || strncmp(what, "bool ", 5) == 0) {
+        return true;
+    }
+    return strncmp(what, "string ", 7) == 0;
+}
+
+static void keep_source(void *user, const char *name, size_t nlen, const char *text, size_t len) {
+    (void)user;
+    if (nsources < 64 && len < sizeof(texts[0])) {
+        (void)snprintf(names[nsources], sizeof(names[0]), "%.*s", (int)nlen, name);
+        memcpy(texts[nsources], text, len);
+        text_len[nsources] = len;
+    }
+    nsources++;
+}
+
+/* Each unit decompiles (fbc_decompile.c) to Filo that this runtime, with
+   the case's packs, compiles back to the same unit but for its debug
+   section; the text is kept beside it (NNNNN.dec: "; NAME" and the text,
+   an entry after another) for the Go engine's decompiler to be held to it
+   (make govm), character for character. */
+static void test_units_decompile_and_build_back(const char *dir) {
+    unsigned done = 0;
+    unsigned differ = 0;
+    for (unsigned no = 0;; no++) {
+        char path[512];
+        (void)snprintf(path, sizeof(path), "%s/%05u.fbc", dir, no);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) {
+            break;
+        }
+        size_t len = fread(data, 1, sizeof(data), f);
+        fclose(f);
+        char packs[64] = "";
+        (void)snprintf(path, sizeof(path), "%s/%05u.packs", dir, no);
+        f = fopen(path, "rb");
+        if (f != NULL) {
+            packs[fread(packs, 1, sizeof(packs) - 1, f)] = '\0';
+            fclose(f);
+        }
+        filo_init(&ctx, &filo_libc_host, persistent_mem, sizeof(persistent_mem), run_mem,
+                  sizeof(run_mem));
+        if (strstr(packs, "math") != NULL) {
+            (void)filo_math_register(&ctx, &filo_libc_math);
+        }
+        if (strstr(packs, "strings") != NULL) {
+            (void)filo_strings_register(&ctx, &filo_libc_strings);
+        }
+        char why[128];
+        bool ok = fbc_read(&unit, data, len, why, sizeof(why));
+        nsources = 0;
+        if (ok) {
+            ok = fbc_decompile(&unit, dmem, sizeof(dmem), folds, &ctx, keep_source, NULL, why,
+                               sizeof(why));
+        }
+        if (!ok || nsources > 64) {
+            if (differ < 10) {
+                printf("  %05u: %s\n", no, ok ? "more than 64 entries" : why);
+            }
+            differ++;
+            continue;
+        }
+        (void)snprintf(path, sizeof(path), "%s/%05u.dec", dir, no);
+        f = fopen(path, "wb");
+        for (uint32_t i = 0; f != NULL && i < nsources; i++) {
+            (void)fprintf(f, "; %s\n", names[i]);
+            (void)fwrite(texts[i], 1, text_len[i], f);
+        }
+        if (f != NULL) {
+            (void)fclose(f);
+        }
+        static filo_prog progs[64];
+        static filo_bc_entry entries[64];
+        bool built = true;
+        for (uint32_t i = 0; i < nsources && built; i++) {
+            built =
+                filo_compile(&ctx, (const uint8_t *)texts[i], text_len[i], &progs[i]) == FILO_OK;
+            entries[i].name = names[i];
+            entries[i].prog = &progs[i];
+        }
+        size_t n = 0;
+        size_t a = 0;
+        size_t b = 0;
+        if (built) {
+            built = filo_bc_build(&ctx, entries, nsources, again, sizeof(again), &n) == FILO_OK;
+        }
+        if (built) {
+            built = filo_bc_strip(&ctx, data, len, stripped[0], sizeof(stripped[0]), &a) == FILO_OK;
+        }
+        if (built) {
+            built = filo_bc_strip(&ctx, again, n, stripped[1], sizeof(stripped[1]), &b) == FILO_OK;
+        }
+        if (!built || a != b || memcmp(stripped[0], stripped[1], a) != 0) {
+            if (differ < 10) {
+                printf("  %05u: %s\n  %.*s\n", no,
+                       built ? "built back, not the same unit" : filo_error(&ctx), (int)text_len[0],
+                       texts[0]);
+            }
+            differ++;
+            continue;
+        }
+        done++;
+    }
+    printf("decompiled: %u built back the same, %u not\n", done, differ);
+    CHECK(differ == 0);
+    CHECK(done > 1000);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         printf("usage: dump_test DIR\n");
@@ -140,6 +297,7 @@ int main(int argc, char **argv) {
     }
     test_numbers_read_as_the_runtime_writes_them();
     test_units_list_and_agree_with_the_loader(argv[1]);
+    test_units_decompile_and_build_back(argv[1]);
     if (failures > 0) {
         printf("%d failure(s)\n", failures);
         return 1;

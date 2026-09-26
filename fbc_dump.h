@@ -16,6 +16,7 @@ enum {
     FBC_FNS_MAX = 1024,
     FBC_EXPORTS_MAX = 64,
     FBC_MEMBERS_MAX = 256,
+    FBC_SECTIONS_MAX = 64,
 };
 
 typedef struct {
@@ -31,6 +32,12 @@ typedef struct {
     uint32_t stack;
 } fbc_fn;
 
+/* An entry of the section table: its kind and where it lies. */
+typedef struct {
+    uint32_t kind;
+    fbc_span span;
+} fbc_section;
+
 typedef struct {
     const uint8_t *data;
     size_t len;
@@ -39,6 +46,9 @@ typedef struct {
     bool checksum_ok;
     uint32_t widest_stack;
     uint32_t widest_frame;
+    uint32_t header_size;                   /* the fixed header and the section table */
+    fbc_section sections[FBC_SECTIONS_MAX]; /* as the table lists them, the first 64 */
+    uint32_t nsections;
     fbc_span imports[FBC_NAMES_MAX];
     uint32_t nimports;
     fbc_span globals[FBC_NAMES_MAX];

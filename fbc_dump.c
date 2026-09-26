@@ -1,5 +1,6 @@
 #include "fbc_dump.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -302,6 +303,7 @@ bool fbc_read(fbc_unit *u, const uint8_t *data, size_t len, char *why, size_t ca
     if (hsize < HEADER || hsize > len || nsec > (hsize - HEADER) / SECTION) {
         return fail(why, cap, "the header does not fit the file");
     }
+    u->header_size = hsize;
     u->checksum_ok = checksum_of(data, len) == u->checksum;
     bool seen[8] = {false};
     for (uint32_t i = 0; i < nsec; i++) {
@@ -320,6 +322,10 @@ bool fbc_read(fbc_unit *u, const uint8_t *data, size_t len, char *why, size_t ca
         }
         if (!read_section(u, kind, off, slen)) {
             return fail(why, cap, "a section does not read as the spec says");
+        }
+        if (u->nsections < FBC_SECTIONS_MAX) {
+            u->sections[u->nsections] = (fbc_section){kind, {off, slen}};
+            u->nsections++;
         }
     }
     for (uint32_t i = 0; i < u->nfns; i++) {
@@ -358,6 +364,35 @@ static void name_text(const fbc_unit *u, fbc_span s, char *dst, size_t cap) {
 /* How Filo writes a number, which is how Go's strconv does with 'g' and the
    shortest precision: the fewest digits that read back as the same double,
    plain from 1e-4 up to 1e6 and in scientific form outside. */
+/* sci, as %e writes it, one unit of its last digit away from zero (up) or
+   toward it, with as many digits. */
+static void other_side(char *sci, size_t cap, bool up) {
+    char *e = strchr(sci, 'e');
+    int exp = (int)strtol(e + 1, NULL, 10);
+    char *first = sci[0] == '-' ? sci + 1 : sci;
+    char *d = e;
+    while (d > first) {
+        d--;
+        if (*d == '.') {
+            continue;
+        }
+        if (*d != (up ? '9' : '0')) {
+            *d = (char)(*d + (up ? 1 : -1));
+            break;
+        }
+        *d = up ? '0' : '9';
+        if (d == first) {
+            *d = up ? '1' : '9';
+            exp += up ? 1 : -1;
+        }
+    }
+    if (*first == '0') {
+        *first = '9';
+        exp--;
+    }
+    (void)snprintf(e, cap - (size_t)(e - sci), "e%+03d", exp);
+}
+
 void fbc_number(double x, char *dst, size_t cap) {
     if (x != x) {
         (void)snprintf(dst, cap, "NaN");
@@ -367,23 +402,64 @@ void fbc_number(double x, char *dst, size_t cap) {
         (void)snprintf(dst, cap, "%s", x > 0 ? "+Inf" : "-Inf");
         return;
     }
+    /* the shortest digits that read back: the nearest ones, or at a power of
+       two, whose gap above is twice the one below, those on the far side */
     char sci[40];
-    int prec = 1;
-    for (; prec < 17; prec++) {
-        (void)snprintf(sci, sizeof(sci), "%.*e", prec - 1, x);
+    for (int prec = 0; prec < 17; prec++) {
+        (void)snprintf(sci, sizeof(sci), "%.*e", prec, x);
+        double back = strtod(sci, NULL);
+        if (back == x) {
+            break;
+        }
+        other_side(sci, sizeof(sci), fabs(back) < fabs(x));
         if (strtod(sci, NULL) == x) {
             break;
         }
     }
-    (void)snprintf(sci, sizeof(sci), "%.*e", prec - 1, x);
     const char *e = strchr(sci, 'e');
-    int exp = e != NULL ? (int)strtol(e + 1, NULL, 10) : 0;
+    int exp = (int)strtol(e + 1, NULL, 10);
     if (exp < -4 || exp >= 6) {
         (void)snprintf(dst, cap, "%s", sci);
         return;
     }
-    int decimals = prec - 1 - exp;
-    (void)snprintf(dst, cap, "%.*f", decimals > 0 ? decimals : 0, x);
+    /* plain decimal, from the digits chosen */
+    char digits[24];
+    size_t nd = 0;
+    bool neg = sci[0] == '-';
+    for (const char *p = neg ? sci + 1 : sci; p < e && nd < sizeof(digits); p++) {
+        if (*p != '.') {
+            digits[nd++] = *p;
+        }
+    }
+    while (nd > 1 && digits[nd - 1] == '0') {
+        nd--;
+    }
+    char out[48];
+    size_t n = 0;
+    if (neg) {
+        out[n++] = '-';
+    }
+    if (exp < 0) {
+        out[n++] = '0';
+        out[n++] = '.';
+        for (int i = 0; i < -exp - 1; i++) {
+            out[n++] = '0';
+        }
+        memcpy(out + n, digits, nd);
+        n += nd;
+    } else {
+        size_t whole = (size_t)exp + 1;
+        for (size_t i = 0; i < whole; i++) {
+            out[n++] = i < nd ? digits[i] : '0';
+        }
+        if (nd > whole) {
+            out[n++] = '.';
+            memcpy(out + n, digits + whole, nd - whole);
+            n += nd - whole;
+        }
+    }
+    out[n] = '\0';
+    (void)snprintf(dst, cap, "%s", out);
 }
 
 static void const_text(const fbc_unit *u, uint32_t i, char *dst, size_t cap) {

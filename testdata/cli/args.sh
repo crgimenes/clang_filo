@@ -2,6 +2,8 @@
 case "$1" in
 demo.run) echo "run build/cli/demo.fbb double" ;;
 demo.dump) echo "dump build/cli/demo.fbb" ;;
+demo.check) echo "check build/cli/demo.fbb" ;;
+demo.size) echo "size build/cli/demo.fbb" ;;
 *.run) echo "run examples/${1%.run}.filo" ;;
 *.dump) echo "dump examples/${1%.dump}.filo" ;;
 *.trace) echo "run --trace examples/${1%.trace}.filo" ;;

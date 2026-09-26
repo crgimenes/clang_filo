@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fbc_decompile.h"
 #include "fbc_dump.h"
 #include "filo.h"
 #include "filo_libc.h"
@@ -31,31 +32,118 @@ static char sources[FILES_MAX][FILE_MAX / FILES_MAX];
 static filo_ctx ctx;
 static fbc_unit listing;
 
-static const char usage[] =
-    "usage: filo run [--vm | --trace | --both] FILE [MEMBER] [ENTRY...]\n"
-    "       filo build [--strip] -o OUT FILE...\n"
-    "       filo bundle -o OUT UNIT...\n"
-    "       filo dump FILE\n"
-    "       filo show tree|folded|ir FILE\n"
-    "\n"
-    "Runs a Filo program and prints its value; builds programs into one unit\n"
-    "of bytecode (docs/bytecode.md), each an entry named by its file; puts\n"
-    "units into one bundle, each a member named by its file; lists a unit or\n"
-    "a bundle; shows a stage of the compiling: the tree as read, the tree once\n"
-    "constants folded, the IR. FILE is source, a unit or a bundle, told apart\n"
-    "by the magic.\n"
-    "\n"
-    "  --vm      run source as bytecode, compiled in memory\n"
-    "  --trace   run as bytecode and show every instruction with the stack\n"
-    "  --both    run source on the IR and on the VM, side by side\n"
-    "  --strip   build without the debug section (errors then have no line)\n"
-    "  MEMBER    for a bundle: the unit to run (default: main, or the first)\n"
-    "  ENTRY     for a unit: the entries to run, in order, sharing globals\n"
-    "            (default: main, or the unit's first entry)\n"
-    "\n"
-    "Example:\n"
-    "  echo '(str-upper \"hello world\")' > hello.filo\n"
-    "  filo run hello.filo && filo build -o hello.fbc hello.filo && filo dump hello.fbc\n";
+/* Each command's help: filo CMD -h writes its own, filo -h all of them. */
+typedef struct {
+    const char *name;
+    const char *synopsis;
+    const char *text;
+    const char *examples;
+} command;
+
+static const command commands[] = {
+    {
+        "run",
+        "filo run [--vm | --trace | --both] FILE [MEMBER] [ENTRY...]",
+        "run runs a program and writes its value: a source (FILE is told apart from\n"
+        "bytecode by the magic) on the tree the compiler lowers; --vm compiles it to\n"
+        "bytecode in memory first; --trace runs it as bytecode, writing each\n"
+        "instruction with the top of its operand stack; --both runs it both ways, a\n"
+        "line each, with their steps. For a unit, the ENTRY points run in order and\n"
+        "share their globals (default: main, or the first); for a bundle, MEMBER is\n"
+        "the unit (default: main, or the first).",
+        "  filo run --both fib.filo\n  filo run prog.fbc main fail",
+    },
+    {
+        "build",
+        "filo build [--strip] -o OUT FILE...",
+        "build compiles programs into one unit of bytecode (docs/bytecode.md), each\n"
+        "an entry named by its file (lib/hello.filo is the entry \"hello\"): the same\n"
+        "bytes the Go engine's filo build writes. --strip leaves out the debug section\n"
+        "(the lines and columns errors say).",
+        "  filo build -o prog.fbc main.filo fail.filo",
+    },
+    {
+        "bundle",
+        "filo bundle -o OUT UNIT...",
+        "bundle puts units into one bundle, each a member named by its file.",
+        "  filo bundle -o demo.fbb prog.fbc upper.fbc",
+    },
+    {
+        "dump",
+        "filo dump FILE",
+        "dump lists Filo bytecode: a unit (.fbc) or a bundle (.fbb), as\n"
+        "docs/bytecode.md describes it -- the header, the names it imports and the\n"
+        "globals it uses (the extern ones marked), its constants and entry points,\n"
+        "and every function, each instruction with its bytes and the line:column it\n"
+        "came from. A source is compiled first, as build compiles it.",
+        "  filo dump lib/msh/edt.fbb | less",
+    },
+    {
+        "show",
+        "filo show tree|folded|ir FILE",
+        "show writes one stage of what the compiler makes of a source, each line\n"
+        "with the line:column it came from: the tree as read, the tree once\n"
+        "constants folded, or the IR, frames and slots named.",
+        "  filo show ir fib.filo",
+    },
+    {
+        "check",
+        "filo check [-vm PROFILE] [FILE]",
+        "check says of each unit (a bundle's members, each) whether a VM gives what\n"
+        "it asks for: the functions it imports and the extern globals it reads. The\n"
+        "VM is this command's (the core, math and strings), or the one PROFILE lists:\n"
+        "the names it gives, one a line, \"#\" for a comment (msh's build writes the\n"
+        "BBS's). A line a unit: \"NAME  runs: ...\" or \"NAME  lacks N: a, b\"; the exit\n"
+        "status is 1 when one lacks something. FILE is read from standard input when\n"
+        "absent or \"-\".",
+        "  filo check -vm bin.vm mine.fbb",
+    },
+    {
+        "decompile",
+        "filo decompile [-o DIR] FILE [MEMBER]",
+        "decompile writes a unit's entry points back as Filo, a top-level form a\n"
+        "line (filofmt lays them out): each under a \"; NAME.filo\" line, or with -o as\n"
+        "DIR/NAME.filo, the paths written in the unit's order, which filo build takes\n"
+        "to make the same unit again, byte for byte but for the debug section. The\n"
+        "bytes do not keep comments, layout, or the names of parameters and let\n"
+        "bindings (x y z, a b c here, a digit for a nested function's); forms that\n"
+        "compile alike come back as one (cond for if chains, a constant for what was\n"
+        "folded into it). The Go engine's filo decompile writes the same forms. For a\n"
+        "bundle, MEMBER is the unit (default: main, or the first).",
+        "  filo decompile prog.fbc\n  filo build -o again.fbc $(filo decompile -o src prog.fbc)",
+    },
+    {
+        "size",
+        "filo size [FILE]",
+        "size says where the bytes go: each unit's header and sections, in the\n"
+        "order the file has them. FILE is read from standard input when absent or \"-\".",
+        "  filo size screens.fbb",
+    },
+};
+
+enum { NCOMMANDS = sizeof(commands) / sizeof(commands[0]) };
+
+/* The help of the command name, or of them all when name is NULL. */
+static void help(FILE *f, const char *name) {
+    const char *lead = "usage: ";
+    for (int i = 0; i < NCOMMANDS; i++) {
+        if (name == NULL || strcmp(commands[i].name, name) == 0) {
+            (void)fprintf(f, "%s%s\n", lead, commands[i].synopsis);
+            lead = "       ";
+        }
+    }
+    for (int i = 0; i < NCOMMANDS; i++) {
+        if (name == NULL || strcmp(commands[i].name, name) == 0) {
+            (void)fprintf(f, "\n%s\n", commands[i].text);
+        }
+    }
+    (void)fputs("\nExamples:\n", f);
+    for (int i = 0; i < NCOMMANDS; i++) {
+        if (name == NULL || strcmp(commands[i].name, name) == 0) {
+            (void)fprintf(f, "%s\n", commands[i].examples);
+        }
+    }
+}
 
 /* A diagnostic, on stderr, where it does not mix with the value. */
 static int complain(const char *text) {
@@ -341,12 +429,12 @@ static int cmd_run(int argc, char **argv) {
             trace = true;
         } else {
             (void)complain2("unknown flag", argv[i]);
-            (void)fputs(usage, stderr);
+            help(stderr, "run");
             return 2;
         }
     }
     if (i >= argc) {
-        fputs(usage, stderr);
+        help(stderr, "run");
         return 2;
     }
     size_t len = read_file(argv[i], unit_mem, sizeof(unit_mem));
@@ -390,7 +478,7 @@ static int cmd_build(int argc, char **argv) {
         argv++;
     }
     if (argc < 3 || strcmp(argv[0], "-o") != 0) {
-        fputs(usage, stderr);
+        help(stderr, "build");
         return 2;
     }
     size_t len = build(argv + 2, argc - 2);
@@ -423,7 +511,7 @@ static int cmd_bundle(int argc, char **argv) {
     static char names[FILES_MAX][256];
     static uint8_t units[FILES_MAX][FILE_MAX / FILES_MAX];
     if (argc < 3 || argc - 2 > FILES_MAX || strcmp(argv[0], "-o") != 0) {
-        (void)fputs(usage, stderr);
+        help(stderr, "bundle");
         return 2;
     }
     int n = argc - 2;
@@ -462,7 +550,7 @@ static int cmd_bundle(int argc, char **argv) {
 
 static int cmd_show(int argc, char **argv) {
     if (argc != 2) {
-        (void)fputs(usage, stderr);
+        help(stderr, "show");
         return 2;
     }
     size_t len = read_file(argv[1], unit_mem, sizeof(unit_mem));
@@ -477,7 +565,7 @@ static int cmd_show(int argc, char **argv) {
 
 static int cmd_dump(int argc, char **argv) {
     if (argc != 1) {
-        fputs(usage, stderr);
+        help(stderr, "dump");
         return 2;
     }
     size_t len = read_file(argv[0], unit_mem, sizeof(unit_mem));
@@ -507,10 +595,365 @@ static int cmd_dump(int argc, char **argv) {
     return 0;
 }
 
+/* FILE, or standard input when it is absent or "-", into dst. */
+static size_t read_input(const char *path, void *dst, size_t cap) {
+    if (path != NULL && strcmp(path, "-") != 0) {
+        return read_file(path, dst, cap);
+    }
+    size_t n = fread(dst, 1, cap, stdin);
+    if (n == cap) {
+        (void)complain("standard input: too large");
+        return 0;
+    }
+    if (n == 0) {
+        (void)complain("standard input: empty");
+    }
+    return n;
+}
+
+static const char *base_name(const char *path) {
+    const char *b = strrchr(path, '/');
+    return b != NULL ? b + 1 : path;
+}
+
+/* A unit to look at: the file itself, or a member of a bundle. */
+typedef struct {
+    char name[256];
+    const uint8_t *data;
+    size_t len;
+} part;
+
+static part parts_of[FBC_MEMBERS_MAX];
+
+/* The units of the file in data: itself when it is one, its members when it
+   is a bundle; how many, and the bytes of the bundle's own header and table.
+   0 parts is an error, said. */
+static uint32_t parts(const char *path, const uint8_t *data, size_t len, size_t *table) {
+    *table = 0;
+    if (fbc_kind(data, len) == 1) {
+        (void)snprintf(parts_of[0].name, sizeof(parts_of[0].name), "%s", base_name(path));
+        parts_of[0].data = data;
+        parts_of[0].len = len;
+        return 1;
+    }
+    if (fbc_kind(data, len) != 2) {
+        (void)complain("not a unit or a bundle (filo build makes one from source)");
+        return 0;
+    }
+    static fbc_bundle b;
+    char why[128];
+    if (!fbc_read_bundle(&b, data, len, why, sizeof(why))) {
+        (void)complain(why);
+        return 0;
+    }
+    *table = len;
+    for (uint32_t i = 0; i < b.n; i++) {
+        const fbc_member *m = &b.members[i];
+        (void)snprintf(parts_of[i].name, sizeof(parts_of[i].name), "%.*s", (int)m->name.len,
+                       (const char *)data + m->name.off);
+        parts_of[i].data = data + m->unit.off;
+        parts_of[i].len = m->unit.len;
+        *table -= m->unit.len;
+    }
+    return b.n;
+}
+
+/* The names a VM gives: a profile's lines ("#" a comment), or when there is
+   no profile the builtins of this command's context. */
+typedef struct {
+    const char *text; /* the profile, or NULL */
+    size_t len;
+} offer;
+
+static bool offered(const offer *o, const uint8_t *name, uint32_t n) {
+    if (o->text == NULL) {
+        for (uint32_t i = 0; i < ctx.nbuiltins; i++) {
+            const char *b = ctx.builtins[i].name;
+            if (strlen(b) == n && memcmp(b, name, n) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (size_t at = 0; at < o->len;) {
+        size_t end = at;
+        while (end < o->len && o->text[end] != '\n') {
+            end++;
+        }
+        size_t a = at;
+        size_t z = end;
+        while (a < z && (o->text[a] == ' ' || o->text[a] == '\t' || o->text[a] == '\r')) {
+            a++;
+        }
+        while (z > a &&
+               (o->text[z - 1] == ' ' || o->text[z - 1] == '\t' || o->text[z - 1] == '\r')) {
+            z--;
+        }
+        if (z > a && o->text[a] != '#' && z - a == n && memcmp(o->text + a, name, n) == 0) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}
+
+static int cmd_check(int argc, char **argv) {
+    offer o = {NULL, 0};
+    int i = 0;
+    if (argc >= 2 && strcmp(argv[0], "-vm") == 0) {
+        static char profile[FILE_MAX];
+        size_t n = read_file(argv[1], profile, sizeof(profile));
+        if (n == 0) {
+            return 1;
+        }
+        o = (offer){profile, n};
+        i = 2;
+    }
+    if (argc - i > 1 || (argc - i == 1 && argv[i][0] == '-' && argv[i][1] != '\0')) {
+        help(stderr, "check");
+        return 2;
+    }
+    const char *path = argc - i == 1 ? argv[i] : "-";
+    size_t len = read_input(path, unit_mem, sizeof(unit_mem));
+    if (len == 0) {
+        return 1;
+    }
+    size_t table = 0;
+    uint32_t n = parts(path, unit_mem, len, &table);
+    if (n == 0) {
+        return 1;
+    }
+    int code = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        char why[128];
+        if (!fbc_read(&listing, parts_of[k].data, parts_of[k].len, why, sizeof(why))) {
+            return complain2(parts_of[k].name, why);
+        }
+        char lack[4096] = "";
+        size_t at = 0;
+        uint32_t nlack = 0;
+        for (uint32_t j = 0; j < listing.nimports + listing.nglobals; j++) {
+            bool import = j < listing.nimports;
+            uint32_t g = j - listing.nimports;
+            if (!import && !listing.externs[g]) {
+                continue;
+            }
+            fbc_span s = import ? listing.imports[j] : listing.globals[g];
+            if (offered(&o, listing.data + s.off, s.len)) {
+                continue;
+            }
+            if (at < sizeof(lack)) {
+                at +=
+                    (size_t)snprintf(lack + at, sizeof(lack) - at, "%s%.*s", nlack > 0 ? ", " : "",
+                                     (int)s.len, (const char *)listing.data + s.off);
+            }
+            nlack++;
+        }
+        if (nlack > 0) {
+            code = 1;
+            printf("%s  lacks %u: %s\n", parts_of[k].name, nlack, lack);
+            continue;
+        }
+        printf("%s  runs: %u imports, %u externs\n", parts_of[k].name, listing.nimports,
+               listing.nexterns);
+    }
+    return code;
+}
+
+static const char *const section_names[] = {
+    "", "imports", "globals", "constants", "functions", "code", "exports", "debug", "externs",
+};
+
+static int cmd_size(int argc, char **argv) {
+    if (argc > 1 || (argc == 1 && argv[0][0] == '-' && argv[0][1] != '\0')) {
+        help(stderr, "size");
+        return 2;
+    }
+    const char *path = argc == 1 ? argv[0] : "-";
+    size_t len = read_input(path, unit_mem, sizeof(unit_mem));
+    if (len == 0) {
+        return 1;
+    }
+    size_t table = 0;
+    uint32_t n = parts(path, unit_mem, len, &table);
+    if (n == 0) {
+        return 1;
+    }
+    if (fbc_kind(unit_mem, len) == 2) {
+        printf("%s  %zu bytes: %u members, %zu of header and table\n", base_name(path), len, n,
+               table);
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        char why[128];
+        if (!fbc_read(&listing, parts_of[k].data, parts_of[k].len, why, sizeof(why))) {
+            return complain2(parts_of[k].name, why);
+        }
+        printf("%s  %zu bytes\n", parts_of[k].name, parts_of[k].len);
+        printf("  %-10s %7u\n", "header", listing.header_size);
+        long rest = (long)parts_of[k].len - (long)listing.header_size;
+        for (uint32_t j = 0; j < listing.nsections; j++) {
+            const fbc_section *sec = &listing.sections[j];
+            char name[24];
+            if (sec->kind < 9 && sec->kind > 0) {
+                (void)snprintf(name, sizeof(name), "%s", section_names[sec->kind]);
+            } else {
+                (void)snprintf(name, sizeof(name), "kind %u", sec->kind);
+            }
+            printf("  %-10s %7u\n", name, sec->span.len);
+            rest -= (long)sec->span.len;
+        }
+        if (rest != 0) {
+            printf("  %-10s %7ld\n", "between", rest);
+        }
+    }
+    return 0;
+}
+
+/* The first line filo_show writes: the folded tree's root. */
+static void first_line(void *user, const char *line) {
+    char *keep = user;
+    if (keep[0] == '\0') {
+        (void)snprintf(keep, 128, "%s", line);
+    }
+}
+
+/* Whether this command's folder turns call into a constant: the folded
+   tree of it is a number, a bool or a string. */
+static bool folds(void *user, const char *call, size_t len) {
+    (void)user;
+    char root[128] = "";
+    if (filo_show(&ctx, (const uint8_t *)call, len, "folded", first_line, root) != FILO_OK) {
+        return false;
+    }
+    const char *what = root;
+    while (*what != '\0' && *what != ' ') {
+        what++; /* past line:col */
+    }
+    while (*what == ' ') {
+        what++;
+    }
+    if (strncmp(what, "number ", 7) == 0 || strncmp(what, "bool ", 5) == 0) {
+        return true;
+    }
+    return strncmp(what, "string ", 7) == 0;
+}
+
+typedef struct {
+    const char *dir;
+    uint32_t count;
+    uint32_t total;
+    int code;
+} decompiled;
+
+/* An entry point's text: on stdout under its file's name, or as that file
+   in the directory, its path on stdout. */
+static void put_source(void *user, const char *name, size_t nlen, const char *text, size_t len) {
+    decompiled *w = user;
+    if (w->dir != NULL) {
+        char path[1024];
+        (void)snprintf(path, sizeof(path), "%s/%.*s.filo", w->dir, (int)nlen, name);
+        FILE *f = fopen(path, "wb");
+        if (f == NULL || fwrite(text, 1, len, f) != len) {
+            w->code = complain2("cannot write", path);
+            if (f != NULL) {
+                fclose(f);
+            }
+            return;
+        }
+        if (fclose(f) != 0) {
+            w->code = complain2("cannot write", path);
+            return;
+        }
+        puts(path);
+        return;
+    }
+    if (w->total > 1) {
+        printf("%s; %.*s.filo\n", w->count > 0 ? "\n" : "", (int)nlen, name);
+    }
+    (void)fwrite(text, 1, len, stdout);
+    w->count++;
+}
+
+static int cmd_decompile(int argc, char **argv) {
+    decompiled w = {NULL, 0, 0, 0};
+    int i = 0;
+    if (argc >= 2 && strcmp(argv[0], "-o") == 0) {
+        w.dir = argv[1];
+        i = 2;
+    }
+    if (argc - i < 1 || argc - i > 2) {
+        help(stderr, "decompile");
+        return 2;
+    }
+    size_t len = read_input(argv[i], unit_mem, sizeof(unit_mem));
+    if (len == 0) {
+        return 1;
+    }
+    const uint8_t *unit = unit_mem;
+    size_t ulen = len;
+    if (fbc_kind(unit_mem, len) == 2) {
+        static fbc_bundle b;
+        char why[128];
+        if (!fbc_read_bundle(&b, unit_mem, len, why, sizeof(why))) {
+            return complain(why);
+        }
+        char name[256] = "main";
+        if (argc - i == 2) {
+            (void)snprintf(name, sizeof(name), "%s", argv[i + 1]);
+        } else if (filo_bundle_find(&ctx, unit_mem, len, name, &unit, &ulen) != FILO_OK) {
+            (void)snprintf(name, sizeof(name), "%.*s", (int)b.members[0].name.len,
+                           (const char *)unit_mem + b.members[0].name.off);
+        }
+        if (filo_bundle_find(&ctx, unit_mem, len, name, &unit, &ulen) != FILO_OK) {
+            return complain(filo_error(&ctx));
+        }
+    } else if (fbc_kind(unit_mem, len) != 1) {
+        return complain("not a unit or a bundle: a source is Filo already");
+    }
+    char why[128];
+    if (!fbc_read(&listing, unit, ulen, why, sizeof(why))) {
+        return complain(why);
+    }
+    enum { DECOMPILE_MEM = 256U << 20U }; /* touched only as it is used */
+    void *mem = malloc(DECOMPILE_MEM);
+    if (mem == NULL) {
+        return complain("out of memory");
+    }
+    w.total = listing.nexports;
+    bool ok =
+        fbc_decompile(&listing, mem, DECOMPILE_MEM, folds, NULL, put_source, &w, why, sizeof(why));
+    free(mem);
+    if (!ok) {
+        return complain(why);
+    }
+    return w.code;
+}
+
+/* Asking a command for help, anywhere in its arguments, is using it. */
+static bool asks_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "-help") == 0 ||
+            strcmp(argv[i], "--help") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-        fputs(usage, argc < 2 ? stderr : stdout);
-        return argc < 2 ? 2 : 0;
+    if (argc < 2) {
+        help(stderr, NULL);
+        return 2;
+    }
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        help(stdout, NULL);
+        return 0;
+    }
+    for (int i = 0; i < NCOMMANDS; i++) {
+        if (strcmp(argv[1], commands[i].name) == 0 && asks_help(argc - 2, argv + 2)) {
+            help(stdout, commands[i].name);
+            return 0;
+        }
     }
     filo_libc_install();
     start();
@@ -529,7 +972,16 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "dump") == 0) {
         return cmd_dump(argc - 2, argv + 2);
     }
+    if (strcmp(argv[1], "check") == 0) {
+        return cmd_check(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "size") == 0) {
+        return cmd_size(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "decompile") == 0) {
+        return cmd_decompile(argc - 2, argv + 2);
+    }
     (void)complain2("unknown command", argv[1]);
-    (void)fputs(usage, stderr);
+    help(stderr, NULL);
     return 2;
 }

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "fbc_decompile.h"
 #include "fbc_dump.h"
 #include "filo.h"
 #include "filo_libc.h"
@@ -21,6 +22,15 @@ static uint8_t run_mem[1U << 20U];
 static uint8_t unit[1U << 16U];
 static filo_ctx ctx;
 static fbc_unit listing;
+
+static void dropped(void *user, const char *name, size_t nlen, const char *text, size_t len) {
+    (void)user;
+    (void)name;
+    (void)nlen;
+    (void)text;
+    (void)len;
+}
+static uint8_t decompile_mem[4U << 20U];
 static fbc_bundle bundle;
 static bool listed = false;
 
@@ -81,6 +91,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     listed = fbc_read(&listing, code, code_len, why, sizeof(why));
     if (listed) {
         fbc_dump(&listing, discard, NULL);
+        /* decompiling reads the same untrusted bytes: it may refuse, never fault */
+        (void)fbc_decompile(&listing, decompile_mem, sizeof(decompile_mem), NULL, NULL, dropped,
+                            NULL, why, sizeof(why));
     }
     const filo_unit *u = NULL;
     (void)filo_bc_load(&ctx, code, code_len, &u); /* the refusal, and its list of names */

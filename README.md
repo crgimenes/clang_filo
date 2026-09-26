@@ -33,6 +33,17 @@ tuples and early return. Each file says what it gives on its last line
 (`; Output:` or `; Error:`), and `make cli` holds `filo run` to it; the Go
 repository keeps the same files and holds its `filo` to the same lines.
 
+`filo check` says whether a VM gives what a unit asks for (its imports and
+the extern globals it reads), against this command's builtins or a profile
+(`-vm`, a name a line); `filo size` says where a unit's bytes go, section by
+section; `filo decompile` writes a unit back as Filo, a top-level form a
+line (`-o DIR`: one file an entry point, the paths in the unit's order, for
+`filo build`). The decompiler (`fbc_decompile.c`) reads only the bytes and
+docs/bytecode.md, in memory the caller gives; `make cli` decompiles every
+unit of the corpus and compiles it back to the same unit but for its debug
+section (17,212), and `make govm` holds the Go engine's decompiler to the
+same text, character for character. `filo CMD -h` is each command's help.
+
 ## Memory
 
 The host hands over two blocks and the runtime never asks for more:
