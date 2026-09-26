@@ -115,6 +115,9 @@ int filo_fail2(filo_ctx *ctx, const char *msg, const char *detail) {
 /* Prefixes the pending error with "in <ctx>: " — the context chain the Go
    engine builds by wrapping errors on the way out. */
 static int fail_in(filo_ctx *ctx, const char *where) {
+    if (strlen("in : ") + strlen(where) + strlen(ctx->error) >= sizeof(ctx->error)) {
+        return FILO_ERR; /* left out, as prefix_error leaves one out */
+    }
     char inner[FILO_ERROR_MAX];
     (void)cstr_copy(inner, sizeof(inner), ctx->error);
     size_t n = cstr_copy(ctx->error, sizeof(ctx->error), "in ");
@@ -690,7 +693,11 @@ static node *read_string(parser *p) {
             /* checked in reading order, as the Go engine checks it: an
                unknown escape fails before a missing closing quote does */
             if (scan < p->len && !escape_known(p->src[scan])) {
-                (void)parse_fail_at(p, scan, "unsupported escape");
+                char what[24] = "unsupported escape: \\";
+                size_t k = strlen(what);
+                what[k] = (char)p->src[scan]; /* the byte itself, as the Go engine says it */
+                what[k + 1] = '\0';
+                (void)parse_fail_at(p, scan, what);
                 return NULL;
             }
         }
@@ -926,8 +933,12 @@ static node *parse_all(filo_ctx *ctx, const uint8_t *src, size_t len) {
                 return NULL;
             }
             let->text = filo_cstring("let").u.str;
-            wrapper->line = first->line; /* the implicit let is where the program starts */
+            /* the implicit let is where the program starts, and so are the
+               two nodes it adds: the Go engine places them the same */
+            wrapper->line = first->line;
             wrapper->col = first->col;
+            let->line = bindings->line = first->line;
+            let->col = bindings->col = first->col;
             cap = 8;
             wrapper->elems = (node **)ralloc(ctx, sizeof(node *) * cap);
             if (wrapper->elems == NULL) {
@@ -1813,7 +1824,12 @@ enum {
     SIG_RETURN,
 };
 
+/* A context that does not fit is left out: the message at the end, which
+   says what happened, is kept whole, and the Go engine's ends the same. */
 static int prefix_error(filo_ctx *ctx, const char *prefix) {
+    if (strlen(prefix) + strlen(ctx->error) >= sizeof(ctx->error)) {
+        return FILO_ERR;
+    }
     char inner[FILO_ERROR_MAX];
     (void)cstr_copy(inner, sizeof(inner), ctx->error);
     size_t n = cstr_copy(ctx->error, sizeof(ctx->error), prefix);
@@ -4995,45 +5011,54 @@ static void sink_puts(sink *s, const char *str) {
     sink_put(s, str, strlen(str));
 }
 
-/* Quotes like Go's %q: printable bytes verbatim, the usual escapes named,
-   other control bytes as \x.. */
+/* A string as Filo reads it back: between double quotes, with the escapes
+   the reader knows, and every other byte as it is — invalid UTF-8 and
+   control bytes included, since the reader takes them raw and has no escape
+   for them. The Go engine writes a string the same way. */
 static void sink_quoted(sink *s, filo_str str) {
-    static const char hex[] = "0123456789abcdef";
     sink_puts(s, "\"");
     for (uint32_t i = 0; i < str.len; i++) {
         uint8_t c = str.ptr[i];
-        char esc[5] = {'\\', 0, 0, 0, 0};
+        char e = 0;
         switch (c) {
         case '"':
-            esc[1] = '"';
-            sink_put(s, esc, 2);
+            e = '"';
             break;
         case '\\':
-            esc[1] = '\\';
-            sink_put(s, esc, 2);
+            e = '\\';
             break;
         case '\n':
-            esc[1] = 'n';
-            sink_put(s, esc, 2);
+            e = 'n';
             break;
         case '\t':
-            esc[1] = 't';
-            sink_put(s, esc, 2);
+            e = 't';
             break;
         case '\r':
-            esc[1] = 'r';
-            sink_put(s, esc, 2);
+            e = 'r';
+            break;
+        case 0:
+            e = '0';
+            break;
+        case '\a':
+            e = 'a';
+            break;
+        case '\b':
+            e = 'b';
+            break;
+        case '\f':
+            e = 'f';
+            break;
+        case '\v':
+            e = 'v';
             break;
         default:
-            if (c < 0x20 || c == 0x7F) {
-                esc[1] = 'x';
-                esc[2] = hex[(unsigned)c >> 4U];
-                esc[3] = hex[(unsigned)c & 0xFU];
-                sink_put(s, esc, 4);
-            } else {
-                sink_put(s, (const char *)&str.ptr[i], 1);
-            }
             break;
+        }
+        if (e != 0) {
+            const char esc[2] = {'\\', e};
+            sink_put(s, esc, 2);
+        } else {
+            sink_put(s, (const char *)&str.ptr[i], 1);
         }
     }
     sink_puts(s, "\"");
@@ -6050,13 +6075,39 @@ static int equal_walk(filo_ctx *ctx, const filo_value *a, const filo_value *b, u
     return FILO_OK;
 }
 
+/* msg, then got and a (and " and " b, when there is a b) as Filo writes
+   them: what broke the rule, as the Go engine names it. Cut where the
+   message ends. */
+static int fail_got(filo_ctx *ctx, const char *msg, const char *got_text, const filo_value *a,
+                    const filo_value *b) {
+    char text[FILO_ERROR_MAX];
+    size_t n = cstr_copy(text, sizeof(text), msg);
+    const filo_value *got[2] = {a, b};
+    for (size_t i = 0; i < 2 && got[i] != NULL && n < sizeof(text) - 1; i++) {
+        n += cstr_copy(text + n, sizeof(text) - n, i == 0 ? got_text : " and ");
+        size_t w = 0;
+        if (n >= sizeof(text) - 1 ||
+            filo_value_repr(ctx, got[i], text + n, sizeof(text) - n, &w) != FILO_OK) {
+            break;
+        }
+        n += w < sizeof(text) - 1 - n ? w : sizeof(text) - 1 - n;
+    }
+    text[n < sizeof(text) ? n : sizeof(text) - 1] = '\0';
+    return filo_fail(ctx, text);
+}
+
 static int b_eq(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
     if (n < 2) {
         return filo_fail(ctx, "= expects at least 2 arguments");
     }
     for (uint32_t i = 1; i < n; i++) {
         if (args[i].kind != args[0].kind) {
-            return filo_fail(ctx, "expected values of the same kind");
+            char msg[96];
+            size_t k = cstr_copy(msg, sizeof(msg), "expected values of the same kind, got ");
+            k += cstr_copy(msg + k, sizeof(msg) - k, filo_kind_name(args[0].kind));
+            k += cstr_copy(msg + k, sizeof(msg) - k, " and ");
+            (void)cstr_copy(msg + k, sizeof(msg) - k, filo_kind_name(args[i].kind));
+            return filo_fail(ctx, msg);
         }
     }
     for (uint32_t i = 1; i < n; i++) {
@@ -6193,7 +6244,7 @@ static int b_number(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_valu
     }
     double x = 0;
     if (ctx->host.str_to_num == NULL || !ctx->host.str_to_num(ctx->host.user, s, len, &x)) {
-        return filo_fail(ctx, "number: cannot parse");
+        return fail_got(ctx, "number: cannot parse", " ", &args[0], NULL);
     }
     *out = filo_num(x);
     return FILO_OK;
@@ -6302,7 +6353,7 @@ static int b_nth(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
         return FILO_ERR;
     }
     if (!is_integral(idx)) {
-        return filo_fail(ctx, "nth expects an integer index");
+        return fail_got(ctx, "nth expects an integer index", ", got ", &args[1], NULL);
     }
     if (idx < 0 || idx >= (double)l.len) {
         return filo_fail(ctx, "index out of range");
@@ -6476,7 +6527,9 @@ static int b_range(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value
         return FILO_ERR;
     }
     if (!is_integral(start) || !is_integral(end)) {
-        return filo_fail(ctx, "range expects integer bounds");
+        filo_value a = filo_num(start);
+        filo_value b = filo_num(end);
+        return fail_got(ctx, "range expects integer bounds", ", got ", &a, &b);
     }
     int64_t lo = (int64_t)start;
     int64_t hi = (int64_t)end;

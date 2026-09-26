@@ -39,7 +39,9 @@ typedef struct {
     char script[TEXT_MAX];
     char want[TEXT_MAX];
     bool want_err;
-    char at[32]; /* "line:col" the error must say, from '--- at'; "" when not checked */
+    char at[32];       /* "line:col" the error must say, from '--- at'; "" when not checked */
+    char message[256]; /* how the error's message must end, from '--- message'; "" when not checked
+                        */
 } corpus_case;
 
 static uint8_t persistent_mem[MEM_PERSISTENT];
@@ -78,11 +80,55 @@ static void write_file(const char *suffix, const void *data, size_t len) {
     (void)fclose(f);
 }
 
+/* What filo show writes of a source, its three stages one after the
+   other under "== tree", "== folded" and "== ir"; a stage that fails is
+   "error", its message being the corpus's to check. */
+typedef struct {
+    char *text;
+    size_t len;
+    size_t cap;
+} show_text;
+
+static void show_add(void *user, const char *line) {
+    show_text *t = user;
+    size_t n = strlen(line);
+    if (t->len + n + 1 >= t->cap) {
+        return;
+    }
+    memcpy(t->text + t->len, line, n);
+    t->len += n;
+    t->text[t->len++] = '\n';
+}
+
+static void init_ctx(filo_ctx *ctx, void *p, size_t pcap, void *r, size_t rcap);
+
+static void write_show(const char *script) {
+    static uint8_t show_persistent[1U << 20U];
+    static uint8_t show_run[4U << 20U];
+    static char text[1U << 20U];
+    static filo_ctx sctx;
+    show_text t = {text, 0, sizeof(text)};
+    const char *stages[3] = {"tree", "folded", "ir"};
+    for (int i = 0; i < 3; i++) {
+        init_ctx(&sctx, show_persistent, sizeof(show_persistent), show_run, sizeof(show_run));
+        char head[16];
+        (void)snprintf(head, sizeof(head), "== %s", stages[i]);
+        show_add(&t, head);
+        if (filo_show(&sctx, (const uint8_t *)script, strlen(script), stages[i], show_add, &t) !=
+            FILO_OK) {
+            show_add(&t, "error");
+        }
+    }
+    write_file(".show", text, t.len);
+}
+
 /* The source a unit was compiled from (NNNNN.filo), and the packs it was
    compiled with (NNNNN.packs, when any): the Go engine's compiler must
-   write the same unit from them (TestCUnits in filo/conformance). */
+   write the same unit from them, and show the same stages of it
+   (NNNNN.show) (TestCUnits in filo/conformance). */
 static void write_source(const char *script) {
     write_file(".filo", script, strlen(script));
+    write_show(script);
     const char *packs = want_math && want_strings ? "math strings"
                         : want_math               ? "math"
                         : want_strings            ? "strings"
@@ -366,6 +412,16 @@ static bool error_at_matches(const filo_ctx *ctx, const char *want) {
     return strcmp(at, want) == 0;
 }
 
+/* s ends with tail; the empty tail always does. */
+static bool ends_with(const char *s, const char *tail) {
+    size_t n = strlen(s);
+    size_t k = strlen(tail);
+    if (k > n) {
+        return false;
+    }
+    return strcmp(s + n - k, tail) == 0;
+}
+
 static bool run_case(const corpus_case *c, char *why, size_t cap) {
     filo_ctx *ctx = malloc(sizeof(filo_ctx));
     if (ctx == NULL) {
@@ -407,6 +463,11 @@ static bool run_case(const corpus_case *c, char *why, size_t cap) {
             (void)filo_error_at(ctx, &line, &col);
             snprintf(why, cap, "the error is at %u:%u, want %s (%s)", line, col, c->at,
                      filo_error(ctx));
+            ok = false;
+        }
+        if (ok && !ends_with(filo_error(ctx), c->message)) {
+            snprintf(why, cap, "the error says \"%s\", want it to end with \"%s\"", filo_error(ctx),
+                     c->message);
             ok = false;
         }
         free(ctx);
@@ -605,6 +666,9 @@ static bool run_file(const char *path) {
                 sec = SEC_GLOBALS;
             } else if (strncmp(s, "at ", 3) == 0) {
                 snprintf(c->at, sizeof(c->at), "%s", s + 3);
+                sec = SEC_NONE;
+            } else if (strncmp(s, "message ", 8) == 0) {
+                snprintf(c->message, sizeof(c->message), "%s", s + 8);
                 sec = SEC_NONE;
             }
             continue;

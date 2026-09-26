@@ -753,32 +753,21 @@ static int fmt_run(filo_ctx *ctx, filo_str f, const filo_value *args, uint32_t n
             continue;
         }
         i++;
+        /* read as the Go engine reads it, and checked in its order, so a
+           wrong directive is the same error in both: the spec is every
+           [-+0-9.] up to the verb, then its shape */
         size_t spec_start = i;
-        fspec sp;
-        memset(&sp, 0, sizeof(sp));
-        while (i < f.len && (f.ptr[i] == '-' || f.ptr[i] == '+' || f.ptr[i] == '0')) {
-            if (f.ptr[i] == '-') {
-                sp.left = true;
-            } else if (f.ptr[i] == '+') {
-                sp.plus = true;
-            } else {
-                sp.zero = true;
-            }
+        while (i < f.len && strchr("-+0123456789.", (char)f.ptr[i]) != NULL) {
             i++;
-        }
-        sp.width = digits_at(f, &i);
-        if (i < f.len && f.ptr[i] == '.') {
-            i++;
-            sp.has_prec = true;
-            sp.prec = digits_at(f, &i);
         }
         if (i >= f.len) {
             return filo_fail(ctx, "str-fmt: incomplete verb at end of format");
         }
+        size_t spec_end = i;
         uint8_t verb = f.ptr[i];
         char shown[40] = {0};
         size_t k = cat(shown, sizeof(shown), 0, "%");
-        size_t spec_len = i - spec_start;
+        size_t spec_len = spec_end - spec_start;
         if (spec_len > sizeof(shown) - 3) {
             spec_len = sizeof(shown) - 3;
         }
@@ -787,21 +776,40 @@ static int fmt_run(filo_ctx *ctx, filo_str f, const filo_value *args, uint32_t n
         shown[k] = (char)verb;
         shown[k + 1] = '\0';
         i++;
-        if (verb == '%' && spec_len == 0) {
+        if (verb == '%' && spec_end == spec_start) {
             sput(s, (const uint8_t *)"%", 1);
             continue;
         }
-        if (strchr("-+0123456789.", (char)verb) != NULL) {
-            return fail3(ctx, "str-fmt: bad verb ", shown, "");
+        if (next >= nargs) {
+            return fail3(ctx, "str-fmt: missing argument for ", shown, "");
         }
-        if (verb != 's' && verb != 'v' && verb != 'd' && verb != 'f') {
-            return fail3(ctx, "str-fmt: unknown verb ", shown, "");
+        fspec sp;
+        memset(&sp, 0, sizeof(sp));
+        size_t j = spec_start;
+        while (j < spec_end && (f.ptr[j] == '-' || f.ptr[j] == '+' || f.ptr[j] == '0')) {
+            if (f.ptr[j] == '-') {
+                sp.left = true;
+            } else if (f.ptr[j] == '+') {
+                sp.plus = true;
+            } else {
+                sp.zero = true;
+            }
+            j++;
+        }
+        sp.width = digits_at(f, &j);
+        if (j < spec_end && f.ptr[j] == '.') {
+            j++;
+            sp.has_prec = true;
+            sp.prec = digits_at(f, &j);
+        }
+        if (j != spec_end) {
+            return fail3(ctx, "str-fmt: bad verb ", shown, "");
         }
         if (sp.width > FMT_MAX || (sp.has_prec && sp.prec > FMT_MAX)) {
             return fail3(ctx, "str-fmt: width and precision stop at 10000000: ", shown, "");
         }
-        if (next >= nargs) {
-            return fail3(ctx, "str-fmt: missing argument for ", shown, "");
+        if (verb != 's' && verb != 'v' && verb != 'd' && verb != 'f') {
+            return fail3(ctx, "str-fmt: unknown verb ", shown, "");
         }
         const filo_value *arg = &args[next];
         next++;
