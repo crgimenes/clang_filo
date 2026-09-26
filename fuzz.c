@@ -1,11 +1,13 @@
 /* libFuzzer entry: any byte string is a script. The runtime must never fault,
    whatever the input; it may only fail with an error. Limits are tight so
    a run finishes fast and the arenas are small so exhaustion is exercised. */
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "filo.h"
+#include "filo_fmt.h"
 #include "filo_libc.h"
 
 static uint8_t persistent_mem[256U << 10U];
@@ -25,6 +27,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
               sizeof(run_mem));
     (void)filo_math_register(&ctx, &filo_libc_math);
     (void)filo_strings_register(&ctx, &filo_libc_strings);
+    /* formatting takes any bytes; a source that reads, formatted, formats
+       again the same (one that does not read, as an unclosed string at the
+       end, may not: filofmt's rules, held to the Go one by make govm) */
+    static uint8_t fmt_mem[8U << 20U];
+    static char once[1U << 16U];
+    size_t fn = 0;
+    const char *text = filo_fmt((const char *)data, size, 2, 80, fmt_mem, sizeof(fmt_mem), &fn);
+    bool reads = filo_show(&ctx, data, size, "tree", discard, NULL) == FILO_OK;
+    if (reads && text != NULL && fn < sizeof(once)) {
+        memcpy(once, text, fn);
+        size_t m = 0;
+        const char *twice = filo_fmt(once, fn, 2, 80, fmt_mem, sizeof(fmt_mem), &m);
+        if (twice == NULL || m != fn || memcmp(twice, once, fn) != 0) {
+            __builtin_trap();
+        }
+    }
     /* every stage the teaching views show, on whatever the input is */
     (void)filo_show(&ctx, data, size, "tree", discard, NULL);
     (void)filo_show(&ctx, data, size, "folded", discard, NULL);

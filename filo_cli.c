@@ -13,6 +13,7 @@
 #include "fbc_decompile.h"
 #include "fbc_dump.h"
 #include "filo.h"
+#include "filo_fmt.h"
 #include "filo_libc.h"
 #include "filo_math.h"
 #include "filo_strings.h"
@@ -102,7 +103,7 @@ static const command commands[] = {
         "decompile",
         "filo decompile [-o DIR] FILE [MEMBER]",
         "decompile writes a unit's entry points back as Filo, a top-level form a\n"
-        "line (filofmt lays them out): each under a \"; NAME.filo\" line, or with -o as\n"
+        "line, laid out as filofmt does: each under a \"; NAME.filo\" line, or with -o as\n"
         "DIR/NAME.filo, the paths written in the unit's order, which filo build takes\n"
         "to make the same unit again, byte for byte but for the debug section. The\n"
         "bytes do not keep comments, layout, or the names of parameters and let\n"
@@ -111,6 +112,14 @@ static const command commands[] = {
         "folded into it). The Go engine's filo decompile writes the same forms. For a\n"
         "bundle, MEMBER is the unit (default: main, or the first).",
         "  filo decompile prog.fbc\n  filo build -o again.fbc $(filo decompile -o src prog.fbc)",
+    },
+    {
+        "fmt",
+        "filo fmt [-w] [FILE...]",
+        "fmt lays Filo source out as the Go repository's filofmt does, byte for\n"
+        "byte: on standard output, or with -w back into each file. FILE is read from\n"
+        "standard input when there is none.",
+        "  filo fmt -w examples/*.filo",
     },
     {
         "size",
@@ -704,6 +713,60 @@ static int cmd_size(int argc, char **argv) {
     return 0;
 }
 
+enum { FMT_MEM = 64U << 20U }; /* touched only as it is used */
+
+/* src laid out as filofmt does, in mem; NULL (said) when it does not fit. */
+static const char *formatted(const char *src, size_t len, void *mem, size_t *out) {
+    const char *text = filo_fmt(src, len, 2, 80, mem, FMT_MEM, out);
+    if (text == NULL) {
+        (void)complain("formatting needs more memory than it has");
+    }
+    return text;
+}
+
+static int cmd_fmt(int argc, char **argv) {
+    bool rewrite = false;
+    if (argc > 0) {
+        rewrite = strcmp(argv[0], "-w") == 0;
+    }
+    int first = rewrite ? 1 : 0;
+    if (rewrite && argc < 2) {
+        help(stderr, "fmt");
+        return 2;
+    }
+    void *mem = malloc(FMT_MEM);
+    if (mem == NULL) {
+        return complain("out of memory");
+    }
+    int code = 0;
+    for (int i = first; i < argc || (i == first && argc == first); i++) {
+        const char *path = i < argc ? argv[i] : "-";
+        size_t len = read_input(path, unit_mem, sizeof(unit_mem));
+        size_t n = 0;
+        const char *text = len > 0 ? formatted((const char *)unit_mem, len, mem, &n) : NULL;
+        if (text == NULL) {
+            code = 1;
+            continue;
+        }
+        if (!rewrite) {
+            (void)fwrite(text, 1, n, stdout);
+            continue;
+        }
+        if (n == len && memcmp(text, unit_mem, n) == 0) {
+            continue; /* formatted already: the file is left as it is */
+        }
+        FILE *f = fopen(path, "wb");
+        if (f == NULL || fwrite(text, 1, n, f) != n) {
+            code = complain2("cannot write", path);
+        }
+        if (f != NULL && fclose(f) != 0) {
+            code = complain2("cannot write", path);
+        }
+    }
+    free(mem);
+    return code;
+}
+
 /* The first line filo_show writes: the folded tree's root. */
 static void first_line(void *user, const char *line) {
     char *keep = user;
@@ -738,12 +801,19 @@ typedef struct {
     uint32_t count;
     uint32_t total;
     int code;
+    void *fmt_mem;
 } decompiled;
 
 /* An entry point's text: on stdout under its file's name, or as that file
    in the directory, its path on stdout. */
-static void put_source(void *user, const char *name, size_t nlen, const char *text, size_t len) {
+static void put_source(void *user, const char *name, size_t nlen, const char *raw, size_t rawlen) {
     decompiled *w = user;
+    size_t len = 0;
+    const char *text = formatted(raw, rawlen, w->fmt_mem, &len);
+    if (text == NULL) {
+        w->code = 1;
+        return;
+    }
     if (w->dir != NULL) {
         char path[1024];
         (void)snprintf(path, sizeof(path), "%s/%.*s.filo", w->dir, (int)nlen, name);
@@ -770,7 +840,7 @@ static void put_source(void *user, const char *name, size_t nlen, const char *te
 }
 
 static int cmd_decompile(int argc, char **argv) {
-    decompiled w = {NULL, 0, 0, 0};
+    decompiled w = {NULL, 0, 0, 0, NULL};
     int i = 0;
     if (argc >= 2 && strcmp(argv[0], "-o") == 0) {
         w.dir = argv[1];
@@ -811,13 +881,17 @@ static int cmd_decompile(int argc, char **argv) {
     }
     enum { DECOMPILE_MEM = 256U << 20U }; /* touched only as it is used */
     void *mem = malloc(DECOMPILE_MEM);
-    if (mem == NULL) {
+    w.fmt_mem = malloc(FMT_MEM);
+    if (mem == NULL || w.fmt_mem == NULL) {
+        free(mem);
+        free(w.fmt_mem);
         return complain("out of memory");
     }
     w.total = listing.nexports;
     bool ok =
         fbc_decompile(&listing, mem, DECOMPILE_MEM, folds, NULL, put_source, &w, why, sizeof(why));
     free(mem);
+    free(w.fmt_mem);
     if (!ok) {
         return complain(why);
     }
@@ -875,6 +949,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "decompile") == 0) {
         return cmd_decompile(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "fmt") == 0) {
+        return cmd_fmt(argc - 2, argv + 2);
     }
     (void)complain2("unknown command", argv[1]);
     help(stderr, NULL);

@@ -84,9 +84,9 @@ device: all device_test.c
 # shows, and it shows up here (make cli-regen rewrites them).
 CLI_CASES = hello.run hello.dump fib.run fib.dump double.dump double.trace demo.run demo.dump demo.check demo.size \
 	constants.tree constants.folded double.ir double.both mistake.both
-CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c
+CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c filo_fmt.c
 
-build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h $(HDRS)
+build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/filo $(CLI_SRC) filo_cli.c -lm
@@ -107,7 +107,7 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 		diff -u testdata/cli/$$c build/cli.out || exit 1; \
 	done; echo "cli: $(words $(CLI_CASES)) outputs as kept"
 	@# asking a command for help is using it: its own, on stdout, exit 0
-	@for c in run build bundle dump show check size; do \
+	@for c in run build bundle dump show check size decompile fmt; do \
 		./build/filo $$c x -h > build/cli.out 2>&1 || { echo "$$c -h: exit $$?"; exit 1; }; \
 		head -1 build/cli.out | grep -q "^usage: filo $$c " || { echo "$$c -h: $$(head -1 build/cli.out)"; exit 1; }; \
 	done; echo "cli: every command's -h"
@@ -161,7 +161,7 @@ tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
-		nolibc_test.c fbc_dump.c fbc_decompile.c filo_cli.c dump_test.c -- -std=c11
+		nolibc_test.c fbc_dump.c fbc_decompile.c filo_fmt.c filo_cli.c dump_test.c -- -std=c11
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) device_test.c -- -std=c11 -DFILO_VM_ONLY
@@ -169,7 +169,7 @@ tidy:
 check:
 	cppcheck --enable=warning,style,performance,portability --inline-suppr \
 		--suppress=missingIncludeSystem --error-exitcode=1 $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c \
-		api_test.c nolibc_test.c device_test.c fbc_dump.c fbc_decompile.c filo_cli.c dump_test.c
+		api_test.c nolibc_test.c device_test.c fbc_dump.c fbc_decompile.c filo_fmt.c filo_cli.c dump_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
 # strlen/strchr: the same freestanding wasm32 target the msh terminal uses.
@@ -186,7 +186,7 @@ freestanding: $(CORE) $(PACKS) $(NOLIBC) $(HDRS)
 		-o build/filo_vm_wasm.o $(CORE)
 	@# the tools a host shows units with (a BBS listing or decompiling one):
 	@# integers and strings from the host's snprintf, numbers from its own
-	@for f in fbc_dump.c fbc_decompile.c; do \
+	@for f in fbc_dump.c fbc_decompile.c filo_fmt.c; do \
 		$(LLVM)/clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -c -DFBC_HOST_NUMBERS \
 			-std=c11 -O2 $(WARN) -isystem freestanding/include \
 			-o build/$${f%.c}_wasm.o $$f || exit 1; \
@@ -202,13 +202,13 @@ FUZZ_TIMEOUT ?= 2
 # Any byte string is a script and the runtime must not fault on any of them.
 # Seeds are the corpus scripts plus testdata/fuzz, the inputs that once went
 # wrong; a finding is written as build/fuzz_crash_* (or fuzz_crash_timeout-*).
-fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict $(HDRS)
+fuzz: $(CORE) $(PACKS) $(HOST) fuzz.c fuzz.dict filo_fmt.c filo_fmt.h $(HDRS)
 	@mkdir -p build/fuzz_seeds build/fuzz_corpus
 	@awk '/^=== /{n++; f=sprintf("build/fuzz_seeds/%04d", n); next} \
 		/^--- /{if (f != "") close(f); f=""; next} \
 		/^(given |limits )/{next} f!=""{print > f}' $(CORPUS)
 	$(LLVM)/clang -std=c11 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all $(WARN) \
-		-o build/fuzz $(CORE) $(PACKS) $(HOST) fuzz.c -lm
+		-o build/fuzz $(CORE) $(PACKS) $(HOST) filo_fmt.c fuzz.c -lm
 	@./build/fuzz -max_total_time=$(FUZZ_SECONDS) -timeout=$(FUZZ_TIMEOUT) -max_len=2048 \
 		-dict=fuzz.dict -artifact_prefix=build/fuzz_crash_ \
 		build/fuzz_corpus build/fuzz_seeds testdata/fuzz > build/fuzz.log 2>&1 \

@@ -12,6 +12,7 @@
 #include "fbc_decompile.h"
 #include "fbc_dump.h"
 #include "filo.h"
+#include "filo_fmt.h"
 #include "filo_libc.h"
 #include "filo_math.h"
 #include "filo_strings.h"
@@ -290,6 +291,53 @@ static void test_units_decompile_and_build_back(const char *dir) {
     CHECK(done > 1000);
 }
 
+/* Each source the corpus kept (NNNNN.filo) formatted by filo_fmt.c, kept
+   beside it (NNNNN.fmt) for the Go repository's filofmt to be held to it
+   (make govm), byte for byte; formatted again, the same text. */
+static char fmt_src[1U << 20U];
+static uint8_t fmt_mem[32U << 20U];
+static char fmt_once[1U << 20U];
+
+static void test_sources_format_as_filofmt_does(const char *dir) {
+    unsigned done = 0;
+    unsigned unstable = 0;
+    for (unsigned no = 0; no < 100000; no++) {
+        char path[512];
+        (void)snprintf(path, sizeof(path), "%s/%05u.filo", dir, no);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) {
+            continue; /* not every unit keeps its source */
+        }
+        size_t len = fread(fmt_src, 1, sizeof(fmt_src), f);
+        fclose(f);
+        size_t n = 0;
+        const char *text = filo_fmt(fmt_src, len, 2, 80, fmt_mem, sizeof(fmt_mem), &n);
+        CHECK(text != NULL);
+        if (text == NULL) {
+            continue;
+        }
+        (void)snprintf(path, sizeof(path), "%s/%05u.fmt", dir, no);
+        FILE *keep = fopen(path, "wb");
+        if (keep != NULL) {
+            (void)fwrite(text, 1, n, keep);
+            (void)fclose(keep);
+        }
+        memcpy(fmt_once, text, n);
+        size_t m = 0;
+        const char *twice = filo_fmt(fmt_once, n, 2, 80, fmt_mem, sizeof(fmt_mem), &m);
+        if (twice == NULL || m != n || memcmp(twice, fmt_once, n) != 0) {
+            if (unstable < 5) {
+                printf("  %05u: formatted twice, not the same\n", no);
+            }
+            unstable++;
+        }
+        done++;
+    }
+    printf("formatted: %u sources, %u not the same formatted twice\n", done, unstable);
+    CHECK(done > 1000);
+    CHECK(unstable == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         printf("usage: dump_test DIR\n");
@@ -298,6 +346,7 @@ int main(int argc, char **argv) {
     test_numbers_read_as_the_runtime_writes_them();
     test_units_list_and_agree_with_the_loader(argv[1]);
     test_units_decompile_and_build_back(argv[1]);
+    test_sources_format_as_filofmt_does(argv[1]);
     if (failures > 0) {
         printf("%d failure(s)\n", failures);
         return 1;
