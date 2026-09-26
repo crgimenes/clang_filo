@@ -857,15 +857,15 @@ size_t filo_nolibc_num_to_str(void *user, double x, char *dst, size_t cap) {
         return 0;
     }
     if (x != x) {
-        memcpy(dst, "NaN", 3);
+        memcpy(dst, "NaN", 4); /* with its terminator: cap is at least 32 */
         return 3;
     }
     if (x >= inf_value) {
-        memcpy(dst, "+Inf", 4);
+        memcpy(dst, "+Inf", 5);
         return 4;
     }
     if (x <= -inf_value) {
-        memcpy(dst, "-Inf", 4);
+        memcpy(dst, "-Inf", 5);
         return 4;
     }
     bool neg = false;

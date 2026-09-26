@@ -530,7 +530,8 @@ static void advance(fsink *s, size_t n) {
 
 /* The room is s->cap - s->pos, never s->pos + n, which could wrap. */
 static void sput(fsink *s, const uint8_t *b, size_t n) {
-    if (s->dst != NULL && s->pos <= s->cap && n <= s->cap - s->pos) {
+    if (n > 0 && s->dst != NULL && s->pos <= s->cap &&
+        n <= s->cap - s->pos) { /* b may be NULL at 0 */
         memcpy(s->dst + s->pos, b, n);
     }
     advance(s, n);

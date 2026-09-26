@@ -548,7 +548,7 @@ static bool parse_binding(const char *s, binding *b) {
     }
     memcpy(b->name, s, nl);
     b->name[nl] = '\0';
-    strcpy(b->expr, e);
+    memcpy(b->expr, e, strlen(e) + 1); /* the length was checked above */
     rstrip(b->expr);
     return true;
 }

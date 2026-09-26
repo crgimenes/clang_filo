@@ -11,7 +11,9 @@ HDRS = filo.h filo_libc.h filo_math.h filo_strings.h filo_nolibc.h
 CORPUS = testdata/corpus/*.txt
 ORACLE = testdata/oracle/*.txt
 FILO_GO ?= ../filo
-TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix
+# The analyzer's insecureAPI check wants C11 Annex K (memcpy_s, snprintf_s),
+# which no libc here has; it fires on glibc and not on macOS, so it is off.
+TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
 
 .PHONY: steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
