@@ -557,7 +557,7 @@ static bool parse_limits(const char *s, filo_limits *l) {
     memset(l, 0, sizeof(*l));
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", s);
-    for (char *tok = strtok(buf, " \t"); tok != NULL; tok = strtok(NULL, " \t")) {
+    for (const char *tok = strtok(buf, " \t"); tok != NULL; tok = strtok(NULL, " \t")) {
         char *eq = strchr(tok, '=');
         if (eq == NULL) {
             return false;

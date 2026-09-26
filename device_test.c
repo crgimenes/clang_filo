@@ -122,7 +122,7 @@ static bool check(filo_ctx *ctx, char *line, bool ok, const filo_value *got, cha
         }
         return true;
     }
-    char *name = line + 7;
+    const char *name = line + 7;
     char *want = strchr(name, ' ');
     if (strncmp(line, "global ", 7) != 0 || want == NULL) {
         snprintf(why, cap, "bad expectation: %s", line);
