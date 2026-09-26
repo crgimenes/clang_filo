@@ -1,10 +1,12 @@
 #include "fbc_dump.h"
 
-#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#ifndef FBC_HOST_NUMBERS
+#include <math.h>
+#include <stdlib.h>
+#endif
 
 enum {
     HEADER = 20,
@@ -361,9 +363,7 @@ static void name_text(const fbc_unit *u, fbc_span s, char *dst, size_t cap) {
     dst[n] = '\0';
 }
 
-/* How Filo writes a number, which is how Go's strconv does with 'g' and the
-   shortest precision: the fewest digits that read back as the same double,
-   plain from 1e-4 up to 1e6 and in scientific form outside. */
+#ifndef FBC_HOST_NUMBERS
 /* sci, as %e writes it, one unit of its last digit away from zero (up) or
    toward it, with as many digits. */
 static void other_side(char *sci, size_t cap, bool up) {
@@ -393,6 +393,9 @@ static void other_side(char *sci, size_t cap, bool up) {
     (void)snprintf(e, cap - (size_t)(e - sci), "e%+03d", exp);
 }
 
+/* How Filo writes a number, which is how Go's strconv does with 'g' and the
+   shortest precision: the fewest digits that read back as the same double,
+   plain from 1e-4 up to 1e6 and in scientific form outside. */
 void fbc_number(double x, char *dst, size_t cap) {
     if (x != x) {
         (void)snprintf(dst, cap, "NaN");
@@ -461,6 +464,8 @@ void fbc_number(double x, char *dst, size_t cap) {
     out[n] = '\0';
     (void)snprintf(dst, cap, "%s", out);
 }
+
+#endif
 
 static void const_text(const fbc_unit *u, uint32_t i, char *dst, size_t cap) {
     const uint8_t *p = u->data + u->consts[i];
@@ -762,4 +767,144 @@ void fbc_dump_bundle(const fbc_bundle *b, fbc_out out, void *user) {
         }
         fbc_dump(&u, out, user);
     }
+}
+
+/* ---- what a unit asks for, and where its bytes go ---- */
+
+typedef struct {
+    char name[256];
+    const uint8_t *data;
+    size_t len;
+} part;
+
+static part parts_of[FBC_MEMBERS_MAX];
+static fbc_bundle parts_bundle;
+static fbc_unit parts_unit;
+
+/* The units of the file: itself when it is one, its members when it is a
+   bundle; how many (0 with why when it does not read) and the bundle's own
+   header and table. */
+static uint32_t parts(const uint8_t *data, size_t len, const char *label, size_t *table, char *why,
+                      size_t cap) {
+    *table = 0;
+    if (fbc_kind(data, len) == 1) {
+        (void)snprintf(parts_of[0].name, sizeof(parts_of[0].name), "%s", label);
+        parts_of[0].data = data;
+        parts_of[0].len = len;
+        return 1;
+    }
+    if (fbc_kind(data, len) != 2) {
+        (void)fail(why, cap, "not a unit or a bundle (filo build makes one from source)");
+        return 0;
+    }
+    if (!fbc_read_bundle(&parts_bundle, data, len, why, cap)) {
+        return 0;
+    }
+    *table = len;
+    for (uint32_t i = 0; i < parts_bundle.n; i++) {
+        const fbc_member *m = &parts_bundle.members[i];
+        (void)snprintf(parts_of[i].name, sizeof(parts_of[i].name), "%.*s", (int)m->name.len,
+                       (const char *)data + m->name.off);
+        parts_of[i].data = data + m->unit.off;
+        parts_of[i].len = m->unit.len;
+        *table -= m->unit.len;
+    }
+    return parts_bundle.n;
+}
+
+int fbc_check(const uint8_t *data, size_t len, const char *label, fbc_offers offered,
+              void *offers_user, fbc_out out, void *user, char *why, size_t cap) {
+    size_t table = 0;
+    uint32_t n = parts(data, len, label, &table, why, cap);
+    if (n == 0) {
+        return -1;
+    }
+    int lacking = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        fbc_unit *u = &parts_unit;
+        char reason[128];
+        if (!fbc_read(u, parts_of[k].data, parts_of[k].len, reason, sizeof(reason))) {
+            (void)snprintf(why, cap, "%s: %s", parts_of[k].name, reason);
+            return -1;
+        }
+        char lack[4096] = "";
+        size_t at = 0;
+        uint32_t nlack = 0;
+        for (uint32_t j = 0; j < u->nimports + u->nglobals; j++) {
+            bool import = j < u->nimports;
+            uint32_t g = j - u->nimports;
+            if (!import && !u->externs[g]) {
+                continue;
+            }
+            fbc_span s = import ? u->imports[j] : u->globals[g];
+            if (offered(offers_user, u->data + s.off, s.len)) {
+                continue;
+            }
+            if (at < sizeof(lack)) {
+                at +=
+                    (size_t)snprintf(lack + at, sizeof(lack) - at, "%s%.*s", nlack > 0 ? ", " : "",
+                                     (int)s.len, (const char *)u->data + s.off);
+            }
+            nlack++;
+        }
+        char line[4400];
+        if (nlack > 0) {
+            lacking++;
+            (void)snprintf(line, sizeof(line), "%s  lacks %u: %s", parts_of[k].name, nlack, lack);
+        } else {
+            (void)snprintf(line, sizeof(line), "%s  runs: %u imports, %u externs", parts_of[k].name,
+                           u->nimports, u->nexterns);
+        }
+        out(user, line);
+    }
+    return lacking;
+}
+
+static const char *const section_names[] = {
+    "", "imports", "globals", "constants", "functions", "code", "exports", "debug", "externs",
+};
+
+bool fbc_size(const uint8_t *data, size_t len, const char *label, fbc_out out, void *user,
+              char *why, size_t cap) {
+    size_t table = 0;
+    uint32_t n = parts(data, len, label, &table, why, cap);
+    if (n == 0) {
+        return false;
+    }
+    char line[320];
+    if (fbc_kind(data, len) == 2) {
+        (void)snprintf(line, sizeof(line), "%s  %zu bytes: %u members, %zu of header and table",
+                       label, len, n, table);
+        out(user, line);
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        fbc_unit *u = &parts_unit;
+        char reason[128];
+        if (!fbc_read(u, parts_of[k].data, parts_of[k].len, reason, sizeof(reason))) {
+            (void)snprintf(why, cap, "%s: %s", parts_of[k].name, reason);
+            return false;
+        }
+        (void)snprintf(line, sizeof(line), "%s  %zu bytes", parts_of[k].name, parts_of[k].len);
+        out(user, line);
+        (void)snprintf(line, sizeof(line), "  %-10s %7u", "header", u->header_size);
+        out(user, line);
+        long rest = (long)parts_of[k].len - (long)u->header_size;
+        for (uint32_t j = 0; j < u->nsections; j++) {
+            const fbc_section *sec = &u->sections[j];
+            char name[24];
+            if (sec->kind > 0 && sec->kind < 9) {
+                (void)snprintf(name, sizeof(name), "%s", section_names[sec->kind]);
+            } else {
+                (void)snprintf(name, sizeof(name), "kind %u", sec->kind);
+            }
+            (void)snprintf(line, sizeof(line), "  %-10s %7u", name, sec->span.len);
+            out(user, line);
+            rest -= (long)sec->span.len;
+        }
+        if (rest != 0) {
+            (void)snprintf(line, sizeof(line), "  %-10s %7ld", "between", rest);
+            out(user, line);
+        }
+    }
+    return true;
 }

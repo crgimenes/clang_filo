@@ -385,6 +385,12 @@ bool filo_bc_has(const filo_unit *unit, const char *entry);
    a damaged unit too. */
 bool filo_bc_declares(const uint8_t *data, size_t len, const char *entry);
 
+/* The name of the entry point at index in the unit in data, read the same
+   way, and how many it declares: what to run of one with neither main nor
+   draw. False past the last, or for a damaged unit. */
+bool filo_bc_entry_at(const uint8_t *data, size_t len, uint32_t index, uint32_t *count,
+                      filo_str *name);
+
 /* Runs an entry point for at most budget instructions (0: no budget). When
    they run out it returns FILO_PAUSED with the run held in ctx, calls and
    all, and filo_bc_resume goes on from there with another budget; the end

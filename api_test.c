@@ -366,8 +366,14 @@ static void test_bc_declares_without_loading(void) {
     CHECK(filo_bc_declares(unit_buf, len, "e0"));
     CHECK(filo_bc_declares(unit_buf, len, "e1"));
     CHECK(!filo_bc_declares(unit_buf, len, "main"));
+    uint32_t count = 0;
+    filo_str name = {NULL, 0};
+    CHECK(filo_bc_entry_at(unit_buf, len, 1, &count, &name) && count == 2 && name.len == 2 &&
+          memcmp(name.ptr, "e1", 2) == 0);
+    CHECK(!filo_bc_entry_at(unit_buf, len, 2, &count, &name));
     unit_buf[len - 1] ^= 1U; /* damaged: nothing is declared */
     CHECK(!filo_bc_declares(unit_buf, len, "e0"));
+    CHECK(!filo_bc_entry_at(unit_buf, len, 0, &count, &name));
 }
 
 /* A builtin named outside a call is a function value, the same one every

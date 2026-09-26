@@ -616,48 +616,6 @@ static const char *base_name(const char *path) {
     return b != NULL ? b + 1 : path;
 }
 
-/* A unit to look at: the file itself, or a member of a bundle. */
-typedef struct {
-    char name[256];
-    const uint8_t *data;
-    size_t len;
-} part;
-
-static part parts_of[FBC_MEMBERS_MAX];
-
-/* The units of the file in data: itself when it is one, its members when it
-   is a bundle; how many, and the bytes of the bundle's own header and table.
-   0 parts is an error, said. */
-static uint32_t parts(const char *path, const uint8_t *data, size_t len, size_t *table) {
-    *table = 0;
-    if (fbc_kind(data, len) == 1) {
-        (void)snprintf(parts_of[0].name, sizeof(parts_of[0].name), "%s", base_name(path));
-        parts_of[0].data = data;
-        parts_of[0].len = len;
-        return 1;
-    }
-    if (fbc_kind(data, len) != 2) {
-        (void)complain("not a unit or a bundle (filo build makes one from source)");
-        return 0;
-    }
-    static fbc_bundle b;
-    char why[128];
-    if (!fbc_read_bundle(&b, data, len, why, sizeof(why))) {
-        (void)complain(why);
-        return 0;
-    }
-    *table = len;
-    for (uint32_t i = 0; i < b.n; i++) {
-        const fbc_member *m = &b.members[i];
-        (void)snprintf(parts_of[i].name, sizeof(parts_of[i].name), "%.*s", (int)m->name.len,
-                       (const char *)data + m->name.off);
-        parts_of[i].data = data + m->unit.off;
-        parts_of[i].len = m->unit.len;
-        *table -= m->unit.len;
-    }
-    return b.n;
-}
-
 /* The names a VM gives: a profile's lines ("#" a comment), or when there is
    no profile the builtins of this command's context. */
 typedef struct {
@@ -665,7 +623,9 @@ typedef struct {
     size_t len;
 } offer;
 
-static bool offered(const offer *o, const uint8_t *name, uint32_t n) {
+/* cppcheck-suppress constParameterCallback ; fbc_offers' shape */
+static bool offered(void *user, const uint8_t *name, uint32_t n) {
+    const offer *o = user;
     if (o->text == NULL) {
         for (uint32_t i = 0; i < ctx.nbuiltins; i++) {
             const char *b = ctx.builtins[i].name;
@@ -718,51 +678,14 @@ static int cmd_check(int argc, char **argv) {
     if (len == 0) {
         return 1;
     }
-    size_t table = 0;
-    uint32_t n = parts(path, unit_mem, len, &table);
-    if (n == 0) {
-        return 1;
+    char why[160];
+    int lacking =
+        fbc_check(unit_mem, len, base_name(path), offered, &o, print_line, NULL, why, sizeof(why));
+    if (lacking < 0) {
+        return complain(why);
     }
-    int code = 0;
-    for (uint32_t k = 0; k < n; k++) {
-        char why[128];
-        if (!fbc_read(&listing, parts_of[k].data, parts_of[k].len, why, sizeof(why))) {
-            return complain2(parts_of[k].name, why);
-        }
-        char lack[4096] = "";
-        size_t at = 0;
-        uint32_t nlack = 0;
-        for (uint32_t j = 0; j < listing.nimports + listing.nglobals; j++) {
-            bool import = j < listing.nimports;
-            uint32_t g = j - listing.nimports;
-            if (!import && !listing.externs[g]) {
-                continue;
-            }
-            fbc_span s = import ? listing.imports[j] : listing.globals[g];
-            if (offered(&o, listing.data + s.off, s.len)) {
-                continue;
-            }
-            if (at < sizeof(lack)) {
-                at +=
-                    (size_t)snprintf(lack + at, sizeof(lack) - at, "%s%.*s", nlack > 0 ? ", " : "",
-                                     (int)s.len, (const char *)listing.data + s.off);
-            }
-            nlack++;
-        }
-        if (nlack > 0) {
-            code = 1;
-            printf("%s  lacks %u: %s\n", parts_of[k].name, nlack, lack);
-            continue;
-        }
-        printf("%s  runs: %u imports, %u externs\n", parts_of[k].name, listing.nimports,
-               listing.nexterns);
-    }
-    return code;
+    return lacking > 0 ? 1 : 0;
 }
-
-static const char *const section_names[] = {
-    "", "imports", "globals", "constants", "functions", "code", "exports", "debug", "externs",
-};
 
 static int cmd_size(int argc, char **argv) {
     if (argc > 1 || (argc == 1 && argv[0][0] == '-' && argv[0][1] != '\0')) {
@@ -774,37 +697,9 @@ static int cmd_size(int argc, char **argv) {
     if (len == 0) {
         return 1;
     }
-    size_t table = 0;
-    uint32_t n = parts(path, unit_mem, len, &table);
-    if (n == 0) {
-        return 1;
-    }
-    if (fbc_kind(unit_mem, len) == 2) {
-        printf("%s  %zu bytes: %u members, %zu of header and table\n", base_name(path), len, n,
-               table);
-    }
-    for (uint32_t k = 0; k < n; k++) {
-        char why[128];
-        if (!fbc_read(&listing, parts_of[k].data, parts_of[k].len, why, sizeof(why))) {
-            return complain2(parts_of[k].name, why);
-        }
-        printf("%s  %zu bytes\n", parts_of[k].name, parts_of[k].len);
-        printf("  %-10s %7u\n", "header", listing.header_size);
-        long rest = (long)parts_of[k].len - (long)listing.header_size;
-        for (uint32_t j = 0; j < listing.nsections; j++) {
-            const fbc_section *sec = &listing.sections[j];
-            char name[24];
-            if (sec->kind < 9 && sec->kind > 0) {
-                (void)snprintf(name, sizeof(name), "%s", section_names[sec->kind]);
-            } else {
-                (void)snprintf(name, sizeof(name), "kind %u", sec->kind);
-            }
-            printf("  %-10s %7u\n", name, sec->span.len);
-            rest -= (long)sec->span.len;
-        }
-        if (rest != 0) {
-            printf("  %-10s %7ld\n", "between", rest);
-        }
+    char why[160];
+    if (!fbc_size(unit_mem, len, base_name(path), print_line, NULL, why, sizeof(why))) {
+        return complain(why);
     }
     return 0;
 }

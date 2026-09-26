@@ -104,7 +104,11 @@ uint32_t fbc_insn(const fbc_unit *u, uint32_t pc, char *dst, size_t cap);
    false without one. */
 bool fbc_position(const fbc_unit *u, uint32_t pc, uint32_t *line, uint32_t *col);
 
-/* A number as Filo writes it (Go's strconv, 'g', shortest). */
+/* A number as Filo writes it (Go's strconv, 'g', shortest). It takes the C
+   library's printf and strtod; a host without them defines FBC_HOST_NUMBERS
+   and supplies this function with its own number text (msh's wasm build,
+   filo_nolibc_num_to_str). The rest of this file and fbc_decompile.c take
+   only snprintf and vsnprintf for integers and strings. */
 void fbc_number(double x, char *dst, size_t cap);
 
 /* The whole listing, a line at a time. */
@@ -112,5 +116,21 @@ typedef void (*fbc_out)(void *user, const char *line);
 void fbc_dump(const fbc_unit *u, fbc_out out, void *user);
 /* A bundle's listing: its table, then every member's. */
 void fbc_dump_bundle(const fbc_bundle *b, fbc_out out, void *user);
+
+/* Whether a VM gives name: a function a unit imports, or an extern global. */
+typedef bool (*fbc_offers)(void *user, const uint8_t *name, uint32_t len);
+
+/* A line for each unit of the file in data (itself, or a bundle's members),
+   label naming a unit file: "NAME  runs: I imports, E externs", or "NAME  lacks
+   N: a, b" (the functions first) for what offered says the VM lacks. How many
+   lack something, or -1 with the reason in why when data does not read. */
+int fbc_check(const uint8_t *data, size_t len, const char *label, fbc_offers offered,
+              void *offers_user, fbc_out out, void *user, char *why, size_t cap);
+
+/* Where the bytes of the file in data go: a bundle's header and table, and
+   each unit's header and sections in the order the file has them. False,
+   with the reason in why, when data does not read. */
+bool fbc_size(const uint8_t *data, size_t len, const char *label, fbc_out out, void *user,
+              char *why, size_t cap);
 
 #endif

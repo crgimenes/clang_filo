@@ -4367,6 +4367,30 @@ bool filo_bc_declares(const uint8_t *data, size_t len, const char *entry) {
     return false;
 }
 
+bool filo_bc_entry_at(const uint8_t *data, size_t len, uint32_t index, uint32_t *count,
+                      filo_str *name) {
+    *count = 0;
+    bc_rd sec[BC_SECTIONS + 1];
+    bool have[BC_SECTIONS + 1];
+    if (bc_table(data, len, sec, have) != BC_TABLE_OK) {
+        return false;
+    }
+    bc_rd *r = &sec[BC_SEC_EXPORTS];
+    uint32_t n = rd_uleb(r);
+    for (uint32_t i = 0; i < n && !r->bad; i++) {
+        filo_str s = rd_name(r);
+        (void)rd_uleb(r);
+        if (!r->bad && i == index) {
+            *name = s;
+        }
+    }
+    if (r->bad || index >= n || name->ptr == NULL) {
+        return false;
+    }
+    *count = n;
+    return true;
+}
+
 static int bc_load(filo_ctx *ctx, const uint8_t *data, size_t len, bool lazy,
                    const filo_unit **out) {
     clear_error(ctx);

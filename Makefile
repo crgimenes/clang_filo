@@ -184,6 +184,14 @@ freestanding: $(CORE) $(PACKS) $(NOLIBC) $(HDRS)
 	$(LLVM)/clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -c -DFILO_VM_ONLY \
 		-std=c11 -O2 $(WARN) -Wno-unused-function -isystem freestanding/include \
 		-o build/filo_vm_wasm.o $(CORE)
+	@# the tools a host shows units with (a BBS listing or decompiling one):
+	@# integers and strings from the host's snprintf, numbers from its own
+	@for f in fbc_dump.c fbc_decompile.c; do \
+		$(LLVM)/clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -c -DFBC_HOST_NUMBERS \
+			-std=c11 -O2 $(WARN) -isystem freestanding/include \
+			-o build/$${f%.c}_wasm.o $$f || exit 1; \
+		echo "freestanding wasm32 object: build/$${f%.c}_wasm.o"; \
+	done
 
 FUZZ_SECONDS ?= 15
 # Seconds one input may take. Every input runs in well under a millisecond

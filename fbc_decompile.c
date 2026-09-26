@@ -720,7 +720,7 @@ typedef struct {
 
 static dsteps *pending_at(dc *d, reader *r, uint32_t h) {
     if (h >= r->npending) {
-        uint32_t cap = h * 2U + 8U;
+        uint32_t cap = (h * 2U) + 8U;
         dsteps *p = take(d, sizeof(dsteps) * cap);
         if (p == NULL) {
             return NULL;
