@@ -5,6 +5,7 @@
    integers, so both are checked: values in the one-step range, arbitrary bit
    patterns, long digit strings, and %f at any precision. Any difference is a
    failure. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,32 @@ static void test_any_double_is_exact(int rounds) {
     CHECK(diff == 0);
 }
 
+/* Every power of two, subnormal ones too, and its negative: there the gap
+   above is twice the one below, so the shortest digits may lie on the far
+   side of x from the nearest ones, which a random double almost never
+   finds. The libc host once wrote 2^-1007 with 17 digits instead of 16. */
+static void test_powers_of_two_are_exact(void) {
+    int checked = 0;
+    int trip = 0;
+    int diff = 0;
+    for (int e = -1074; e <= 1023; e++) {
+        for (int sign = 1; sign >= -1; sign -= 2) {
+            double x = sign * ldexp(1.0, e);
+            checked++;
+            if (!round_trips(x)) {
+                trip++;
+            }
+            if (!same_as_libc(x)) {
+                diff++;
+            }
+        }
+    }
+    printf("powers of two: %d values, %d round-trip failures, %d differ from libc\n", checked, trip,
+           diff);
+    CHECK(trip == 0);
+    CHECK(diff == 0);
+}
+
 /* Long digit strings read as strtod reads them: correctly rounded however
    many digits there are and wherever the exponent lands. */
 static void test_long_decimals_parse_exactly(int rounds) {
@@ -322,6 +349,7 @@ int main(int argc, char **argv) {
     test_fixed_point_matches_libc(rounds / 4);
     test_in_range_is_exact(rounds);
     test_any_double_is_exact(rounds / 4);
+    test_powers_of_two_are_exact();
     test_long_decimals_parse_exactly(rounds / 8);
     if (failures > 0) {
         printf("%d failure(s)\n", failures);

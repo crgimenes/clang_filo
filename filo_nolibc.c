@@ -844,6 +844,17 @@ static void bump(char *dig, size_t p, int *e10) {
     *e10 += 1;
 }
 
+/* Whether the n digits of dig from position from (past have: zeros, which
+   is what they are) are all c. */
+static bool run_of(const char *dig, size_t have, size_t from, size_t n, char c) {
+    for (size_t i = from; i < from + n; i++) {
+        if ((i < have ? dig[i] : '0') != c) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static size_t put_shortest(bool neg, const char *dig, size_t nd, int e10, char *dst, size_t cap) {
     while (nd > 1 && dig[nd - 1] == '0') {
         nd--; /* trailing zeros carry no information */
@@ -886,7 +897,20 @@ size_t filo_nolibc_num_to_str(void *user, double x, char *dst, size_t cap) {
     int e10 = 0;
     bool more = false;
     size_t have = leading_digits(x, dig, &e10, &more);
+    uint64_t bits = 0;
+    memcpy(&bits, &x, sizeof(bits));
+    bool normal = ((bits >> 52U) & 0x7FFU) != 0;
     for (size_t p = 1; p < SHORT_DIGITS; p++) {
+        /* A p-digit candidate reads back only within half an ulp of x: at
+           most 2^-53 of it when x is normal, so the digits after p must run
+           to 15 - p zeros (lo) or nines (hi); 2^-1075 when it is not, so
+           to e10 - p + 324. Two fewer leave room. Reading back is exact and
+           slow, near 1e-300 above all, so a candidate that cannot is not
+           tried. */
+        int need = normal ? 14 - (int)p : e10 - (int)p + 322;
+        size_t run = need > 0 ? (size_t)need : 0;
+        bool lo_may = run_of(dig, have, p, run, '0');
+        bool hi_may = run_of(dig, have, p, run, '9');
         char lo[SHORT_DIGITS];
         char hi[SHORT_DIGITS];
         for (size_t i = 0; i < p; i++) {
@@ -910,13 +934,13 @@ size_t filo_nolibc_num_to_str(void *user, double x, char *dst, size_t cap) {
         if (next == 5U && (beyond || ((uint32_t)(lo[p - 1] - '0') % 2U) == 1U)) {
             up = true;
         }
-        if (up && reads_back(hi, p, e_hi, x)) {
+        if (up && hi_may && reads_back(hi, p, e_hi, x)) {
             return put_shortest(neg, hi, p, e_hi, dst, cap);
         }
-        if (reads_back(lo, p, e_lo, x)) {
+        if (lo_may && reads_back(lo, p, e_lo, x)) {
             return put_shortest(neg, lo, p, e_lo, dst, cap);
         }
-        if (!up && reads_back(hi, p, e_hi, x)) {
+        if (!up && hi_may && reads_back(hi, p, e_hi, x)) {
             return put_shortest(neg, hi, p, e_hi, dst, cap);
         }
     }

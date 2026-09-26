@@ -9,6 +9,36 @@
 
 #include "filo_libc.h"
 
+/* sci, as %e writes it, one unit of its last digit away from zero (up) or
+   toward it, with the same number of digits: 9.99e+05 up is 1.00e+06, 1.00e+06
+   down is 9.99e+05. */
+static void other_side(char *sci, size_t cap, bool up) {
+    char *e = strchr(sci, 'e');
+    int exp = (int)strtol(e + 1, NULL, 10);
+    char *first = sci[0] == '-' ? sci + 1 : sci;
+    char *d = e;
+    while (d > first) {
+        d--;
+        if (*d == '.') {
+            continue;
+        }
+        if (*d != (up ? '9' : '0')) {
+            *d = (char)(*d + (up ? 1 : -1));
+            break;
+        }
+        *d = up ? '0' : '9';
+        if (d == first) {
+            *d = up ? '1' : '9'; /* carried past the first digit */
+            exp += up ? 1 : -1;
+        }
+    }
+    if (*first == '0') {
+        *first = '9'; /* 1.00 down: 0.99 is 9.9 one power lower */
+        exp--;
+    }
+    (void)snprintf(e, cap - (size_t)(e - sci), "e%d", exp);
+}
+
 /* The shortest digit string that round-trips, then Go's placement rule for
    FormatFloat(x, 'g', -1, 64): plain decimal when the exponent is in
    [-4, 6), else d.ddde±XX — so 999999 prints as is and 1000000 as 1e+06. */
@@ -27,6 +57,14 @@ size_t filo_libc_num_to_str(void *user, double x, char *dst, size_t cap) {
     int prec = 0;
     for (prec = 0; prec < 17; prec++) {
         (void)snprintf(sci, sizeof(sci), "%.*e", prec, x);
+        double back = strtod(sci, NULL);
+        if (back == x) {
+            break;
+        }
+        /* at a power of two the gap above x is twice the one below, so the
+           digits on the far side may read back when the nearest do not:
+           2^-1007 is 7.291122019556398e-304, not ...397 nor ...3975 */
+        other_side(sci, sizeof(sci), fabs(back) < fabs(x));
         if (strtod(sci, NULL) == x) {
             break;
         }

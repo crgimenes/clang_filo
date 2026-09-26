@@ -5075,16 +5075,17 @@ static void sink_quoted(sink *s, filo_str str) {
    WALK_PARTS_MAX parts and WALK_LEVELS_MAX levels, the Go engine's
    ceilings, checked in its order, so both fail on the same value: writing
    it checks first (walkable), comparing it counts as it goes (equal_walk).
-   The levels also bound the C stack the walk takes. */
+   The levels also bound the C stack the walk takes; the parts, the time
+   writing a value takes (2^18 numbers, ~1.3 s here with libc). */
 enum {
-    WALK_PARTS_MAX = 1U << 22U,
+    WALK_PARTS_MAX = 1U << 18U,
     WALK_LEVELS_MAX = FILO_EVAL_DEPTH_MAX,
 };
 
 static int walk_check(filo_ctx *ctx, const filo_value *v, uint32_t level, uint32_t *parts) {
     (*parts)++;
     if (*parts > WALK_PARTS_MAX) {
-        return filo_fail(ctx, "value too large: more than 4194304 parts");
+        return filo_fail(ctx, "value too large: more than 262144 parts");
     }
     if (v->kind != FILO_LIST && v->kind != FILO_TUPLE) {
         return FILO_OK;
@@ -6051,7 +6052,7 @@ static int equal_walk(filo_ctx *ctx, const filo_value *a, const filo_value *b, u
     *eq = false;
     (*parts)++;
     if (*parts > WALK_PARTS_MAX) {
-        return filo_fail(ctx, "value too large: more than 4194304 parts");
+        return filo_fail(ctx, "value too large: more than 262144 parts");
     }
     if (a->kind != b->kind) {
         return FILO_OK;

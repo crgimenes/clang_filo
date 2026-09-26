@@ -75,6 +75,7 @@ casts.txt	string of a huge number	1
 casts.txt	string of the smallest subnormal	1
 casts.txt	string of the largest double	1
 casts.txt	string of the smallest normal	1
+casts.txt	string of a power of two takes the digits on its wide side	3
 casts.txt	a 17-digit literal reads as the nearest double	1
 casts.txt	number reads past twenty zeros after the point	1
 casts.txt	number underflows to zero	1
@@ -170,6 +171,7 @@ limits.txt	the same recursion succeeds with the default limits	461
 limits.txt	a long loop fails under a small step limit	305
 limits.txt	the same loop succeeds with the default limits	305
 limits.txt	limits reset between runs	305
+limits.txt	a list of 262143 items is 262144 parts: at the ceiling, it compares	5
 limits.txt	a comparison settled early walks no further	109
 limits.txt	a shared value under the ceiling compares	39
 lists.txt	list	4

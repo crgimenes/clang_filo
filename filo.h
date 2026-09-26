@@ -275,7 +275,7 @@ bool filo_equal(const filo_value *a, const filo_value *b);
 
 /* Renders v the way (string v) does: strings verbatim, everything else in
    source form. Needs the num_to_str hook for numbers. Refuses a value past
-   the walk ceilings (4194304 parts, 512 levels), the Go engine's, since a
+   the walk ceilings (262144 parts, 512 levels), the Go engine's, since a
    list may hold the same value many times and grow past memory as text. */
 int filo_value_text(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len);
 
