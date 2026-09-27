@@ -447,7 +447,10 @@ static uint32_t open_group(layout *l, uint32_t i, uint32_t cap_frames) {
     if (need_space(l)) {
         write_text(l, " ", 1);
     }
-    frame f = {NULL, 0, 0, false, (l->depth + 1) * l->indent, -1, false};
+    /* the children of a broken form indent from its own paren, which is not
+       where the depth says under a column aligned to a head line (the
+       bindings of let) */
+    frame f = {NULL, 0, 0, false, l->col + l->indent, -1, false};
     if (p != NULL && is_head(p, "cond")) {
         f.clause = true;
         f.inline_n = 1;
