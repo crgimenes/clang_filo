@@ -130,6 +130,41 @@ static void test_host_calls_a_script_function(void) {
     CHECK(v.u.num == 8);
 }
 
+/* A host loop keeps one result at a time: a thousand results, each a list
+   with a string in it, in an arena that holds a few dozen of them. */
+static void test_keep_holds_one_result(void) {
+    static uint8_t small_run[32 * 1024];
+    static uint8_t small_lasting[32 * 1024];
+    filo_host host = filo_libc_host;
+    filo_init(&CTX, &host, small_lasting, sizeof(small_lasting), small_run, sizeof(small_run));
+    CHECK(filo_strings_register(&CTX, &filo_libc_strings) == FILO_OK);
+    filo_value v = {0};
+    filo_prog prog;
+    const char *src = "(def step (fn (st) (list (+ (nth st 0) 1) (str-concat \"line number \" "
+                      "(string (nth st 0))))))";
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    CHECK(filo_run(&CTX, &prog, NULL, &v) == FILO_OK);
+    filo_value fn = {0};
+    CHECK(filo_get_global(&CTX, "step", &fn));
+    filo_value items[2] = {filo_num(0), filo_cstring("")};
+    filo_value state = {0};
+    CHECK(filo_list(&CTX, items, 2, &state) == FILO_OK);
+    size_t mark = CTX.run.used;
+    size_t most = 0;
+    for (int i = 0; i < 1000; i++) {
+        filo_value next = {0};
+        CHECK(filo_call(&CTX, &fn, &state, 1, &next) == FILO_OK);
+        filo_keep(&CTX, mark, &next);
+        state = next;
+        most = CTX.run.used > most ? CTX.run.used : most;
+    }
+    CHECK(state.kind == FILO_LIST && state.u.seq.items[0].u.num == 1000);
+    CHECK(state.u.seq.items[1].kind == FILO_STRING && state.u.seq.items[1].u.str.len == 15);
+    CHECK(memcmp(state.u.seq.items[1].u.str.ptr, "line number 999", 15) == 0);
+    CHECK(most - mark < 1024); /* one result's worth, not a thousand */
+    start();
+}
+
 static int host_calls = 0;
 
 static int b_set_key(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
@@ -792,6 +827,7 @@ int main(void) {
     test_runs_pause_and_resume();
     test_paused_runs_show_their_calls();
     test_host_calls_a_script_function();
+    test_keep_holds_one_result();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();
     test_limits_are_enforced();

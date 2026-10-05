@@ -159,6 +159,10 @@ static int64_t tokenize(const char *src, size_t len, token *toks, size_t cap) {
                 i++;
             }
             t->type = TOK_ATOM;
+        } else if (c == '#' && i + 2 < len && (src[i + 1] == 't' || src[i + 1] == 'f') &&
+                   src[i + 2] == '"') {
+            i += 2; /* the reader's #t" ": a bool, then a string */
+            t->type = TOK_ATOM;
         } else {
             while (i < len) {
                 char a = src[i];

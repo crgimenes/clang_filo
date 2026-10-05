@@ -6713,3 +6713,10 @@ int filo_arg_list(filo_ctx *ctx, const filo_value *v, filo_seq *out) {
 void *filo_alloc(filo_ctx *ctx, size_t n) {
     return ralloc(ctx, n);
 }
+
+void filo_keep(filo_ctx *ctx, size_t mark, filo_value *v) {
+    if (mark > ctx->run.used) {
+        return;
+    }
+    region_release(ctx, mark, v);
+}

@@ -43,7 +43,7 @@ enum {
    Registering past it fails, so a host that ignores the result loses the
    builtin without a word — size it to what the host registers. */
 #ifndef FILO_BUILTINS_MAX
-#define FILO_BUILTINS_MAX 128
+#define FILO_BUILTINS_MAX 160 /* msh registers ~130 */
 #endif
 
 /* Globals a context can name. Each costs about 22 bytes on a 32-bit target
@@ -298,6 +298,13 @@ int filo_arg_list(filo_ctx *ctx, const filo_value *v, filo_seq *out);
 /* Run-arena memory for a builtin's result; gone when the run ends. NULL
    (with the error set) when the arena is exhausted. */
 void *filo_alloc(filo_ctx *ctx, size_t n);
+
+/* For a builtin that calls functions over and over, each result the next
+   one's argument (a loop): what the run's memory took since mark, taken as
+   ctx->run.used before, goes back, all but *v, which is copied whole down
+   to mark. A loop then holds one result at a time, not every one it made.
+   A closure in *v, or no room for the copy: nothing goes back. */
+void filo_keep(filo_ctx *ctx, size_t mark, filo_value *v);
 
 /* Renders v in source form: strings quoted, lists as (list ...); refuses a
    value past the walk ceilings, as filo_value_text does. */
