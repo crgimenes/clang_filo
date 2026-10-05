@@ -306,7 +306,19 @@ enum {
     REGION_COPY_DEPTH_MAX = 64,
 };
 
-static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, uint32_t depth) {
+/* Only what lies in the region (from lo up) is copied: what is older, or in
+   the persistent arena, stays valid where it is, and a list never holds
+   anything younger than itself, so what it reaches stays too. */
+static bool outside(const filo_ctx *ctx, const void *p, const uint8_t *lo) {
+    const uint8_t *b = (const uint8_t *)p;
+    if (b < lo) {
+        return true;
+    }
+    return b >= ctx->run.base + ctx->run.cap;
+}
+
+static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, uint32_t depth,
+                        const uint8_t *lo) {
     *dst = *src;
     if (src->kind == FILO_NUMBER || src->kind == FILO_BOOL) {
         return true;
@@ -315,7 +327,7 @@ static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, u
         return false;
     }
     if (src->kind == FILO_STRING) {
-        if (src->u.str.len == 0) {
+        if (src->u.str.len == 0 || outside(ctx, src->u.str.ptr, lo)) {
             return true;
         }
         uint8_t *bytes = ralloc(ctx, src->u.str.len);
@@ -330,8 +342,8 @@ static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, u
         return false; /* a closure: see the note above */
     }
     uint32_t n = src->u.seq.len;
-    if (n == 0 || src->u.seq.items == NULL) {
-        return true; /* empty, or a range that was never materialised */
+    if (n == 0 || src->u.seq.items == NULL || outside(ctx, src->u.seq.items, lo)) {
+        return true; /* empty, a range never materialised, or older */
     }
     filo_value *items = ralloc(ctx, sizeof(filo_value) * n);
     if (items == NULL) {
@@ -339,7 +351,7 @@ static bool region_copy(filo_ctx *ctx, const filo_value *src, filo_value *dst, u
     }
     dst->u.seq.items = items;
     for (uint32_t i = 0; i < n; i++) {
-        if (!region_copy(ctx, &src->u.seq.items[i], &items[i], depth + 1)) {
+        if (!region_copy(ctx, &src->u.seq.items[i], &items[i], depth + 1, lo)) {
             return false;
         }
     }
@@ -366,10 +378,11 @@ static void region_relocate(filo_value *v, const uint8_t *lo, const uint8_t *hi,
         return;
     }
     const uint8_t *p = (const uint8_t *)items;
-    if (p >= lo && p < hi) {
-        items = (filo_value *)(void *)(p + delta);
-        v->u.seq.items = items;
+    if (p < lo || p >= hi) {
+        return; /* a list left where it was holds nothing that moved */
     }
+    items = (filo_value *)(void *)(p + delta);
+    v->u.seq.items = items;
     for (uint32_t i = 0; i < v->u.seq.len; i++) {
         region_relocate(&items[i], lo, hi, delta);
     }
@@ -396,7 +409,7 @@ static void region_release(filo_ctx *ctx, size_t mark, filo_value *out) {
     if (out->kind == FILO_LIST || out->kind == FILO_TUPLE) {
         size_t top = ctx->run.used;
         filo_value copy = {0};
-        if (!region_copy(ctx, out, &copy, 0)) {
+        if (!region_copy(ctx, out, &copy, 0, base + mark)) {
             /* could not: the region stays as it was, and the run goes on as
                if nothing was tried — the failed allocation's message must not
                outlive it (this runs only where nothing has failed) */
