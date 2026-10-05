@@ -8,9 +8,10 @@
    table and the globals; it only grows. The run arena holds everything a
    single run creates (frames, lists, strings, closures) and is reset at the
    start of the next run. Globals written by a run are copied out into the
-   persistent arena when the run ends, so they survive; the run's result value
-   stays valid until the next run or compile. A script that exhausts either
-   arena fails with an error, never corrupts memory.
+   persistent arena when the run ends, so they survive (a function takes of
+   the frames it captured only the slots its code can read); the run's
+   result value stays valid until the next run or compile. A script that
+   exhausts either arena fails with an error, never corrupts memory.
 
    Built with FILO_VM_ONLY defined (for the whole build, this header
    included), the runtime keeps only what runs a loaded unit: no parser, no

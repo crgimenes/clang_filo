@@ -539,6 +539,40 @@ static void test_bc_entries_share_globals(void) {
     CHECK(filo_get_global(&CTX, "n", &v) && v.u.num == 7);
 }
 
+/* A function kept past the run takes of the frames it captured only what
+   it can read: bytecode holds every top-level let in one frame, and a list
+   no function sees must not fill the persistent arena. */
+static void test_bc_persists_what_closures_read(void) {
+    start();
+    const char *src[] = {
+        "(let ((big (map (fn (x) x) (range 0 5000)))) (length big))"
+        "(let ((n 0) (k 10) (g (fn () 1)))"
+        "  (def inc (fn () (set n (+ n 1)) n))"
+        "  (def mk (fn (x) (fn () (+ x k))))"
+        "  (def h (fn () (g))))"
+        "(def outer (fn (p) (let ((q 5)) (def inner (fn () (+ p q))))))",
+        "(do (inc) (inc))",
+        "(+ ((mk 1)) (do (outer 3) (inner)) (h))",
+        "(let ((big (map (fn (x) x) (range 0 5000)))) (def sees (fn () (length big))))",
+    };
+    size_t len = build(src, 4);
+    const filo_unit *u = NULL;
+    CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+    filo_value v;
+    size_t before = CTX.persistent.used;
+    CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
+    CHECK(CTX.persistent.used - before < 4096); /* the list takes 120 KB */
+    CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 2);
+    CHECK(filo_bc_run(&CTX, u, "e2", NULL, &v) == FILO_OK);
+    CHECK(v.kind == FILO_NUMBER && v.u.num == 20);
+    CHECK(run("(inc)", &v) == FILO_OK && v.u.num == 3);
+    before = CTX.persistent.used;
+    CHECK(filo_bc_run(&CTX, u, "e3", NULL, &v) == FILO_OK);
+    CHECK(CTX.persistent.used - before > 5000 * sizeof(filo_value)); /* sees reads it */
+    CHECK(run("(sees)", &v) == FILO_OK && v.u.num == 5000);
+}
+
 /* The IR and the bytecode call each other both ways, and the host calls a
    bytecode function like any other: a closure is a closure. */
 static void test_bc_and_ir_call_each_other(void) {
@@ -879,6 +913,7 @@ int main(void) {
     test_bc_globals_read_only_are_externs();
     test_bc_functions_resolve_whatever_their_origin();
     test_bc_entries_share_globals();
+    test_bc_persists_what_closures_read();
     test_bc_and_ir_call_each_other();
     test_bc_sealed_context_refuses_unknown_globals();
     if (failures > 0) {

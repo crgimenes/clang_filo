@@ -2498,47 +2498,107 @@ enum { COPY_MEMO_MAX = 128 };
 typedef struct {
     const frame *from[COPY_MEMO_MAX];
     frame *to[COPY_MEMO_MAX];
+    uint8_t *filled[COPY_MEMO_MAX]; /* the slots of to copied so far */
     uint32_t n;
 } copy_memo;
 
-static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, copy_memo *memo);
+/* What a closure can read of the frames it captured, as (depth, slot)
+   pairs, depth 1 the frame itself: bytecode keeps every let of a program's
+   top level in one frame, and a function defined there sees few of them.
+   all: an IR closure, or bytecode too nested to follow, reads every slot. */
+typedef struct {
+    uint32_t depth;
+    uint32_t slot;
+} reach_pair;
 
-static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo) {
+typedef struct {
+    reach_pair *pairs;
+    uint32_t n;
+    uint32_t cap;
+    bool all;
+} reach;
+
+static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, copy_memo *memo);
+static int bc_reach(filo_ctx *ctx, const bc_fn *fn, uint32_t lift, uint32_t nest, reach *r);
+
+static bool reaches_past(const reach *r, uint32_t depth) {
+    if (r->all) {
+        return true;
+    }
+    for (uint32_t i = 0; i < r->n; i++) {
+        if (r->pairs[i].depth > depth) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Copies of old the slots r reaches at depth, and of its parents those
+   further out; a frame met again through another closure gets the slots
+   that one adds. A slot no closure reaches is left nil: nothing reads it. */
+static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo, const reach *r,
+                         uint32_t depth) {
     if (old == NULL || in_persistent(ctx, old)) {
         return old;
     }
-    for (uint32_t i = 0; i < memo->n; i++) {
-        if (memo->from[i] == old) {
-            return memo->to[i];
-        }
+    uint32_t at = 0;
+    while (at < memo->n && memo->from[at] != old) {
+        at++;
     }
-    if (memo->n >= COPY_MEMO_MAX) {
-        (void)filo_fail(ctx, "cannot persist function: too many frames");
-        return NULL;
-    }
-    frame *f = palloc(ctx, sizeof(frame));
-    if (f == NULL) {
-        return NULL;
-    }
-    memo->from[memo->n] = old;
-    memo->to[memo->n] = f;
-    memo->n++;
-    f->n = old->n;
-    f->slots = NULL;
-    if (f->n > 0) {
-        f->slots = palloc(ctx, sizeof(filo_value) * f->n);
-        if (f->slots == NULL) {
+    if (at == memo->n) {
+        if (memo->n >= COPY_MEMO_MAX) {
+            (void)filo_fail(ctx, "cannot persist function: too many frames");
             return NULL;
         }
-        for (uint32_t i = 0; i < f->n; i++) {
-            if (copy_value(ctx, &old->slots[i], &f->slots[i], memo) != FILO_OK) {
+        frame *f = palloc(ctx, sizeof(frame));
+        if (f == NULL) {
+            return NULL;
+        }
+        f->n = old->n;
+        f->slots = NULL;
+        f->parent = NULL;
+        uint8_t *filled = NULL;
+        if (f->n > 0) {
+            f->slots = palloc(ctx, sizeof(filo_value) * f->n);
+            filled = ralloc(ctx, f->n);
+            if (f->slots == NULL || filled == NULL) {
                 return NULL;
             }
+            for (uint32_t i = 0; i < f->n; i++) {
+                f->slots[i] = empty_list();
+                filled[i] = 0;
+            }
+        }
+        memo->from[at] = old;
+        memo->to[at] = f;
+        memo->filled[at] = filled;
+        memo->n++;
+    }
+    frame *f = memo->to[at];
+    uint8_t *filled = memo->filled[at];
+    uint32_t count = r->all ? old->n : r->n;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = i;
+        if (!r->all) {
+            if (r->pairs[i].depth != depth) {
+                continue;
+            }
+            slot = r->pairs[i].slot;
+        }
+        if (filled == NULL || slot >= old->n || filled[slot] != 0) {
+            continue;
+        }
+        filled[slot] = 1; /* first: a closure kept in the frame it captured comes back here */
+        if (copy_value(ctx, &old->slots[slot], &f->slots[slot], memo) != FILO_OK) {
+            return NULL;
         }
     }
-    f->parent = copy_frame(ctx, old->parent, memo);
-    if (old->parent != NULL && f->parent == NULL) {
-        return NULL;
+    if (old->parent != NULL && reaches_past(r, depth)) {
+        frame *p = copy_frame(ctx, old->parent, memo, r, depth + 1U);
+        if (p == NULL) {
+            return NULL;
+        }
+        f->parent = p;
     }
     return f;
 }
@@ -2588,7 +2648,11 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
             return FILO_ERR;
         }
         *fn = *src->u.fn;
-        fn->frame = copy_frame(ctx, src->u.fn->frame, memo);
+        reach r = {NULL, 0, 0, src->u.fn->bc == NULL};
+        if (!r.all && bc_reach(ctx, src->u.fn->bc, 0, 0, &r) != FILO_OK) {
+            return FILO_ERR;
+        }
+        fn->frame = copy_frame(ctx, src->u.fn->frame, memo, &r, 1);
         if (src->u.fn->frame != NULL && fn->frame == NULL) {
             return FILO_ERR;
         }
@@ -4733,6 +4797,82 @@ static int vm_unpack(filo_ctx *ctx, bc_act *a, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
         if (vm_push(ctx, a, seq_at(&t.u.seq, i)) != FILO_OK) {
             return FILO_ERR;
+        }
+    }
+    return FILO_OK;
+}
+
+enum { BC_REACH_NEST_MAX = 32 };
+
+static int reach_add(filo_ctx *ctx, reach *r, uint32_t depth, uint32_t slot) {
+    for (uint32_t i = 0; i < r->n; i++) {
+        if (r->pairs[i].depth == depth && r->pairs[i].slot == slot) {
+            return FILO_OK;
+        }
+    }
+    if (r->n == r->cap) {
+        uint32_t cap = r->cap == 0 ? 16U : r->cap * 2U;
+        reach_pair *pairs = ralloc(ctx, sizeof(reach_pair) * cap);
+        if (pairs == NULL) {
+            return FILO_ERR;
+        }
+        if (r->n > 0) {
+            memcpy(pairs, r->pairs, sizeof(reach_pair) * r->n);
+        }
+        r->pairs = pairs;
+        r->cap = cap;
+    }
+    r->pairs[r->n].depth = depth;
+    r->pairs[r->n].slot = slot;
+    r->n++;
+    return FILO_OK;
+}
+
+/* The frames fn reads further out than its own, and the functions it makes
+   read past it: lift is how far inside the persisted closure fn is. A unit
+   that does not decode here reads everything (the VM refuses it anyway). */
+static int bc_reach(filo_ctx *ctx, const bc_fn *fn, uint32_t lift, uint32_t nest, reach *r) {
+    const filo_unit *u = fn->unit;
+    uint32_t end = fn->off + fn->len;
+    uint32_t pc = fn->off;
+    if (nest > BC_REACH_NEST_MAX || end > u->code_len) {
+        r->all = true;
+        return FILO_OK;
+    }
+    while (pc < end && !r->all) {
+        uint32_t b = u->code[pc];
+        pc++;
+        uint32_t op = b >> 3U;
+        uint32_t x = b & 7U;
+        bool ok = true;
+        if (x == 7U && op != BC_JMP) {
+            ok = vm_uleb(u->code, end, &pc, &x);
+        }
+        if (op == BC_PUSH_UP || op == BC_STORE_UP) {
+            uint32_t slot = 0;
+            if (ok) {
+                ok = vm_uleb(u->code, end, &pc, &slot);
+            }
+            if (ok && x > lift && reach_add(ctx, r, x - lift, slot) != FILO_OK) {
+                return FILO_ERR;
+            }
+        } else if (op == BC_JMP) {
+            pc += 2U;
+        } else if (op == BC_CALLB) {
+            uint32_t idx = 0;
+            if (ok) {
+                ok = vm_uleb(u->code, end, &pc, &idx);
+            }
+        } else if (op == BC_CLOSURE) {
+            if (ok && x >= u->nfns) {
+                ok = false;
+            }
+            if (ok && bc_reach(ctx, &u->fns[x], lift + 1U, nest + 1U, r) != FILO_OK) {
+                return FILO_ERR;
+            }
+        }
+        if (!ok) {
+            r->all = true;
         }
     }
     return FILO_OK;
