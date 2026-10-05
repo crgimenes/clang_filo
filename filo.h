@@ -306,6 +306,11 @@ void *filo_alloc(filo_ctx *ctx, size_t n);
    A closure in *v, or no room for the copy: nothing goes back. */
 void filo_keep(filo_ctx *ctx, size_t mark, filo_value *v);
 
+/* For a builtin whose work grows with what it reads (a file a piece at a
+   time): more steps for the run in progress, past its step limit. Nothing
+   for a run without one. */
+void filo_grant_steps(filo_ctx *ctx, uint32_t more);
+
 /* Renders v in source form: strings quoted, lists as (list ...); refuses a
    value past the walk ceilings, as filo_value_text does. */
 int filo_value_repr(filo_ctx *ctx, const filo_value *v, char *dst, size_t cap, size_t *len);

@@ -294,6 +294,42 @@ static int twice(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *
     return FILO_OK;
 }
 
+static int b_grant(filo_ctx *ctx, const filo_value *args, uint32_t n, filo_value *out) {
+    (void)args;
+    (void)n;
+    filo_grant_steps(ctx, 400);
+    *out = filo_num(0);
+    return FILO_OK;
+}
+
+/* A loop past its step limit fails; the same loop with steps granted as it
+   goes runs to the end, as source and as bytecode. */
+static void test_grant_steps(void) {
+    static const char *const src[] = {
+        "(def spin (fn (n g) (if (= n 0) 0 (do (if g (grant) 0) (spin (- n 1) g)))))"
+        "(spin 60 #f)",
+        "(def spin (fn (n g) (if (= n 0) 0 (do (if g (grant) 0) (spin (- n 1) g)))))"
+        "(spin 60 #t)",
+    };
+    filo_limits limits = {300U, 0U};
+    for (int i = 0; i < 2; i++) {
+        start();
+        CHECK(filo_register_builtin(&CTX, "grant", b_grant) == FILO_OK);
+        filo_prog prog;
+        filo_value v = {0};
+        CHECK(filo_compile(&CTX, (const uint8_t *)src[i], strlen(src[i]), &prog) == FILO_OK);
+        CHECK(filo_run(&CTX, &prog, &limits, &v) == (i == 0 ? FILO_ERR : FILO_OK));
+        size_t len = build(&src[i], 1);
+        const filo_unit *u = NULL;
+        CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
+        CHECK(filo_bc_run(&CTX, u, "e0", &limits, &v) == (i == 0 ? FILO_ERR : FILO_OK));
+    }
+    start();
+    CTX.limits.step_limit = 0; /* no limit: nothing to raise */
+    filo_grant_steps(&CTX, 10);
+    CHECK(CTX.limits.step_limit == 0);
+}
+
 /* The imports are the capability list: a context without one of them does
    not load the unit at all, rather than failing at the call. */
 static void test_bc_missing_builtin_fails_the_load(void) {
@@ -828,6 +864,7 @@ int main(void) {
     test_paused_runs_show_their_calls();
     test_host_calls_a_script_function();
     test_keep_holds_one_result();
+    test_grant_steps();
     test_exit_reaches_the_host_as_a_value();
     test_math_registers_only_what_the_host_backs();
     test_limits_are_enforced();

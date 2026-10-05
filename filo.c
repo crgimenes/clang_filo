@@ -6720,3 +6720,15 @@ void filo_keep(filo_ctx *ctx, size_t mark, filo_value *v) {
     }
     region_release(ctx, mark, v);
 }
+
+void filo_grant_steps(filo_ctx *ctx, uint32_t more) {
+    uint32_t old = ctx->limits.step_limit;
+    if (old == 0) {
+        return;
+    }
+    uint32_t now = old > UINT32_MAX - more ? UINT32_MAX : old + more;
+    if (ctx->vm_stop == old) {
+        ctx->vm_stop = now; /* a run with no budget of its own stops at the limit */
+    }
+    ctx->limits.step_limit = now;
+}
