@@ -112,7 +112,7 @@ void fbc_positions(const fbc_unit *u, fbc_place out, void *user);
 
 /* A number as Filo writes it (Go's strconv, 'g', shortest). It takes the C
    library's printf and strtod; a host without them defines FBC_HOST_NUMBERS
-   and supplies this function with its own number text (msh's wasm build,
+   and supplies this function with its own number text (rocchetto's wasm build,
    filo_nolibc_num_to_str). The rest of this file and fbc_decompile.c take
    only snprintf and vsnprintf for integers and strings. */
 void fbc_number(double x, char *dst, size_t cap);

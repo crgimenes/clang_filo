@@ -179,7 +179,7 @@ check:
 		api_test.c nolibc_test.c device_test.c fbc_dump.c fbc_decompile.c filo_fmt.c filo_cli.c dump_test.c
 
 # Proves the core and the packs need nothing from libc but memcpy/memcmp/
-# strlen/strchr: the same freestanding wasm32 target the msh terminal uses.
+# strlen/strchr: the same freestanding wasm32 target the rocchetto shell uses.
 freestanding: $(CORE) $(PACKS) $(NOLIBC) $(HDRS)
 	@mkdir -p build
 	@for f in $(CORE) $(PACKS) $(NOLIBC); do \

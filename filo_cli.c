@@ -80,7 +80,7 @@ static const command commands[] = {
         "globals it uses (the extern ones marked), its constants and entry points,\n"
         "and every function, each instruction with its bytes and the line:column it\n"
         "came from. A source is compiled first, as build compiles it.",
-        "  filo dump lib/msh/edt.fbb | less",
+        "  filo dump edt.fbb | less",
     },
     {
         "show",
@@ -97,7 +97,7 @@ static const command commands[] = {
         "it asks for: the functions it imports and the extern globals it reads. The\n"
         "VM is this command's (the core, math and strings), or the one PROFILE lists:\n"
         "the names it gives, one a line -- a function, or \"global NAME\" for a value\n"
-        "it sets -- and \"#\" for a comment (msh's build writes the BBS's). A line a unit: \"NAME  "
+        "it sets -- and \"#\" for a comment (rocchetto's build writes its own). A line a unit: \"NAME  "
         "runs: ...\" or \"NAME  lacks N: a, b\"; the exit\n"
         "status is 1 when one lacks something. FILE is read from standard input when\n"
         "absent or \"-\".",

@@ -1,6 +1,6 @@
 /* Host hooks for a libc host: number formatting that matches the Go engine's
    FormatFloat(x, 'g', -1, 64) and parsing that matches its ParseFloat. A
-   freestanding host (the msh wasm build, a microcontroller without stdio)
+   freestanding host (rocchetto's wasm build, a microcontroller without stdio)
    supplies its own or leaves them NULL. */
 #include <math.h>
 #include <stdio.h>

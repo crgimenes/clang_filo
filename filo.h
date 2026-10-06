@@ -44,7 +44,7 @@ enum {
    Registering past it fails, so a host that ignores the result loses the
    builtin without a word — size it to what the host registers. */
 #ifndef FILO_BUILTINS_MAX
-#define FILO_BUILTINS_MAX 160 /* msh registers ~130 */
+#define FILO_BUILTINS_MAX 160 /* rocchetto registers ~130 */
 #endif
 
 /* Globals a context can name. Each costs about 22 bytes on a 32-bit target

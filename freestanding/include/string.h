@@ -1,6 +1,6 @@
 /* Declarations for the freestanding wasm32 build, which has no C library:
    exactly the six functions the core and the packs call. The host supplies
-   the definitions (the msh terminal does it in host/wasm/libc.c). */
+   the definitions (rocchetto does it in its host/wasm/libc.c). */
 #ifndef FILO_FREESTANDING_STRING_H
 #define FILO_FREESTANDING_STRING_H
 
