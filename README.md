@@ -35,7 +35,9 @@ repository keeps the same files and holds its `filo` to the same lines.
 
 `filo check` says whether a VM gives what a unit asks for (its imports and
 the extern globals it reads), against this command's builtins or a profile
-(`-vm`, a name a line); `filo size` says where a unit's bytes go, section by
+(`-vm`, a name a line: a function, or `global NAME` for a value); `filo
+build -vm` compiles against the same profile, so a call to the VM's own
+function is an import, as where that VM compiles it; `filo size` says where a unit's bytes go, section by
 section; `filo decompile` writes a unit back as Filo, a top-level form a
 line (`-o DIR`: one file an entry point, the paths in the unit's order, for
 `filo build`). The decompiler (`fbc_decompile.c`) reads only the bytes and

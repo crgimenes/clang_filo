@@ -89,7 +89,7 @@ CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c filo_fmt.c
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
-		-o build/filo $(CLI_SRC) filo_cli.c -lm
+		-DFILO_BUILTINS_MAX=1024 -o build/filo $(CLI_SRC) filo_cli.c -lm
 
 # the demo bundle: two examples, built and bundled as a lesson would
 build/cli/demo.fbb: build/filo examples/hello.filo examples/double.filo
@@ -111,6 +111,13 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 		./build/filo $$c x -h > build/cli.out 2>&1 || { echo "$$c -h: exit $$?"; exit 1; }; \
 		head -1 build/cli.out | grep -q "^usage: filo $$c " || { echo "$$c -h: $$(head -1 build/cli.out)"; exit 1; }; \
 	done; echo "cli: every command's -h"
+	@# compiled against a profile, a call to the VM's function is an import
+	@# and its value an extern: the bytes the Go repository keeps as well
+	@./build/filo build -vm testdata/vm/host.vm -o build/cli/host.fbc testdata/vm/host.filo
+	@cmp build/cli/host.fbc testdata/vm/host.fbc && echo "cli: build -vm as kept"
+	@printf 'paint\nstr-upper\n global W\n' > build/cli/host.vm
+	@./build/filo check -vm build/cli/host.vm testdata/vm/host.fbc | grep -q "runs: 2 imports, 1 externs" && \
+		echo "cli: check -vm reads a global as a value it sets"
 	@# each example says what it gives on its last line, as in the Go
 	@# repository, which keeps the same files: "; Output: VALUE" on the tree
 	@# and as bytecode, or "; Error: LINE:COL: MESSAGE"

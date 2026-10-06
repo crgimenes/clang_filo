@@ -56,12 +56,15 @@ static const command commands[] = {
     },
     {
         "build",
-        "filo build [--strip] -o OUT FILE...",
+        "filo build [--strip] [-vm PROFILE] -o OUT FILE...",
         "build compiles programs into one unit of bytecode (docs/bytecode.md), each\n"
         "an entry named by its file (lib/hello.filo is the entry \"hello\"): the same\n"
         "bytes the Go engine's filo build writes. --strip leaves out the debug section\n"
-        "(the lines and columns errors say).",
-        "  filo build -o prog.fbc main.filo fail.filo",
+        "(the lines and columns errors say). -vm compiles against the VM the profile\n"
+        "lists, as check reads it: a call to one of its functions is a call to a\n"
+        "builtin (an import), as where that VM compiles it, not to a global.",
+        "  filo build -o prog.fbc main.filo fail.filo\n  filo build -vm app.vm -o app.fbc "
+        "draw.filo",
     },
     {
         "bundle",
@@ -93,8 +96,9 @@ static const command commands[] = {
         "check says of each unit (a bundle's members, each) whether a VM gives what\n"
         "it asks for: the functions it imports and the extern globals it reads. The\n"
         "VM is this command's (the core, math and strings), or the one PROFILE lists:\n"
-        "the names it gives, one a line, \"#\" for a comment (msh's build writes the\n"
-        "BBS's). A line a unit: \"NAME  runs: ...\" or \"NAME  lacks N: a, b\"; the exit\n"
+        "the names it gives, one a line -- a function, or \"global NAME\" for a value\n"
+        "it sets -- and \"#\" for a comment (msh's build writes the BBS's). A line a unit: \"NAME  "
+        "runs: ...\" or \"NAME  lacks N: a, b\"; the exit\n"
         "status is 1 when one lacks something. FILE is read from standard input when\n"
         "absent or \"-\".",
         "  filo check -vm bin.vm mine.fbb",
@@ -479,6 +483,140 @@ static int cmd_run(int argc, char **argv) {
     return show_value(&v);
 }
 
+/* The names a VM gives: a profile's lines ("#" a comment), or when there is
+   no profile the builtins of this command's context. A line is a function
+   the VM gives ("print-at") or, after "global ", a value it sets ("global
+   W"): check wants both, build only the functions. */
+typedef struct {
+    const char *text; /* the profile, or NULL */
+    size_t len;
+} offer;
+
+/* Calls fn with each name of the profile, and whether it is a value; stops
+   when fn returns true, and says whether one did. */
+static bool profile_each(const offer *o,
+                         bool (*fn)(void *user, const char *name, size_t n, bool global),
+                         void *user) {
+    static const char global[] = "global ";
+    for (size_t at = 0; at < o->len;) {
+        size_t end = at;
+        while (end < o->len && o->text[end] != '\n') {
+            end++;
+        }
+        size_t a = at;
+        size_t z = end;
+        at = end + 1;
+        while (a < z && (o->text[a] == ' ' || o->text[a] == '\t' || o->text[a] == '\r')) {
+            a++;
+        }
+        while (z > a &&
+               (o->text[z - 1] == ' ' || o->text[z - 1] == '\t' || o->text[z - 1] == '\r')) {
+            z--;
+        }
+        if (z == a || o->text[a] == '#') {
+            continue;
+        }
+        bool value = false;
+        if (z - a > sizeof(global) - 1 && memcmp(o->text + a, global, sizeof(global) - 1) == 0) {
+            value = true;
+            a += sizeof(global) - 1;
+            while (a < z && (o->text[a] == ' ' || o->text[a] == '\t')) {
+                a++;
+            }
+        }
+        if (fn(user, o->text + a, z - a, value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    const uint8_t *name;
+    uint32_t n;
+} wanted;
+
+/* cppcheck-suppress constParameterCallback ; profile_each's shape */
+static bool same_name(void *user, const char *name, size_t n, bool global) {
+    (void)global;
+    const wanted *w = user;
+    if (n != w->n) {
+        return false;
+    }
+    return memcmp(name, w->name, n) == 0;
+}
+
+/* cppcheck-suppress constParameterCallback ; fbc_offers' shape */
+static bool offered(void *user, const uint8_t *name, uint32_t n) {
+    const offer *o = user;
+    if (o->text == NULL) {
+        for (uint32_t i = 0; i < ctx.nbuiltins; i++) {
+            const char *b = ctx.builtins[i].name;
+            if (strlen(b) == n && memcmp(b, name, n) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    wanted w = {name, n};
+    return profile_each(o, same_name, &w);
+}
+
+/* What a profile's function does here: build only compiles against it,
+   and nothing runs it in this command. */
+static int b_profiled(filo_ctx *c, const filo_value *a, uint32_t n, filo_value *out) {
+    (void)a;
+    (void)n;
+    (void)out;
+    return filo_fail(c, "a builtin of the profile's VM, not this command's");
+}
+
+/* The profile's functions, registered so a call to one compiles as a call
+   to a builtin (an import), as it would where the VM compiled it. */
+static bool register_name(void *user, const char *name, size_t n, bool global) {
+    static char names[FILE_MAX];
+    static size_t used = 0;
+    bool *failed = user;
+    if (global) {
+        return false;
+    }
+    if (used + n + 1 > sizeof(names)) {
+        (void)complain("the profile has too many names");
+        *failed = true;
+        return true;
+    }
+    char *copy = names + used;
+    memcpy(copy, name, n);
+    copy[n] = '\0';
+    for (uint32_t i = 0; i < ctx.nbuiltins; i++) {
+        if (strcmp(ctx.builtins[i].name, copy) == 0) {
+            return false; /* the core has it already */
+        }
+    }
+    used += n + 1;
+    if (filo_register_builtin(&ctx, copy, b_profiled) != FILO_OK) {
+        (void)complain(filo_error(&ctx));
+        *failed = true;
+        return true;
+    }
+    return false;
+}
+
+/* -vm PROFILE in front of args: the profile read into o, and how many
+   arguments that took (0 without one, -1 when it cannot be read). */
+static int vm_flag(int argc, char **argv, offer *o) {
+    static char profile[FILE_MAX];
+    if (argc < 2 || strcmp(argv[0], "-vm") != 0) {
+        return 0;
+    }
+    size_t n = read_file(argv[1], profile, sizeof(profile));
+    if (n == 0) {
+        return -1;
+    }
+    *o = (offer){profile, n};
+    return 2;
+}
+
 static int cmd_build(int argc, char **argv) {
     bool strip = false;
     if (argc > 0 && strcmp(argv[0], "--strip") == 0) {
@@ -486,9 +624,20 @@ static int cmd_build(int argc, char **argv) {
         argc--;
         argv++;
     }
+    offer o = {NULL, 0};
+    int skip = vm_flag(argc, argv, &o);
+    if (skip < 0) {
+        return 1;
+    }
+    argc -= skip;
+    argv += skip;
     if (argc < 3 || strcmp(argv[0], "-o") != 0) {
         help(stderr, "build");
         return 2;
+    }
+    bool failed = false;
+    if (o.text != NULL && profile_each(&o, register_name, &failed) && failed) {
+        return 1;
     }
     size_t len = build(argv + 2, argc - 2);
     if (len == 0) {
@@ -625,58 +774,11 @@ static const char *base_name(const char *path) {
     return b != NULL ? b + 1 : path;
 }
 
-/* The names a VM gives: a profile's lines ("#" a comment), or when there is
-   no profile the builtins of this command's context. */
-typedef struct {
-    const char *text; /* the profile, or NULL */
-    size_t len;
-} offer;
-
-/* cppcheck-suppress constParameterCallback ; fbc_offers' shape */
-static bool offered(void *user, const uint8_t *name, uint32_t n) {
-    const offer *o = user;
-    if (o->text == NULL) {
-        for (uint32_t i = 0; i < ctx.nbuiltins; i++) {
-            const char *b = ctx.builtins[i].name;
-            if (strlen(b) == n && memcmp(b, name, n) == 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-    for (size_t at = 0; at < o->len;) {
-        size_t end = at;
-        while (end < o->len && o->text[end] != '\n') {
-            end++;
-        }
-        size_t a = at;
-        size_t z = end;
-        while (a < z && (o->text[a] == ' ' || o->text[a] == '\t' || o->text[a] == '\r')) {
-            a++;
-        }
-        while (z > a &&
-               (o->text[z - 1] == ' ' || o->text[z - 1] == '\t' || o->text[z - 1] == '\r')) {
-            z--;
-        }
-        if (z > a && o->text[a] != '#' && z - a == n && memcmp(o->text + a, name, n) == 0) {
-            return true;
-        }
-        at = end + 1;
-    }
-    return false;
-}
-
 static int cmd_check(int argc, char **argv) {
     offer o = {NULL, 0};
-    int i = 0;
-    if (argc >= 2 && strcmp(argv[0], "-vm") == 0) {
-        static char profile[FILE_MAX];
-        size_t n = read_file(argv[1], profile, sizeof(profile));
-        if (n == 0) {
-            return 1;
-        }
-        o = (offer){profile, n};
-        i = 2;
+    int i = vm_flag(argc, argv, &o);
+    if (i < 0) {
+        return 1;
     }
     if (argc - i > 1 || (argc - i == 1 && argv[i][0] == '-' && argv[i][1] != '\0')) {
         help(stderr, "check");
