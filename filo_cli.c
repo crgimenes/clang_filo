@@ -97,10 +97,10 @@ static const command commands[] = {
         "it asks for: the functions it imports and the extern globals it reads. The\n"
         "VM is this command's (the core, math and strings), or the one PROFILE lists:\n"
         "the names it gives, one a line -- a function, or \"global NAME\" for a value\n"
-        "it sets -- and \"#\" for a comment (rocchetto's build writes its own). A line a unit: \"NAME  "
-        "runs: ...\" or \"NAME  lacks N: a, b\"; the exit\n"
-        "status is 1 when one lacks something. FILE is read from standard input when\n"
-        "absent or \"-\".",
+        "it sets -- and \"#\" for a comment (rocchetto's build writes its own). A\n"
+        "line a unit: \"NAME  runs: ...\" or \"NAME  lacks N: a, b\"; the exit status\n"
+        "is 1 when one lacks something. FILE is read from standard input when absent\n"
+        "or \"-\".",
         "  filo check -vm bin.vm mine.fbb",
     },
     {
