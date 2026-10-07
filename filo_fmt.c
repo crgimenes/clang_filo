@@ -191,6 +191,21 @@ static int64_t tokenize(const char *src, size_t len, token *toks, size_t cap) {
     return (int64_t)n;
 }
 
+/* A string with no closing quote: the tokenizer ran it to the end. */
+static bool open_string(const token *t) {
+    if (t->type != TOK_ATOM || t->len == 0 || t->text[0] != '"') {
+        return false;
+    }
+    for (uint32_t i = 1; i < t->len; i++) {
+        if (t->text[i] == '\\' && i + 1 < t->len) {
+            i++;
+        } else if (t->text[i] == '"') {
+            return false; /* the tokenizer ends a string at its quote */
+        }
+    }
+    return true;
+}
+
 /* Each open's matching close, and the width of its group on one line: -1
    when a comment, a blank line or a string over lines inside forbids it. */
 static bool spans(token *toks, uint32_t n, uint32_t *stack) {
@@ -573,6 +588,12 @@ const char *filo_fmt(const char *src, size_t len, uint32_t indent, uint32_t widt
     }
     if (l.full) {
         return NULL;
+    }
+    /* a string the source leaves open runs to the end: trimming it or a
+       newline after it would change it, and the next run's layout */
+    if (n > 0 && open_string(&toks[n - 1])) {
+        *out_len = l.n;
+        return l.out;
     }
     while (l.n > 0 && (l.out[l.n - 1] == '\n' || l.out[l.n - 1] == ' ')) {
         l.n--;
