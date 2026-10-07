@@ -15,7 +15,7 @@ FILO_GO ?= ../filo
 # which no libc here has; it fires on glibc and not on macOS, so it is off.
 TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
 
-.PHONY: steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: dist steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -86,10 +86,13 @@ CLI_CASES = hello.run hello.dump fib.run fib.dump double.dump double.trace demo.
 	constants.tree constants.folded double.ir double.both mistake.both
 CLI_SRC = $(CORE) $(PACKS) $(HOST) fbc_dump.c fbc_decompile.c filo_fmt.c
 
+# The tag the CLI reports (filo --version); outside a checkout, "dev".
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
-		-DFILO_BUILTINS_MAX=1024 -o build/filo $(CLI_SRC) filo_cli.c -lm
+		-DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"' -o build/filo $(CLI_SRC) filo_cli.c -lm
 
 # the demo bundle: two examples, built and bundled as a lesson would
 build/cli/demo.fbb: build/filo examples/hello.filo examples/double.filo
@@ -250,4 +253,24 @@ bench: $(CORE) $(PACKS) $(HOST) bench.c $(HDRS)
 qa: all fmt-check corpus corpus-nolibc oracle api nolibc device cli tidy check freestanding fuzz fuzz-bc
 
 clean:
-	rm -rf build
+	rm -rf build dist
+
+# What release.sh publishes (VERSION is its tag, which the CLI reports): the
+# CLI as clang-filo, beside Go's filo, universal for macOS and static (musl,
+# zig's cross compiler) for Linux.
+ZIG ?= zig
+DIST_DIR ?= dist
+DIST_CFLAGS = -std=c11 -O2 $(WARN) -DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"'
+dist: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
+	@mkdir -p $(DIST_DIR)/.work
+	for a in arm64 x86_64; do \
+		$(CC) -arch $$a -mmacosx-version-min=11.0 $(DIST_CFLAGS) -o $(DIST_DIR)/.work/$$a \
+			$(CLI_SRC) filo_cli.c -lm || exit 1; \
+	done
+	lipo -create -output $(DIST_DIR)/clang-filo-darwin-universal $(DIST_DIR)/.work/arm64 $(DIST_DIR)/.work/x86_64
+	for p in x86_64:amd64 aarch64:arm64; do \
+		out=$(DIST_DIR)/clang-filo-linux-$${p#*:}; \
+		$(ZIG) cc -target $${p%%:*}-linux-musl -static -s -D_DEFAULT_SOURCE $(DIST_CFLAGS) -o $$out \
+			$(CLI_SRC) filo_cli.c -lm || exit 1; \
+		gzip -9f $$out; \
+	done

@@ -60,3 +60,5 @@ build/
 CLAUDE.md
 project.md
 TODO.md
+dist/
+release.sh

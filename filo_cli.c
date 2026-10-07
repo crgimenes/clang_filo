@@ -145,10 +145,17 @@ static void help(FILE *f, const char *name) {
             lead = "       ";
         }
     }
+    if (name == NULL) {
+        (void)fputs("       filo --version\n", f);
+    }
     for (int i = 0; i < NCOMMANDS; i++) {
         if (name == NULL || strcmp(commands[i].name, name) == 0) {
             (void)fprintf(f, "\n%s\n", commands[i].text);
         }
+    }
+    if (name == NULL) {
+        (void)fputs(
+            "\n--version writes the version of this filo and which runtime it is, Go or C.\n", f);
     }
     (void)fputs("\nExamples:\n", f);
     for (int i = 0; i < NCOMMANDS; i++) {
@@ -157,6 +164,11 @@ static void help(FILE *f, const char *name) {
         }
     }
 }
+
+/* The release tag, stamped by the Makefile. */
+#ifndef FILO_CLI_VERSION
+#define FILO_CLI_VERSION "dev"
+#endif
 
 /* A diagnostic, on stderr, where it does not mix with the value. */
 static int complain(const char *text) {
@@ -1018,6 +1030,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         help(stdout, NULL);
+        return 0;
+    }
+    if (strcmp(argv[1], "--version") == 0) {
+        (void)printf("filo version %s (C)\n", FILO_CLI_VERSION);
         return 0;
     }
     for (int i = 0; i < NCOMMANDS; i++) {
