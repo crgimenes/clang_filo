@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "fbc_decompile.h"
 #include "fbc_dump.h"
@@ -146,6 +147,7 @@ static void help(FILE *f, const char *name) {
         }
     }
     if (name == NULL) {
+        (void)fputs("       filo [-step-limit N] [-recursion-limit N] < FILE\n", f);
         (void)fputs("       filo --version\n", f);
     }
     for (int i = 0; i < NCOMMANDS; i++) {
@@ -154,6 +156,11 @@ static void help(FILE *f, const char *name) {
         }
     }
     if (name == NULL) {
+        (void)fputs("\nfilo alone runs the program that comes on standard input and writes its\n"
+                    "value, as Go's filo does with a pipe: -step-limit and -recursion-limit\n"
+                    "bound it (100000 and 128 by default). The C runtime has no REPL: on a\n"
+                    "terminal it says so.\n",
+                    f);
         (void)fputs(
             "\n--version writes the version of this filo and which runtime it is, Go or C.\n", f);
     }
@@ -491,6 +498,73 @@ static int cmd_run(int argc, char **argv) {
     if (filo_compile(&ctx, unit_mem, len, &prog) != FILO_OK ||
         filo_run(&ctx, &prog, NULL, &v) != FILO_OK) {
         return complain_at(argv[i]);
+    }
+    return show_value(&v);
+}
+
+static size_t read_input(const char *path, void *dst, size_t cap);
+
+/* A limit's value, after the flag or after its "=": digits only. */
+static bool limit_value(const char *text, uint32_t *out) {
+    if (text == NULL || *text == '\0') {
+        return false;
+    }
+    uint64_t v = 0;
+    for (const char *p = text; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9' || v > UINT32_MAX / 10) {
+            return false;
+        }
+        v = (v * 10) + (uint64_t)(*p - '0');
+    }
+    if (v > UINT32_MAX) {
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+/* filo alone: the program on standard input, run, its value written, as
+   Go's filo does with a pipe; Go's other REPL flags are the Go runtime's. */
+static int cmd_pipe(int argc, char **argv) {
+    filo_limits limits = {FILO_STEP_LIMIT_DEFAULT, FILO_RECURSION_LIMIT_DEFAULT};
+    for (int i = 0; i < argc; i++) {
+        const char *flag = argv[i] + (strncmp(argv[i], "--", 2) == 0 ? 2 : 1);
+        const char *eq = strchr(flag, '=');
+        size_t n = eq != NULL ? (size_t)(eq - flag) : strlen(flag);
+        uint32_t *to = NULL;
+        if (n == 10 && strncmp(flag, "step-limit", n) == 0) {
+            to = &limits.step_limit;
+        } else if (n == 15 && strncmp(flag, "recursion-limit", n) == 0) {
+            to = &limits.recursion_limit;
+        } else if ((n == 7 && strncmp(flag, "timeout", n) == 0) ||
+                   (n == 10 && strncmp(flag, "fold-const", n) == 0) ||
+                   (n == 12 && strncmp(flag, "filo-package", n) == 0)) {
+            (void)complain2("Go's filo has it, the C runtime does not", argv[i]);
+            return 2;
+        } else {
+            (void)complain2("unknown flag", argv[i]);
+            help(stderr, NULL);
+            return 2;
+        }
+        const char *value = eq != NULL ? eq + 1 : (i + 1 < argc ? argv[++i] : NULL);
+        if (!limit_value(value, to)) {
+            (void)complain2("a limit is a number", argv[i]);
+            return 2;
+        }
+    }
+    if (isatty(STDIN_FILENO)) {
+        help(stderr, NULL);
+        return complain("the C runtime has no REPL: pipe a program in, or filo run FILE");
+    }
+    size_t len = read_input("-", unit_mem, sizeof(unit_mem));
+    if (len == 0) {
+        return 1;
+    }
+    filo_prog prog;
+    filo_value v = {0};
+    if (filo_compile(&ctx, unit_mem, len, &prog) != FILO_OK ||
+        filo_run(&ctx, &prog, &limits, &v) != FILO_OK) {
+        return complain_at("stdin");
     }
     return show_value(&v);
 }
@@ -1024,11 +1098,15 @@ static bool asks_help(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        help(stderr, NULL);
-        return 2;
+    if (argc < 2 ||
+        (argv[1][0] == '-' && strcmp(argv[1], "-h") != 0 && strcmp(argv[1], "-help") != 0 &&
+         strcmp(argv[1], "--help") != 0 && strcmp(argv[1], "--version") != 0)) {
+        filo_libc_install();
+        start();
+        return cmd_pipe(argc - 1, argv + 1);
     }
-    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "-help") == 0 ||
+        strcmp(argv[1], "--help") == 0) {
         help(stdout, NULL);
         return 0;
     }

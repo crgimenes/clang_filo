@@ -92,7 +92,8 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 build/filo: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	@mkdir -p build
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
-		-DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"' -o build/filo $(CLI_SRC) filo_cli.c -lm
+		-D_DEFAULT_SOURCE -DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"' -o build/filo \
+		$(CLI_SRC) filo_cli.c -lm
 
 # the demo bundle: two examples, built and bundled as a lesson would
 build/cli/demo.fbb: build/filo examples/hello.filo examples/double.filo
@@ -137,6 +138,10 @@ cli: device build/filo build/cli/demo.fbb dump_test.c
 			[ -n "$$want" ] && [ "$$got" = "filo: $$f:$$want" ] || { echo "$$f: $$got, want $$want"; exit 1; }; \
 		fi; \
 	done; echo "examples: $(words $(wildcard examples/*.filo)) as they say"
+	@# filo alone runs what comes on a pipe, as Go's filo does, within its limits
+	@[ "$$(echo '(+ 40 2)' | ./build/filo)" = 42 ] && \
+		echo '(fold (fn (a b) (+ a b)) 0 (range 1000))' | ./build/filo -step-limit 50 2>&1 | \
+		grep -q 'step limit exceeded' && echo "cli: a program on a pipe, within its limits"
 
 cli-regen: build/filo build/cli/demo.fbb
 	@for c in $(CLI_CASES); do ./build/filo $$(sh testdata/cli/args.sh $$c) > testdata/cli/$$c 2>&1; done
@@ -171,7 +176,7 @@ tidy:
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c bench.c fuzz.c fuzz_bc.c api_test.c \
-		nolibc_test.c fbc_dump.c fbc_decompile.c filo_fmt.c filo_cli.c dump_test.c -- -std=c11
+		nolibc_test.c fbc_dump.c fbc_decompile.c filo_fmt.c filo_cli.c dump_test.c -- -std=c11 -D_DEFAULT_SOURCE
 	$(LLVM)/clang-tidy --quiet --warnings-as-errors='*' \
 		--checks='$(TIDY_CHECKS)' \
 		$(CORE) device_test.c -- -std=c11 -DFILO_VM_ONLY
@@ -260,7 +265,8 @@ clean:
 # zig's cross compiler) for Linux.
 ZIG ?= zig
 DIST_DIR ?= dist
-DIST_CFLAGS = -std=c11 -O2 $(WARN) -DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"'
+# glibc and musl hide isatty under a strict -std; macOS ignores the macro
+DIST_CFLAGS = -std=c11 -O2 $(WARN) -D_DEFAULT_SOURCE -DFILO_BUILTINS_MAX=1024 -DFILO_CLI_VERSION='"$(VERSION)"'
 dist: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	@mkdir -p $(DIST_DIR)/.work
 	for a in arm64 x86_64; do \
@@ -270,7 +276,7 @@ dist: $(CLI_SRC) filo_cli.c fbc_dump.h fbc_decompile.h filo_fmt.h $(HDRS)
 	lipo -create -output $(DIST_DIR)/clang-filo-darwin-universal $(DIST_DIR)/.work/arm64 $(DIST_DIR)/.work/x86_64
 	for p in x86_64:amd64 aarch64:arm64; do \
 		out=$(DIST_DIR)/clang-filo-linux-$${p#*:}; \
-		$(ZIG) cc -target $${p%%:*}-linux-musl -static -s -D_DEFAULT_SOURCE $(DIST_CFLAGS) -o $$out \
+		$(ZIG) cc -target $${p%%:*}-linux-musl -static -s $(DIST_CFLAGS) -o $$out \
 			$(CLI_SRC) filo_cli.c -lm || exit 1; \
 		gzip -9f $$out; \
 	done
