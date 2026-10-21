@@ -8,7 +8,7 @@
 /* ---------------------------------------------------------------- memory */
 
 static void *arena_alloc(filo_arena *a, size_t n) {
-    size_t room = a->cap - a->used;
+    size_t room = a->cap - a->used - a->top;
     /* compared before rounding up: n + 7 wraps near SIZE_MAX, and an
        impossible size would come out as zero bytes that fit */
     if (n > room) {
@@ -25,6 +25,22 @@ static void *arena_alloc(filo_arena *a, size_t n) {
 
 static void arena_reset(filo_arena *a) {
     a->used = 0;
+}
+
+/* From the end of the arena, down: the persistent arena's globals' values,
+   packed now and then (compact_globals), apart from the programs and
+   symbols that only grow from its start. */
+static void *arena_alloc_top(filo_arena *a, size_t n) {
+    size_t room = a->cap - a->used - a->top;
+    if (n > room) {
+        return NULL;
+    }
+    size_t aligned = (n + 7U) & ~(size_t)7U;
+    if (aligned > room) {
+        return NULL;
+    }
+    a->top += aligned;
+    return a->base + a->cap - a->top;
 }
 
 /* Every allocation that fails ends the current operation with this
@@ -74,6 +90,14 @@ static void *ralloc(filo_ctx *ctx, size_t n) {
 
 static void *palloc(filo_ctx *ctx, size_t n) {
     void *p = arena_alloc(&ctx->persistent, n);
+    if (p == NULL) {
+        fail_memory(ctx, "persistent", ctx->persistent.cap);
+    }
+    return p;
+}
+
+static void *valloc(filo_ctx *ctx, size_t n) {
+    void *p = arena_alloc_top(&ctx->persistent, n);
     if (p == NULL) {
         fail_memory(ctx, "persistent", ctx->persistent.cap);
     }
@@ -2503,6 +2527,15 @@ static bool in_persistent(const filo_ctx *ctx, const void *p) {
     return b < ctx->persistent.base + ctx->persistent.cap;
 }
 
+/* In the globals' values, the part of the persistent arena that is packed. */
+static bool in_values(const filo_ctx *ctx, const void *p) {
+    const uint8_t *b = (const uint8_t *)p;
+    if (!in_persistent(ctx, p)) {
+        return false;
+    }
+    return b >= ctx->persistent.base + ctx->persistent.cap - ctx->persistent.top;
+}
+
 /* Frames reachable from a persisted closure may form cycles (a closure
    stored in the frame it captured); the memo breaks them and bounds the
    copy. */
@@ -2513,7 +2546,29 @@ typedef struct {
     frame *to[COPY_MEMO_MAX];
     uint8_t *filled[COPY_MEMO_MAX]; /* the slots of to copied so far */
     uint32_t n;
+    bool to_run; /* packing: out of the values into the run arena, not in */
 } copy_memo;
+
+static void memo_init(copy_memo *m, bool to_run) {
+    m->n = 0;
+    m->to_run = to_run;
+}
+
+static void *copy_alloc(filo_ctx *ctx, const copy_memo *memo, size_t n) {
+    return memo->to_run ? ralloc(ctx, n) : valloc(ctx, n);
+}
+
+/* Kept as it is, not copied: what is persistent already — but not the
+   values being packed, which are what the copy out of them is for. */
+static bool shared(const filo_ctx *ctx, const copy_memo *memo, const void *p) {
+    if (!in_persistent(ctx, p)) {
+        return false;
+    }
+    if (memo->to_run && in_values(ctx, p)) {
+        return false;
+    }
+    return true;
+}
 
 /* What a closure can read of the frames it captured, as (depth, slot)
    pairs, depth 1 the frame itself: bytecode keeps every let of a program's
@@ -2551,7 +2606,7 @@ static bool reaches_past(const reach *r, uint32_t depth) {
    that one adds. A slot no closure reaches is left nil: nothing reads it. */
 static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo, const reach *r,
                          uint32_t depth) {
-    if (old == NULL || in_persistent(ctx, old)) {
+    if (old == NULL || shared(ctx, memo, old)) {
         return old;
     }
     uint32_t at = 0;
@@ -2563,7 +2618,7 @@ static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo, const reach
             (void)filo_fail(ctx, "cannot persist function: too many frames");
             return NULL;
         }
-        frame *f = palloc(ctx, sizeof(frame));
+        frame *f = copy_alloc(ctx, memo, sizeof(frame));
         if (f == NULL) {
             return NULL;
         }
@@ -2572,7 +2627,7 @@ static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo, const reach
         f->parent = NULL;
         uint8_t *filled = NULL;
         if (f->n > 0) {
-            f->slots = palloc(ctx, sizeof(filo_value) * f->n);
+            f->slots = copy_alloc(ctx, memo, sizeof(filo_value) * f->n);
             filled = ralloc(ctx, f->n);
             if (f->slots == NULL || filled == NULL) {
                 return NULL;
@@ -2616,17 +2671,18 @@ static frame *copy_frame(filo_ctx *ctx, frame *old, copy_memo *memo, const reach
     return f;
 }
 
-/* Deep-copies a value into the persistent arena. Anything already there is
-   shared, not copied: string constants come from the IR, and a persisted
-   list only ever holds persisted values. */
+/* Deep-copies a value into the persistent arena (or, packing, out of it
+   into the run arena). Anything kept is shared, not copied: string
+   constants come from the IR, and a persisted list only ever holds
+   persisted values. */
 static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, copy_memo *memo) {
     *dst = *src;
     switch (src->kind) {
     case FILO_STRING: {
-        if (src->u.str.len == 0 || in_persistent(ctx, src->u.str.ptr)) {
+        if (src->u.str.len == 0 || shared(ctx, memo, src->u.str.ptr)) {
             return FILO_OK;
         }
-        uint8_t *copy = palloc(ctx, src->u.str.len);
+        uint8_t *copy = copy_alloc(ctx, memo, src->u.str.len);
         if (copy == NULL) {
             return FILO_ERR;
         }
@@ -2637,10 +2693,10 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
     case FILO_LIST:
     case FILO_TUPLE: {
         if (src->u.seq.len == 0 || src->u.seq.items == NULL ||
-            in_persistent(ctx, src->u.seq.items)) {
+            shared(ctx, memo, src->u.seq.items)) {
             return FILO_OK;
         }
-        filo_value *items = palloc(ctx, sizeof(filo_value) * src->u.seq.len);
+        filo_value *items = copy_alloc(ctx, memo, sizeof(filo_value) * src->u.seq.len);
         if (items == NULL) {
             return FILO_ERR;
         }
@@ -2653,10 +2709,10 @@ static int copy_value(filo_ctx *ctx, const filo_value *src, filo_value *dst, cop
         return FILO_OK;
     }
     case FILO_FUNC: {
-        if (in_persistent(ctx, src->u.fn)) {
+        if (shared(ctx, memo, src->u.fn)) {
             return FILO_OK;
         }
-        filo_func *fn = palloc(ctx, sizeof(filo_func));
+        filo_func *fn = copy_alloc(ctx, memo, sizeof(filo_func));
         if (fn == NULL) {
             return FILO_ERR;
         }
@@ -2724,13 +2780,13 @@ static void rollback_globals(filo_ctx *ctx) {
    back, and the persistent arena to where it was. */
 static int commit_globals(filo_ctx *ctx) {
     copy_memo memo;
-    memo.n = 0;
-    size_t mark = ctx->persistent.used;
+    memo_init(&memo, false);
+    size_t mark = ctx->persistent.top;
     for (const saved_global *s = ctx->journal; s != NULL; s = s->next) {
         filo_value persisted = {0};
         if (copy_value(ctx, &ctx->globals[s->id], &persisted, &memo) != FILO_OK) {
             rollback_globals(ctx);
-            ctx->persistent.used = mark;
+            ctx->persistent.top = mark;
             return FILO_ERR;
         }
         ctx->globals[s->id] = persisted;
@@ -2740,6 +2796,46 @@ static int commit_globals(filo_ctx *ctx) {
     }
     ctx->journal = NULL;
     return FILO_OK;
+}
+
+/* The values keep every version of every global written, the dead ones
+   too. Before a run, when what was written since the last packing takes
+   half of what is free, the live values are copied out to the empty run
+   arena and back, packed. What two globals shared comes back as two
+   copies; when that would not fit, or would gain nothing, nothing moves
+   and the next look waits for as much again. */
+static void compact_globals(filo_ctx *ctx) {
+    filo_arena *p = &ctx->persistent;
+    size_t since = p->top - ctx->packed;
+    if (since == 0 || since < (p->cap - p->used - p->top) / 2) {
+        return;
+    }
+    copy_memo memo;
+    memo_init(&memo, true);
+    filo_value *out = ralloc(ctx, sizeof(filo_value) * ctx->nsymbols);
+    bool ok = out != NULL;
+    for (uint32_t id = 0; ok && id < ctx->nsymbols; id++) {
+        if (ctx->defined[id]) {
+            ok = copy_value(ctx, &ctx->globals[id], &out[id], &memo) == FILO_OK;
+        }
+    }
+    size_t live = ctx->run.used; /* the copies, their side tables too: never less */
+    if (!ok || live >= p->top || live > p->cap - p->used) {
+        ctx->packed = p->top;
+        arena_reset(&ctx->run);
+        clear_error(ctx);
+        return;
+    }
+    p->top = 0;
+    memo_init(&memo, false);
+    for (uint32_t id = 0; id < ctx->nsymbols; id++) {
+        if (ctx->defined[id]) {
+            /* cannot fail: the same copies, into the room live was measured in */
+            (void)copy_value(ctx, &out[id], &ctx->globals[id], &memo);
+        }
+    }
+    ctx->packed = p->top;
+    arena_reset(&ctx->run);
 }
 
 /* A paused run lives in the run arena, so whatever resets it ends the run
@@ -2759,7 +2855,7 @@ int filo_set_global(filo_ctx *ctx, const char *name, filo_value v) {
         return FILO_ERR;
     }
     copy_memo memo;
-    memo.n = 0;
+    memo_init(&memo, false);
     filo_value persisted = {0};
     if (copy_value(ctx, &v, &persisted, &memo) != FILO_OK) {
         return FILO_ERR;
@@ -5608,6 +5704,7 @@ static void run_begin(filo_ctx *ctx, const filo_limits *limits, filo_limits *sav
     cancel_paused(ctx);
     arena_reset(&ctx->run);
     clear_error(ctx);
+    compact_globals(ctx);
     ctx->steps = 0;
     ctx->recursion = 0;
     ctx->depth = 0;

@@ -50,8 +50,9 @@ same text, character for character. `filo CMD -h` is each command's help.
 
 The host hands over two blocks and the runtime never asks for more:
 
-- **persistent arena** — compiled programs, the symbol table, the globals. It
-  only grows.
+- **persistent arena** — compiled programs and the symbol table, which only
+  grow, from its start; the globals' values from its end, packed before a
+  run when the versions left behind are worth taking back.
 - **run arena** — everything a single run creates (frames, lists, strings,
   closures). Reset at the start of the next run.
 

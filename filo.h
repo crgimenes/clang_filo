@@ -4,14 +4,18 @@
    memcpy/memcmp/strlen, no allocation after init: the host hands over two
    memory blocks and everything lives in them.
 
-   Memory model. The persistent arena holds compiled programs, the symbol
-   table and the globals; it only grows. The run arena holds everything a
-   single run creates (frames, lists, strings, closures) and is reset at the
-   start of the next run. Globals written by a run are copied out into the
-   persistent arena when the run ends, so they survive (a function takes of
-   the frames it captured only the slots its code can read); the run's
-   result value stays valid until the next run or compile. A script that
-   exhausts either arena fails with an error, never corrupts memory.
+   Memory model. The persistent arena holds compiled programs and the
+   symbol table, which only grow, from its start; and the globals' values,
+   from its end. The run arena holds everything a single run creates
+   (frames, lists, strings, closures) and is reset at the start of the next
+   run. Globals written by a run are copied out into the persistent arena
+   when the run ends, so they survive (a function takes of the frames it
+   captured only the slots its code can read); the values they held before
+   stay behind, and are taken back before a later run by packing the live
+   ones (see compact_globals in filo.c). The run's result value, and a
+   global read with filo_get_global, stay valid until the next run or
+   compile. A script that exhausts either arena fails with an error, never
+   corrupts memory.
 
    Built with FILO_VM_ONLY defined (for the whole build, this header
    included), the runtime keeps only what runs a loaded unit: no parser, no
@@ -127,6 +131,7 @@ typedef struct {
     uint8_t *base;
     size_t cap;
     size_t used;
+    size_t top; /* taken from the end: the persistent arena's globals' values */
 } filo_arena;
 
 typedef struct {
@@ -168,6 +173,7 @@ struct filo_ctx {
        kept in the run arena, in journal (internal), for the ones written */
     bool dirty[FILO_SYMBOLS_MAX];
     void *journal;
+    size_t packed; /* persistent.top when the globals' values were last packed */
 
     filo_limits limits;
     bool sealed; /* no new globals: only what the host created may be used */
@@ -243,7 +249,8 @@ bool filo_error_at(const filo_ctx *ctx, uint32_t *line, uint32_t *col);
 /* Copies v into the persistent arena under name (creating the symbol). */
 int filo_set_global(filo_ctx *ctx, const char *name, filo_value v);
 
-/* Reads a global; false when it was never set. */
+/* Reads a global; false when it was never set. What out points to is valid
+   until the next run or compile. */
 bool filo_get_global(const filo_ctx *ctx, const char *name, filo_value *out);
 
 /* Closes the set of globals: from here on a script that names a global the

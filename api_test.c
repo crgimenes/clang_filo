@@ -500,6 +500,43 @@ static void test_globals_that_do_not_fit_leave_no_trace(void) {
     CHECK(run("(def d (list 4 5))", &v) == FILO_OK); /* and the room it took is back */
 }
 
+/* Globals written run after run do not fill the persistent arena: the
+   values left behind are packed before a later run. A 48 KB arena, a list
+   of 50 reversed and a string made 20000 times, with a closure and two
+   globals sharing a list looking on; without packing the arena is full by
+   the fortieth run. */
+static void test_rewritten_globals_do_not_fill_the_arena(void) {
+    static uint8_t small_persistent[48 * 1024];
+    filo_init(&CTX, &filo_libc_host, small_persistent, sizeof(small_persistent), run_mem,
+              sizeof(run_mem));
+    filo_value v = {0};
+    CHECK(run("(def g (range 50)) (def s \"\") (def f (let ((n 5)) (fn (x) (+ x n)))) "
+              "(def a (range 20)) (def b a)",
+              &v) == FILO_OK);
+    filo_prog prog;
+    const char *src = "(do (set g (reverse g)) (set s (string (+ 1000 (nth g 0)))))";
+    CHECK(filo_compile(&CTX, (const uint8_t *)src, strlen(src), &prog) == FILO_OK);
+    int runs = 0;
+    while (runs < 20000 && filo_run(&CTX, &prog, NULL, NULL) == FILO_OK) {
+        runs++;
+    }
+    CHECK(runs == 20000);
+    if (runs < 20000) {
+        printf("  run %d: %s\n", runs, filo_error(&CTX));
+    }
+    CHECK(CTX.persistent.top < sizeof(small_persistent) / 2);
+    CHECK(run("(list (nth g 0) s (f 1) (nth a 3) (nth b 3) (length b))", &v) == FILO_OK);
+    CHECK(v.kind == FILO_LIST && v.u.seq.len == 6);
+    if (v.kind == FILO_LIST && v.u.seq.len == 6) {
+        const filo_value *i = v.u.seq.items;
+        CHECK(i[0].kind == FILO_NUMBER && i[0].u.num == 0); /* reversed an even number of times */
+        CHECK(i[1].kind == FILO_STRING && i[1].u.str.len == 4 &&
+              memcmp(i[1].u.str.ptr, "1000", 4) == 0);
+        CHECK(i[2].kind == FILO_NUMBER && i[2].u.num == 6);
+        CHECK(i[3].u.num == 3 && i[4].u.num == 3 && i[5].u.num == 20);
+    }
+}
+
 /* A bundle's members by position: a listing, or the only member of a
    bundle renamed on its way somewhere. */
 static void test_bundle_members_by_position(void) {
@@ -559,17 +596,17 @@ static void test_bc_persists_what_closures_read(void) {
     const filo_unit *u = NULL;
     CHECK(filo_bc_load(&CTX, unit_buf, len, &u) == FILO_OK);
     filo_value v;
-    size_t before = CTX.persistent.used;
+    size_t before = CTX.persistent.top;
     CHECK(filo_bc_run(&CTX, u, "e0", NULL, &v) == FILO_OK);
-    CHECK(CTX.persistent.used - before < 4096); /* the list takes 120 KB */
+    CHECK(CTX.persistent.top - before < 4096); /* the list takes 120 KB */
     CHECK(filo_bc_run(&CTX, u, "e1", NULL, &v) == FILO_OK);
     CHECK(v.kind == FILO_NUMBER && v.u.num == 2);
     CHECK(filo_bc_run(&CTX, u, "e2", NULL, &v) == FILO_OK);
     CHECK(v.kind == FILO_NUMBER && v.u.num == 20);
     CHECK(run("(inc)", &v) == FILO_OK && v.u.num == 3);
-    before = CTX.persistent.used;
+    before = CTX.persistent.top;
     CHECK(filo_bc_run(&CTX, u, "e3", NULL, &v) == FILO_OK);
-    CHECK(CTX.persistent.used - before > 5000 * sizeof(filo_value)); /* sees reads it */
+    CHECK(CTX.persistent.top - before > 5000 * sizeof(filo_value)); /* sees reads it */
     CHECK(run("(sees)", &v) == FILO_OK && v.u.num == 5000);
 }
 
@@ -888,6 +925,7 @@ int main(void) {
     test_pow_is_the_same_everywhere();
     test_globals_cross_both_ways();
     test_globals_that_do_not_fit_leave_no_trace();
+    test_rewritten_globals_do_not_fill_the_arena();
     test_seal_refuses_new_globals();
     test_seal_is_off_until_asked();
     test_symbol_table_is_bounded();
