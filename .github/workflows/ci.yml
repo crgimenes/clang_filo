@@ -66,6 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make fuzz
+      - run: make fuzz-bc
       - name: Upload findings
         if: failure()
         uses: actions/upload-artifact@v4
@@ -74,4 +75,6 @@ jobs:
           path: |
             build/fuzz_crash_*
             build/fuzz.log
+            build/fuzz_bc_crash_*
+            build/fuzz_bc.log
           if-no-files-found: ignore

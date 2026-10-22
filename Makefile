@@ -15,7 +15,7 @@ FILO_GO ?= ../filo
 # which no libc here has; it fires on glibc and not on macOS, so it is off.
 TIDY_CHECKS = bugprone-*,cert-*,clang-analyzer-*,readability-*,-readability-magic-numbers,-readability-function-cognitive-complexity,-readability-identifier-length,-readability-braces-around-statements,-bugprone-easily-swappable-parameters,-cert-err33-c,-readability-else-after-return,-readability-avoid-nested-conditional-operator,-readability-math-missing-parentheses,-cert-dcl03-c,-readability-uppercase-literal-suffix,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
 
-.PHONY: dist steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
+.PHONY: dist steps-regen govm all corpus corpus-nolibc oracle oracle-regen api nolibc device cli cli-regen cov fmt fmt-check tidy check qa clean freestanding fuzz fuzz-bc bench
 
 all: build/corpus_runner
 
@@ -29,6 +29,24 @@ nolibc: $(CORE) $(PACKS) $(HOST) $(NOLIBC) nolibc_test.c $(HDRS)
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(WARN) \
 		-o build/nolibc_test $(CORE) $(PACKS) $(HOST) $(NOLIBC) nolibc_test.c -lm
 	./build/nolibc_test
+
+# Line coverage of the corpus (three modes) and the API tests:
+# build/cov/cov.txt per file.
+LLVM_PROFDATA ?= xcrun llvm-profdata
+LLVM_COV ?= xcrun llvm-cov
+cov: $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c api_test.c $(HDRS)
+	@rm -rf build/cov && mkdir -p build/cov
+	$(CC) -std=c11 -O1 -g -fprofile-instr-generate -fcoverage-mapping $(WARN) \
+		-o build/cov/corpus_runner $(CORE) $(PACKS) $(HOST) $(NOLIBC) corpus_runner.c fbc_dump.c -lm
+	$(CC) -std=c11 -O1 -g -fprofile-instr-generate -fcoverage-mapping $(WARN) \
+		-o build/cov/api_test $(CORE) $(PACKS) $(HOST) api_test.c -lm
+	LLVM_PROFILE_FILE=build/cov/steps.profraw ./build/cov/corpus_runner --steps testdata/steps.txt $(CORPUS) > /dev/null
+	LLVM_PROFILE_FILE=build/cov/vm.profraw ./build/cov/corpus_runner --vm $(CORPUS) > /dev/null
+	LLVM_PROFILE_FILE=build/cov/pause.profraw ./build/cov/corpus_runner --vm --pause 1 $(CORPUS) > /dev/null
+	LLVM_PROFILE_FILE=build/cov/api.profraw ./build/cov/api_test > /dev/null
+	$(LLVM_PROFDATA) merge -sparse -o build/cov/all.profdata build/cov/*.profraw
+	$(LLVM_COV) report -instr-profile=build/cov/all.profdata build/cov/corpus_runner -object build/cov/api_test \
+		$(CORE) $(PACKS) $(HOST) fbc_dump.c | tee build/cov/cov.txt | tail -1
 
 # Host API behavior the corpus cannot express, under the same sanitizers.
 api: $(CORE) $(PACKS) $(HOST) api_test.c $(HDRS)
