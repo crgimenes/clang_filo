@@ -61,6 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
+      CC: clang  # fuzz-bc builds the runner too, and gcc's format-truncation is not a gate here
       LLVM: /usr/bin
       FUZZ_SECONDS: 60
     steps:
