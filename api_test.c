@@ -1,6 +1,7 @@
 /* Host API behavior the corpus cannot express: sealed globals, values
    crossing in and out, and calling a script function from C. Exit status is
    the number of failures. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -920,7 +921,60 @@ static void test_pow_is_the_same_everywhere(void) {
     CHECK(wrong == 0);
 }
 
+/* What a host builtin gets to compare and coerce with: filo_equal walks the
+   whole value (the language's = is equal_walk, so the corpus never reaches
+   the lists here), and the arg helpers fail with the core's own words. A
+   run's values live until the next run, so each pair comes from one. */
+static bool pair_equal(const char *pair_src) {
+    filo_value v = {0};
+    if (run(pair_src, &v) != FILO_OK || v.kind != FILO_TUPLE || v.u.seq.len != 2) {
+        failures++;
+        printf("FAIL: %s did not give a pair\n", pair_src);
+        return false;
+    }
+    return filo_equal(&v.u.seq.items[0], &v.u.seq.items[1]);
+}
+
+static void test_host_compares_and_coerces(void) {
+    start();
+    CHECK(pair_equal(
+        "(tuple (list 1 (list 2 \"x\") (tuple 3 #t)) (list 1 (list 2 \"x\") (tuple 3 #t)))"));
+    CHECK(!pair_equal(
+        "(tuple (list 1 (list 2 \"x\")) (list 1 (list 2 \"y\")))")); /* two levels down */
+    CHECK(!pair_equal("(tuple (list 1 2) (list 1))"));               /* length */
+    CHECK(!pair_equal("(tuple (list 1 2) (tuple 1 2))"));            /* kind */
+    CHECK(pair_equal("(tuple (range 3) (list 0 1 2))")); /* no items vector behind a range */
+    CHECK(pair_equal("(tuple \"\" \"\")") && !pair_equal("(tuple \"ab\" \"ac\")"));
+    CHECK(!pair_equal("(tuple \"ab\" \"\")") && !pair_equal("(tuple #t 1)"));
+    CHECK(pair_equal("(let ((f (fn () 1))) (tuple f f))"));
+    CHECK(!pair_equal("(tuple (fn () 1) (fn () 1))"));
+
+    filo_value nan = filo_num((double)NAN);
+    filo_value zero = filo_num(0.0);
+    filo_value minus_zero = filo_num(-0.0);
+    CHECK(!filo_equal(&nan, &nan));
+    CHECK(filo_equal(&zero, &minus_zero));
+
+    filo_value ab = filo_cstring("ab");
+    filo_str str = {0};
+    CHECK(filo_arg_str(&CTX, &ab, &str) == FILO_OK && str.len == 2 &&
+          memcmp(str.ptr, "ab", 2) == 0);
+    CHECK(filo_arg_str(&CTX, &zero, &str) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "expected string, got number") != NULL);
+
+    filo_value v = {0};
+    filo_seq seq = {0};
+    CHECK(run("(range 3)", &v) == FILO_OK);
+    CHECK(filo_arg_list(&CTX, &v, &seq) == FILO_OK);
+    CHECK(seq.len == 3 && seq.items != NULL &&
+          seq.items[2].u.num == 2); /* made real for the host */
+    CHECK(run("(tuple 1 2)", &v) == FILO_OK);
+    CHECK(filo_arg_list(&CTX, &v, &seq) == FILO_ERR);
+    CHECK(strstr(filo_error(&CTX), "expected list, got tuple") != NULL);
+}
+
 int main(void) {
+    test_host_compares_and_coerces();
     filo_libc_install();
     test_pow_is_the_same_everywhere();
     test_globals_cross_both_ways();

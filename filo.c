@@ -496,7 +496,7 @@ bool filo_equal(const filo_value *a, const filo_value *b) {
     }
     switch (a->kind) {
     case FILO_NUMBER:
-        return a->u.num == b->u.num; /* desvio: comparação exata de float é a semântica de = */
+        return a->u.num == b->u.num; /* exact: = on numbers has no epsilon */
     case FILO_BOOL:
         return a->u.b == b->u.b;
     case FILO_STRING:

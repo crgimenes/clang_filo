@@ -187,6 +187,9 @@ typedef struct {
 } text;
 
 static void put(text *t, const char *s, size_t n) {
+    if (n == 0) { /* an empty text has no buffer yet: no offset from NULL */
+        return;
+    }
     if (t->n + n > t->cap) {
         size_t cap = (t->cap + n) * 2U;
         char *p = take(t->d, cap);
@@ -888,7 +891,11 @@ static bool store_local(dc *d, fnstate *st, reader *r, uint32_t x, uint32_t *nex
             break;
         }
     }
-    dnode *value = wrap(d, (dentry){e.n, {e.pre.p + keep, e.pre.n - keep}});
+    dsteps rest = {NULL, 0}; /* no steps may mean no array: no offset from NULL */
+    if (keep < e.pre.n) {
+        rest = (dsteps){e.pre.p + keep, e.pre.n - keep};
+    }
+    dnode *value = wrap(d, (dentry){e.n, rest});
     dstep s = {BIND, list1(d, name, value), x}; /* (name value) */
     add_step(d, r, (dsteps){e.pre.p, keep}, s);
     *next += after.len;

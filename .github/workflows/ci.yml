@@ -6,12 +6,14 @@ permissions:
   contents: read
 
 jobs:
-  # The behavior gate: the corpus under ASan/UBSan, on both hosts, plus the
-  # API and number-text tests. What the local `make qa` runs first.
+  # The behavior gate: the corpus and the oracle under ASan/UBSan, on both
+  # hosts, the API and number-text tests, the device build on the units the
+  # full build compiles, and the filo command's outputs as kept. What the
+  # local `make qa` runs, apart from the lint and the fuzzers.
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +26,9 @@ jobs:
       - run: make corpus-nolibc
       - run: make api
       - run: make nolibc
+      - run: make oracle
+      - run: make device
+      - run: make cli
 
   # Format and the two static analyzers, warnings as errors. clang-format
   # and clang-tidy are the LLVM the local `make qa` runs (Homebrew's, 23):

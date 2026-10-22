@@ -5,12 +5,15 @@
 static filo_math_fns host_fns;
 
 /* Truncation without libm: doubles beyond 2^53 are already integral, and
-   NaN or an infinity fails both comparisons and comes back unchanged. */
+   NaN or an infinity fails both comparisons and comes back unchanged. A
+   zero keeps the sign of x, as IEEE trunc (and Go's math.Trunc) does: the
+   int64 trip alone would turn -0.4 into +0. */
 static double trunc_d(double x) {
     if (!(x > -9007199254740992.0 && x < 9007199254740992.0)) {
         return x;
     }
-    return (double)(int64_t)x;
+    double t = (double)(int64_t)x;
+    return t == 0 ? x * 0.0 : t;
 }
 
 static int one_num(filo_ctx *ctx, const char *name, const filo_value *args, uint32_t n, double *x) {
