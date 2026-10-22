@@ -783,11 +783,11 @@ static dnode **pop_args(dc *d, reader *r, uint32_t k, dentry *first) {
     if (ns == NULL) {
         return NULL;
     }
-    dentry *es = r->stack + r->n - k;
-    for (uint32_t i = 0; i < k; i++) {
-        ns[i] = i == 0 ? es[i].n : wrap(d, es[i]);
-    }
-    if (k > 0) {
+    if (k > 0) { /* with no values the stack may still be NULL: no offset from it */
+        dentry *es = r->stack + r->n - k;
+        for (uint32_t i = 0; i < k; i++) {
+            ns[i] = i == 0 ? es[i].n : wrap(d, es[i]);
+        }
         *first = es[0];
     }
     r->n -= k;
