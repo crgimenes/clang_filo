@@ -2039,6 +2039,7 @@ static int eval_body(filo_ctx *ctx, const filo_instr *const *body, uint32_t n, f
 
 static int call_builtin(filo_ctx *ctx, const char *name, filo_builtin fn,
                         const filo_instr *const *args, uint32_t n, filo_value *out) {
+    /* cppcheck-suppress variableScope ; the region before eval_args grows it */
     size_t mark = ctx->run.used;
     uint64_t escapes = ctx->escapes;
     filo_value *vals = NULL;
@@ -3974,6 +3975,7 @@ int filo_bc_strip(filo_ctx *ctx, const uint8_t *src, size_t len, uint8_t *dst, s
         }
         uint32_t off = get_u32(e + 4);
         uint32_t n = get_u32(e + 8);
+        /* cppcheck-suppress variableScope ; the offset before out_bytes moves it */
         size_t at = o.len;
         out_bytes(&o, src + off, n);
         if (o.len <= cap) {
