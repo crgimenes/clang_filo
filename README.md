@@ -5,7 +5,7 @@ six types, fourteen special forms and thirty-one core builtins as the Go engine,
 lowered to the instruction set in [docs/ir.md](docs/ir.md) and evaluated by the
 same rules, so a script's outcome is identical on both.
 
-Two files are the whole core — `filo.h` and `filo.c` — with no libc beyond
+Two files are the whole core — `src/filo.h` and `src/filo.c` — with no libc beyond
 `memcpy`/`memset`/`memcmp`/`strlen`/`strcmp`/`strchr` and no allocation after
 init. It builds for a freestanding wasm32 target and for microcontrollers.
 
